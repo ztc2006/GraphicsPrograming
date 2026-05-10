@@ -28,6 +28,10 @@ add_subdirectory(${CMAKE_SOURCE_DIR}/deps/tinyobjloader)
 #--: Targets
 
 file(GLOB_RECURSE SOURCE_FILES CONFIGURE_DEPENDS "src/*.cpp")
+file(GLOB SHADER_SOURCE_FILES CONFIGURE_DEPENDS
+  "${CMAKE_SOURCE_DIR}/shaders/*.vert"
+  "${CMAKE_SOURCE_DIR}/shaders/*.frag"
+)
 
 file(GLOB_RECURSE MODULE_FILES CONFIGURE_DEPENDS "src/*.cppm")
 set(VULKAN_HPP_MODULE "${VULKAN_SDK_PATH}/Include/vulkan/vulkan.cppm")
@@ -110,3 +114,23 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
   glm
   tinyobjloader
 )
+
+set(SHADER_OUTPUT_FILES)
+foreach(SHADER_SOURCE ${SHADER_SOURCE_FILES})
+  get_filename_component(SHADER_NAME "${SHADER_SOURCE}" NAME)
+  set(SHADER_OUTPUT "${CMAKE_BINARY_DIR}/shaders/${SHADER_NAME}.spv")
+  add_custom_command(
+    OUTPUT "${SHADER_OUTPUT}"
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_BINARY_DIR}/shaders"
+    COMMAND "${VULKAN_SDK_PATH}/Bin/glslangValidator.exe" -V "${SHADER_SOURCE}" -o "${SHADER_OUTPUT}"
+    DEPENDS "${SHADER_SOURCE}"
+    COMMENT "Compiling shader ${SHADER_NAME}"
+    VERBATIM
+  )
+  list(APPEND SHADER_OUTPUT_FILES "${SHADER_OUTPUT}")
+endforeach()
+
+if(SHADER_OUTPUT_FILES)
+  add_custom_target(compile_shaders ALL DEPENDS ${SHADER_OUTPUT_FILES})
+  add_dependencies(${PROJECT_NAME} compile_shaders)
+endif()
