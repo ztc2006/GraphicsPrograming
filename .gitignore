@@ -7,3 +7,6 @@ cmake-build-*/
 out/
 compile_commands.json
 __cmake_systeminformation/
+Vulkan_Simple_Engine_从零搭建学习路线.md
+Vulkan_学习与封装顺序建议.md
+Vulkan_引擎下一步推进路线.md
