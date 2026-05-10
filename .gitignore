@@ -1,0 +1,9 @@
+build/
+build-*/
+cmake-build-*/
+.cache/
+.idea/
+.vs/
+out/
+compile_commands.json
+__cmake_systeminformation/
