@@ -69,7 +69,8 @@ void Application::initVulkan() {
   device_ =
       std::make_unique<Device>(instance_, surface_, requiredDeviceExtensions_);
   swapChain_ = std::make_unique<SwapChain>(*device_, surface_, window_);
-  renderer_ = std::make_unique<Renderer>(*device_, *swapChain_);
+  renderer_ = std::make_unique<Renderer>(*device_);
+  renderer_->recreateForSwapChain(*swapChain_);
 }
 
 void Application::mainLoop() {
@@ -107,15 +108,13 @@ void Application::recreateSwapChain() {
   }
   device_->logicalDevice().waitIdle();
 
-  renderer_.reset();
-
   auto oldSwapChain = std::move(swapChain_);
   vk::SwapchainKHR oldSwapChainHandle =
       oldSwapChain ? *oldSwapChain->handle() : vk::SwapchainKHR{};
 
   swapChain_ = std::make_unique<SwapChain>(*device_, surface_, window_,
                                            oldSwapChainHandle);
-  renderer_ = std::make_unique<Renderer>(*device_, *swapChain_);
+  renderer_->recreateForSwapChain(*swapChain_);
 }
 
 void Application::framebufferResizeCallback(GLFWwindow *window, int width,

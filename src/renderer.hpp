@@ -14,16 +14,30 @@ public:
     eSwapChainSuboptimal,
   };
 
-  Renderer(Device const &device, SwapChain const &swapChain);
+  explicit Renderer(Device const &device);
 
   FrameResult drawFrame();
+  void recreateForSwapChain(SwapChain const &swapChain);
 
 private:
+  struct FrameContext {
+    vk::raii::Semaphore imageAvailableSemaphore = nullptr;
+    vk::raii::Fence inFlightFence = nullptr;
+  };
+
+  static constexpr std::uint32_t kFramesInFlight = 1;
+
   static std::vector<char> readBinaryFile(char const *path);
-  void createCommandPool();
-  void createGraphicsPipeline();
+
+  void createPersistentResources();
+  void createFrameResources();
   void createCommandBuffers();
-  void createSyncObjects();
+  void createCommandPool();
+
+  void createSwapChainDependentResources();
+  void destroySwapChainDependentResources();
+  void createGraphicsPipeline();
+
   void recordCommandBuffer(vk::raii::CommandBuffer const &commandBuffer,
                            std::uint32_t imageIndex);
   void transitionSwapChainImage(vk::raii::CommandBuffer const &commandBuffer,
@@ -36,14 +50,16 @@ private:
 
 private:
   Device const &device_;
-  SwapChain const &swapChain_;
+  SwapChain const *swapChain_ = nullptr;
+
+  vk::raii::CommandPool commandPool_ = nullptr;
+  std::vector<FrameContext> frames_;
+  vk::raii::CommandBuffers commandBuffers_ = nullptr;
+  std::uint32_t currentFrame_ = 0;
 
   vk::raii::PipelineLayout pipelineLayout_ = nullptr;
   vk::raii::Pipeline graphicsPipeline_ = nullptr;
-  vk::raii::CommandPool commandPool_ = nullptr;
-  vk::raii::CommandBuffers commandBuffers_ = nullptr;
-  vk::raii::Semaphore imageAvailableSemaphore_ = nullptr;
-  vk::raii::Fence inFlightFence_ = nullptr;
-  std::vector<vk::ImageLayout> swapChainImageLayouts_;
   std::vector<vk::raii::Semaphore> renderFinishedSemaphores_;
+  std::vector<vk::ImageLayout> swapChainImageLayouts_;
+  std::vector<vk::Fence> imagesInFlight_;
 };

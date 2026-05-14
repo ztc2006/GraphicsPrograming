@@ -6,26 +6,82 @@
 #include <stdexcept>
 #include <string>
 
-Renderer::Renderer(Device const &device, SwapChain const &swapChain)
-    : device_(device), swapChain_(swapChain) {
-  swapChainImageLayouts_.assign(swapChain_.images().size(),
-                                vk::ImageLayout::eUndefined);
-  createCommandPool();
-  createGraphicsPipeline();
-  createCommandBuffers();
-  createSyncObjects();
+Renderer::Renderer(Device const &device) : device_(device) {
+  createPersistentResources();
 }
+
+void Renderer::recreateForSwapChain(SwapChain const &swapchain) {
+  destroySwapChainDependentResources();
+  swapChain_ = &swapchain;
+  createSwapChainDependentResources();
+}
+
+void Renderer::createPersistentResources() {
+  createCommandPool();
+  createFrameResources();
+  createCommandBuffers();
+}
+
+void Renderer::createFrameResources() {
+  frames_.clear();
+  frames_.reserve(kFramesInFlight);
+
+  for (std::uint32_t index = 0; index < kFramesInFlight; ++index) {
+    FrameContext frame{};
+    frame.imageAvailableSemaphore =
+        vk::raii::Semaphore(device_.logicalDevice(), vk::SemaphoreCreateInfo{});
+    frame.inFlightFence = vk::raii::Fence(
+        device_.logicalDevice(),
+        vk::FenceCreateInfo{.flags = vk::FenceCreateFlagBits::eSignaled});
+    frames_.push_back(std::move(frame));
+  }
+}
+
+void Renderer::createSwapChainDependentResources() {
+  if (swapChain_ == nullptr) {
+    throw std::runtime_error("Renderer has no swapchain bound.");
+  }
+
+  createGraphicsPipeline();
+
+  renderFinishedSemaphores_.clear();
+  renderFinishedSemaphores_.reserve(swapChain_->images().size());
+  for (std::size_t index = 0; index < swapChain_->images().size(); ++index) {
+    renderFinishedSemaphores_.emplace_back(device_.logicalDevice(),
+                                           vk::SemaphoreCreateInfo{});
+  }
+
+  swapChainImageLayouts_.assign(swapChain_->images().size(),
+                                vk::ImageLayout::eUndefined);
+  imagesInFlight_.assign(swapChain_->images().size(), vk::Fence{});
+}
+
+void Renderer::destroySwapChainDependentResources() {
+  graphicsPipeline_ = nullptr;
+  pipelineLayout_ = nullptr;
+  renderFinishedSemaphores_.clear();
+  swapChainImageLayouts_.clear();
+  imagesInFlight_.clear();
+  swapChain_ = nullptr;
+}
+
 Renderer::FrameResult Renderer::drawFrame() {
+  if (swapChain_ == nullptr) {
+    throw std::runtime_error("Renderer is not initialized with a swapchain.");
+  }
+  auto &frame = frames_[currentFrame_];
+  auto &commandBuffer = commandBuffers_[currentFrame_];
+
   (void)device_.logicalDevice().waitForFences(
-      {*inFlightFence_}, true, std::numeric_limits<std::uint64_t>::max());
+      {*frame.inFlightFence}, true, std::numeric_limits<std::uint64_t>::max());
 
   vk::Result acquireResult = vk::Result::eSuccess;
   std::uint32_t imageIndex = 0;
 
   try {
-    auto acquire = swapChain_.handle().acquireNextImage(
-        std::numeric_limits<std::uint64_t>::max(), *imageAvailableSemaphore_,
-        nullptr);
+    auto acquire = swapChain_->handle().acquireNextImage(
+        std::numeric_limits<std::uint64_t>::max(),
+        *frame.imageAvailableSemaphore, nullptr);
     acquireResult = acquire.first;
     imageIndex = acquire.second;
   } catch (vk::OutOfDateKHRError const &) {
@@ -37,15 +93,23 @@ Renderer::FrameResult Renderer::drawFrame() {
     throw std::runtime_error("Failed to acquire swapchain image.");
   }
 
-  device_.logicalDevice().resetFences({*inFlightFence_});
+  if (imagesInFlight_[imageIndex]) {
+    (void)device_.logicalDevice().waitForFences(
+        {imagesInFlight_[imageIndex]}, true,
+        std::numeric_limits<std::uint64_t>::max());
+  }
 
-  commandBuffers_[0].reset();
-  recordCommandBuffer(commandBuffers_[0], imageIndex);
+  imagesInFlight_[imageIndex] = *frame.inFlightFence;
 
-  vk::Semaphore waitSemaphore = *imageAvailableSemaphore_;
+  device_.logicalDevice().resetFences({*frame.inFlightFence});
+
+  commandBuffer.reset();
+  recordCommandBuffer(commandBuffer, imageIndex);
+
+  vk::Semaphore waitSemaphore = *frame.imageAvailableSemaphore;
   vk::PipelineStageFlags waitStage =
       vk::PipelineStageFlagBits::eColorAttachmentOutput;
-  vk::CommandBuffer commandBuffer = *commandBuffers_[0];
+  vk::CommandBuffer rawCommandBuffer = *commandBuffer;
   vk::Semaphore signalSemaphore = *renderFinishedSemaphores_[imageIndex];
 
   vk::SubmitInfo submitInfo{
@@ -53,14 +117,14 @@ Renderer::FrameResult Renderer::drawFrame() {
       .pWaitSemaphores = &waitSemaphore,
       .pWaitDstStageMask = &waitStage,
       .commandBufferCount = 1,
-      .pCommandBuffers = &commandBuffer,
+      .pCommandBuffers = &rawCommandBuffer,
       .signalSemaphoreCount = 1,
       .pSignalSemaphores = &signalSemaphore,
   };
 
-  device_.graphicsQueue().submit({submitInfo}, *inFlightFence_);
+  device_.graphicsQueue().submit({submitInfo}, *frame.inFlightFence);
 
-  vk::SwapchainKHR swapChainHandle = *swapChain_.handle();
+  vk::SwapchainKHR swapChainHandle = *swapChain_->handle();
   vk::PresentInfoKHR presentInfo{
       .waitSemaphoreCount = 1,
       .pWaitSemaphores = &signalSemaphore,
@@ -69,10 +133,15 @@ Renderer::FrameResult Renderer::drawFrame() {
       .pImageIndices = &imageIndex,
   };
 
+  auto advanceFrame = [this]() {
+    currentFrame_ = (currentFrame_ + 1) % kFramesInFlight;
+  };
+
   vk::Result presentResult = vk::Result::eSuccess;
   try {
     presentResult = device_.presentQueue().presentKHR(presentInfo);
   } catch (vk::OutOfDateKHRError const &) {
+    advanceFrame();
     return FrameResult::eSwapChainOutOfDate;
   }
 
@@ -83,9 +152,10 @@ Renderer::FrameResult Renderer::drawFrame() {
 
   if (acquireResult == vk::Result::eSuboptimalKHR ||
       presentResult == vk::Result::eSuboptimalKHR) {
+    advanceFrame();
     return FrameResult::eSwapChainSuboptimal;
   }
-
+  advanceFrame();
   return FrameResult::eSuccess;
 }
 
@@ -193,7 +263,7 @@ void Renderer::createGraphicsPipeline() {
   pipelineLayout_ = vk::raii::PipelineLayout(device_.logicalDevice(),
                                              vk::PipelineLayoutCreateInfo{});
 
-  vk::Format colorAttachmentFormat = swapChain_.imageFormat();
+  vk::Format colorAttachmentFormat = swapChain_->imageFormat();
   vk::PipelineRenderingCreateInfo pipelineRenderingCreateInfo{
       .colorAttachmentCount = 1,
       .pColorAttachmentFormats = &colorAttachmentFormat,
@@ -221,26 +291,10 @@ void Renderer::createCommandBuffers() {
   vk::CommandBufferAllocateInfo allocateInfo{
       .commandPool = *commandPool_,
       .level = vk::CommandBufferLevel::ePrimary,
-      .commandBufferCount = 1,
+      .commandBufferCount = kFramesInFlight,
   };
   commandBuffers_ =
       vk::raii::CommandBuffers(device_.logicalDevice(), allocateInfo);
-}
-
-void Renderer::createSyncObjects() {
-  imageAvailableSemaphore_ =
-      vk::raii::Semaphore(device_.logicalDevice(), vk::SemaphoreCreateInfo{});
-
-  renderFinishedSemaphores_.clear();
-  renderFinishedSemaphores_.reserve(swapChain_.images().size());
-  for (std::size_t index = 0; index < swapChain_.images().size(); ++index) {
-    renderFinishedSemaphores_.emplace_back(device_.logicalDevice(),
-                                           vk::SemaphoreCreateInfo{});
-  }
-
-  inFlightFence_ = vk::raii::Fence(
-      device_.logicalDevice(),
-      vk::FenceCreateInfo{.flags = vk::FenceCreateFlagBits::eSignaled});
 }
 
 void Renderer::recordCommandBuffer(vk::raii::CommandBuffer const &commandBuffer,
@@ -262,7 +316,7 @@ void Renderer::recordCommandBuffer(vk::raii::CommandBuffer const &commandBuffer,
   };
 
   vk::RenderingAttachmentInfo colorAttachment{
-      .imageView = *swapChain_.imageViews()[imageIndex],
+      .imageView = *swapChain_->imageViews()[imageIndex],
       .imageLayout = vk::ImageLayout::eColorAttachmentOptimal,
       .loadOp = vk::AttachmentLoadOp::eClear,
       .storeOp = vk::AttachmentStoreOp::eStore,
@@ -272,7 +326,7 @@ void Renderer::recordCommandBuffer(vk::raii::CommandBuffer const &commandBuffer,
       .renderArea =
           {
               .offset = {0, 0},
-              .extent = swapChain_.extent(),
+              .extent = swapChain_->extent(),
           },
       .layerCount = 1,
       .colorAttachmentCount = 1,
@@ -286,14 +340,14 @@ void Renderer::recordCommandBuffer(vk::raii::CommandBuffer const &commandBuffer,
   vk::Viewport viewport{
       .x = 0.0f,
       .y = 0.0f,
-      .width = static_cast<float>(swapChain_.extent().width),
-      .height = static_cast<float>(swapChain_.extent().height),
+      .width = static_cast<float>(swapChain_->extent().width),
+      .height = static_cast<float>(swapChain_->extent().height),
       .minDepth = 0.0f,
       .maxDepth = 1.0f,
   };
   vk::Rect2D scissor{
       .offset = {0, 0},
-      .extent = swapChain_.extent(),
+      .extent = swapChain_->extent(),
   };
   commandBuffer.setViewport(0, {viewport});
   commandBuffer.setScissor(0, {scissor});
@@ -324,7 +378,7 @@ void Renderer::transitionSwapChainImage(
       .newLayout = newLayout,
       .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
       .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-      .image = swapChain_.images()[imageIndex],
+      .image = swapChain_->images()[imageIndex],
       .subresourceRange =
           {
               .aspectMask = vk::ImageAspectFlagBits::eColor,
