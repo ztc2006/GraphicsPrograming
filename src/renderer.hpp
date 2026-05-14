@@ -33,10 +33,11 @@ private:
   void createFrameResources();
   void createCommandBuffers();
   void createCommandPool();
-
-  void createSwapChainDependentResources();
-  void destroySwapChainDependentResources();
-  void createGraphicsPipeline();
+  void validateSwapChainCandidate(SwapChain const &swapChain) const;
+  void validateSwapChainState() const;
+  vk::raii::Pipeline createGraphicsPipeline(
+      SwapChain const &swapChain,
+      vk::raii::PipelineLayout const &pipelineLayout) const;
 
   void recordCommandBuffer(vk::raii::CommandBuffer const &commandBuffer,
                            std::uint32_t imageIndex);

@@ -79,7 +79,6 @@ void Application::mainLoop() {
 
     auto frameResult = renderer_->drawFrame();
     if (frameResult != Renderer::FrameResult::eSuccess || framebufferResized_) {
-      framebufferResized_ = false;
       recreateSwapChain();
     }
   }
@@ -98,6 +97,22 @@ void Application::cleanup() {
 }
 
 void Application::recreateSwapChain() {
+  if (window_ == nullptr) {
+    throw std::runtime_error("Cannot recreate swapchain without a window.");
+  }
+
+  if (!device_) {
+    throw std::runtime_error("Cannot recreate swapchain without a device.");
+  }
+
+  if (!renderer_) {
+    throw std::runtime_error("Cannot recreate swapchain without a renderer.");
+  }
+
+  if (!swapChain_) {
+    throw std::runtime_error("Cannot recreate swapchain without a swapchain.");
+  }
+
   int width = 0;
   int height = 0;
   glfwGetFramebufferSize(window_, &width, &height);
@@ -108,13 +123,13 @@ void Application::recreateSwapChain() {
   }
   device_->logicalDevice().waitIdle();
 
-  auto oldSwapChain = std::move(swapChain_);
-  vk::SwapchainKHR oldSwapChainHandle =
-      oldSwapChain ? *oldSwapChain->handle() : vk::SwapchainKHR{};
+  vk::SwapchainKHR oldSwapChainHandle = *swapChain_->handle();
+  auto newSwapChain = std::make_unique<SwapChain>(*device_, surface_, window_,
+                                                  oldSwapChainHandle);
+  renderer_->recreateForSwapChain(*newSwapChain);
 
-  swapChain_ = std::make_unique<SwapChain>(*device_, surface_, window_,
-                                           oldSwapChainHandle);
-  renderer_->recreateForSwapChain(*swapChain_);
+  swapChain_.swap(newSwapChain);
+  framebufferResized_ = false;
 }
 
 void Application::framebufferResizeCallback(GLFWwindow *window, int width,

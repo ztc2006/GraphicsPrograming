@@ -5,15 +5,41 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 Renderer::Renderer(Device const &device) : device_(device) {
   createPersistentResources();
 }
 
-void Renderer::recreateForSwapChain(SwapChain const &swapchain) {
-  destroySwapChainDependentResources();
-  swapChain_ = &swapchain;
-  createSwapChainDependentResources();
+void Renderer::recreateForSwapChain(SwapChain const &swapChain) {
+  validateSwapChainCandidate(swapChain);
+
+  vk::raii::PipelineLayout newPipelineLayout(device_.logicalDevice(),
+                                             vk::PipelineLayoutCreateInfo{});
+  vk::raii::Pipeline newGraphicsPipeline =
+      createGraphicsPipeline(swapChain, newPipelineLayout);
+
+  std::vector<vk::raii::Semaphore> newRenderFinishedSemaphores;
+  newRenderFinishedSemaphores.reserve(swapChain.images().size());
+  for (std::size_t index = 0; index < swapChain.images().size(); ++index) {
+    newRenderFinishedSemaphores.emplace_back(device_.logicalDevice(),
+                                             vk::SemaphoreCreateInfo{});
+  }
+
+  std::vector<vk::ImageLayout> newSwapChainImageLayouts(
+      swapChain.images().size(), vk::ImageLayout::eUndefined);
+  std::vector<vk::Fence> newImagesInFlight(swapChain.images().size(),
+                                           vk::Fence{});
+  SwapChain const *newSwapChain = &swapChain;
+
+  using std::swap;
+  swap(pipelineLayout_, newPipelineLayout);
+  swap(graphicsPipeline_, newGraphicsPipeline);
+  swap(renderFinishedSemaphores_, newRenderFinishedSemaphores);
+  swap(swapChainImageLayouts_, newSwapChainImageLayouts);
+  swap(imagesInFlight_, newImagesInFlight);
+  swap(swapChain_, newSwapChain);
+  currentFrame_ = 0;
 }
 
 void Renderer::createPersistentResources() {
@@ -37,38 +63,9 @@ void Renderer::createFrameResources() {
   }
 }
 
-void Renderer::createSwapChainDependentResources() {
-  if (swapChain_ == nullptr) {
-    throw std::runtime_error("Renderer has no swapchain bound.");
-  }
-
-  createGraphicsPipeline();
-
-  renderFinishedSemaphores_.clear();
-  renderFinishedSemaphores_.reserve(swapChain_->images().size());
-  for (std::size_t index = 0; index < swapChain_->images().size(); ++index) {
-    renderFinishedSemaphores_.emplace_back(device_.logicalDevice(),
-                                           vk::SemaphoreCreateInfo{});
-  }
-
-  swapChainImageLayouts_.assign(swapChain_->images().size(),
-                                vk::ImageLayout::eUndefined);
-  imagesInFlight_.assign(swapChain_->images().size(), vk::Fence{});
-}
-
-void Renderer::destroySwapChainDependentResources() {
-  graphicsPipeline_ = nullptr;
-  pipelineLayout_ = nullptr;
-  renderFinishedSemaphores_.clear();
-  swapChainImageLayouts_.clear();
-  imagesInFlight_.clear();
-  swapChain_ = nullptr;
-}
-
 Renderer::FrameResult Renderer::drawFrame() {
-  if (swapChain_ == nullptr) {
-    throw std::runtime_error("Renderer is not initialized with a swapchain.");
-  }
+  validateSwapChainState();
+
   auto &frame = frames_[currentFrame_];
   auto &commandBuffer = commandBuffers_[currentFrame_];
 
@@ -91,6 +88,10 @@ Renderer::FrameResult Renderer::drawFrame() {
   if (acquireResult != vk::Result::eSuccess &&
       acquireResult != vk::Result::eSuboptimalKHR) {
     throw std::runtime_error("Failed to acquire swapchain image.");
+  }
+
+  if (imageIndex >= renderFinishedSemaphores_.size()) {
+    throw std::runtime_error("Acquired swapchain image index is out of range.");
   }
 
   if (imagesInFlight_[imageIndex]) {
@@ -155,6 +156,7 @@ Renderer::FrameResult Renderer::drawFrame() {
     advanceFrame();
     return FrameResult::eSwapChainSuboptimal;
   }
+
   advanceFrame();
   return FrameResult::eSuccess;
 }
@@ -177,6 +179,68 @@ std::vector<char> Renderer::readBinaryFile(char const *path) {
   return buffer;
 }
 
+void Renderer::validateSwapChainCandidate(SwapChain const &swapChain) const {
+  if (swapChain.images().empty()) {
+    throw std::runtime_error("Swapchain candidate has no images.");
+  }
+
+  if (swapChain.imageViews().size() != swapChain.images().size()) {
+    throw std::runtime_error(
+        "Swapchain candidate image view count does not match image count.");
+  }
+
+  if (swapChain.imageFormat() == vk::Format::eUndefined) {
+    throw std::runtime_error("Swapchain candidate has an undefined format.");
+  }
+
+  if (swapChain.extent().width == 0 || swapChain.extent().height == 0) {
+    throw std::runtime_error("Swapchain candidate has an invalid extent.");
+  }
+}
+
+void Renderer::validateSwapChainState() const {
+  if (swapChain_ == nullptr) {
+    throw std::runtime_error("Renderer is not initialized with a swapchain.");
+  }
+
+  if (frames_.size() != kFramesInFlight) {
+    throw std::runtime_error("Renderer frame resource count is invalid.");
+  }
+
+  if (commandBuffers_.size() != kFramesInFlight) {
+    throw std::runtime_error("Renderer command buffer count is invalid.");
+  }
+
+  if (currentFrame_ >= frames_.size()) {
+    throw std::runtime_error("Renderer current frame index is out of range.");
+  }
+
+  if (pipelineLayout_ == nullptr) {
+    throw std::runtime_error("Renderer pipeline layout is not initialized.");
+  }
+
+  if (graphicsPipeline_ == nullptr) {
+    throw std::runtime_error("Renderer graphics pipeline is not initialized.");
+  }
+
+  auto const imageCount = swapChain_->images().size();
+  if (imageCount == 0) {
+    throw std::runtime_error("Renderer swapchain has no images.");
+  }
+
+  if (swapChain_->imageViews().size() != imageCount) {
+    throw std::runtime_error(
+        "Renderer swapchain image view count does not match image count.");
+  }
+
+  if (renderFinishedSemaphores_.size() != imageCount ||
+      imagesInFlight_.size() != imageCount ||
+      swapChainImageLayouts_.size() != imageCount) {
+    throw std::runtime_error(
+        "Renderer swapchain-dependent resource counts are inconsistent.");
+  }
+}
+
 void Renderer::createCommandPool() {
   vk::CommandPoolCreateInfo createInfo{
       .flags = vk::CommandPoolCreateFlagBits::eResetCommandBuffer,
@@ -185,7 +249,9 @@ void Renderer::createCommandPool() {
   commandPool_ = vk::raii::CommandPool(device_.logicalDevice(), createInfo);
 }
 
-void Renderer::createGraphicsPipeline() {
+vk::raii::Pipeline Renderer::createGraphicsPipeline(
+    SwapChain const &swapChain,
+    vk::raii::PipelineLayout const &pipelineLayout) const {
   auto vertCode = readBinaryFile("shaders/triangle.vert.spv");
   auto fragCode = readBinaryFile("shaders/triangle.frag.spv");
 
@@ -260,10 +326,7 @@ void Renderer::createGraphicsPipeline() {
       .pDynamicStates = dynamicStates.data(),
   };
 
-  pipelineLayout_ = vk::raii::PipelineLayout(device_.logicalDevice(),
-                                             vk::PipelineLayoutCreateInfo{});
-
-  vk::Format colorAttachmentFormat = swapChain_->imageFormat();
+  vk::Format colorAttachmentFormat = swapChain.imageFormat();
   vk::PipelineRenderingCreateInfo pipelineRenderingCreateInfo{
       .colorAttachmentCount = 1,
       .pColorAttachmentFormats = &colorAttachmentFormat,
@@ -280,11 +343,11 @@ void Renderer::createGraphicsPipeline() {
       .pMultisampleState = &multisampling,
       .pColorBlendState = &colorBlending,
       .pDynamicState = &dynamicState,
-      .layout = *pipelineLayout_,
+      .layout = *pipelineLayout,
   };
 
-  graphicsPipeline_ =
-      vk::raii::Pipeline(device_.logicalDevice(), nullptr, pipelineCreateInfo);
+  return vk::raii::Pipeline(device_.logicalDevice(), nullptr,
+                            pipelineCreateInfo);
 }
 
 void Renderer::createCommandBuffers() {
