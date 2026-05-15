@@ -1,3 +1,5 @@
+#include "pch.hpp"
+
 #include "application.hpp"
 
 #include <cstring>

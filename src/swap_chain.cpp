@@ -1,3 +1,5 @@
+#include "pch.hpp"
+
 #include "swap_chain.hpp"
 
 #include <algorithm>

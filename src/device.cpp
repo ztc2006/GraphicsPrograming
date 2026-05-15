@@ -1,3 +1,5 @@
+#include "pch.hpp"
+
 #include "device.hpp"
 
 #include <cstring>

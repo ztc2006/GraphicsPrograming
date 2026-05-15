@@ -1,10 +1,11 @@
+#include "pch.hpp"
+
 #include "renderer.hpp"
 
 #include <array>
 #include <cstddef>
 #include <cstring>
 #include <fstream>
-#include <glm/glm.hpp>
 #include <limits>
 #include <stdexcept>
 #include <string>
