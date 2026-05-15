@@ -31,13 +31,14 @@ private:
 
   void createPersistentResources();
   void createFrameResources();
+  void createGeometryResources();
   void createCommandBuffers();
   void createCommandPool();
   void validateSwapChainCandidate(SwapChain const &swapChain) const;
   void validateSwapChainState() const;
-  vk::raii::Pipeline createGraphicsPipeline(
-      SwapChain const &swapChain,
-      vk::raii::PipelineLayout const &pipelineLayout) const;
+  vk::raii::Pipeline
+  createGraphicsPipeline(SwapChain const &swapChain,
+                         vk::raii::PipelineLayout const &pipelineLayout) const;
 
   void recordCommandBuffer(vk::raii::CommandBuffer const &commandBuffer,
                            std::uint32_t imageIndex);
@@ -63,4 +64,9 @@ private:
   std::vector<vk::raii::Semaphore> renderFinishedSemaphores_;
   std::vector<vk::ImageLayout> swapChainImageLayouts_;
   std::vector<vk::Fence> imagesInFlight_;
+  vk::raii::Buffer vertexBuffer_ = nullptr;
+  vk::raii::DeviceMemory vertexBufferMemory_ = nullptr;
+  vk::raii::Buffer indexBuffer_ = nullptr;
+  vk::raii::DeviceMemory indexBufferMemory_ = nullptr;
+  std::uint32_t indexCount_ = 0;
 };

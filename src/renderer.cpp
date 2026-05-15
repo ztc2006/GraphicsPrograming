@@ -1,11 +1,60 @@
 #include "renderer.hpp"
 
 #include <array>
+#include <cstddef>
+#include <cstring>
 #include <fstream>
+#include <glm/glm.hpp>
 #include <limits>
 #include <stdexcept>
 #include <string>
 #include <utility>
+
+namespace {
+struct Vertex {
+  glm::vec2 position;
+  glm::vec3 color;
+
+  static vk::VertexInputBindingDescription bindingDescription() {
+    return vk::VertexInputBindingDescription{
+        .binding = 0,
+        .stride = sizeof(Vertex),
+        .inputRate = vk::VertexInputRate::eVertex,
+    };
+  }
+
+  static std::array<vk::VertexInputAttributeDescription, 2>
+  attributeDescriptions() {
+    return {
+        vk::VertexInputAttributeDescription{
+            .location = 0,
+            .binding = 0,
+            .format = vk::Format::eR32G32Sfloat,
+            .offset = offsetof(Vertex, position),
+        },
+        vk::VertexInputAttributeDescription{
+            .location = 1,
+            .binding = 0,
+            .format = vk::Format::eR32G32B32Sfloat,
+            .offset = offsetof(Vertex, color),
+        },
+    };
+  }
+};
+
+struct PushConstants {
+  glm::mat4 transform{1.0f};
+};
+
+const std::array<Vertex, 4> kVertices = {
+    Vertex{{-0.5f, -0.5f}, {0.95f, 0.30f, 0.25f}},
+    Vertex{{0.5f, -0.5f}, {0.20f, 0.75f, 0.35f}},
+    Vertex{{0.5f, 0.5f}, {0.15f, 0.45f, 0.95f}},
+    Vertex{{-0.5f, 0.5f}, {0.98f, 0.82f, 0.20f}},
+};
+
+const std::array<std::uint32_t, 6> kIndices = {0, 1, 2, 2, 3, 0};
+} // namespace
 
 Renderer::Renderer(Device const &device) : device_(device) {
   createPersistentResources();
@@ -14,8 +63,18 @@ Renderer::Renderer(Device const &device) : device_(device) {
 void Renderer::recreateForSwapChain(SwapChain const &swapChain) {
   validateSwapChainCandidate(swapChain);
 
+  vk::PushConstantRange pushConstantRange{
+      .stageFlags = vk::ShaderStageFlagBits::eVertex,
+      .offset = 0,
+      .size = sizeof(PushConstants),
+  };
+  vk::PipelineLayoutCreateInfo PipelineLayoutCreateInfo{
+      .pushConstantRangeCount = 1,
+      .pPushConstantRanges = &pushConstantRange,
+  };
   vk::raii::PipelineLayout newPipelineLayout(device_.logicalDevice(),
-                                             vk::PipelineLayoutCreateInfo{});
+                                             PipelineLayoutCreateInfo);
+
   vk::raii::Pipeline newGraphicsPipeline =
       createGraphicsPipeline(swapChain, newPipelineLayout);
 
@@ -46,6 +105,7 @@ void Renderer::createPersistentResources() {
   createCommandPool();
   createFrameResources();
   createCommandBuffers();
+  createGeometryResources();
 }
 
 void Renderer::createFrameResources() {
@@ -61,6 +121,47 @@ void Renderer::createFrameResources() {
         vk::FenceCreateInfo{.flags = vk::FenceCreateFlagBits::eSignaled});
     frames_.push_back(std::move(frame));
   }
+}
+
+void Renderer::createGeometryResources() {
+  auto uploadArryToDeviceLocalBuffer =
+      [this]<typename T, std::size_t N>(std::array<T, N> const &sourceData,
+                                        vk::BufferUsageFlags finalUsage)
+      -> std::pair<vk::raii::Buffer, vk::raii::DeviceMemory> {
+    vk::DeviceSize const bufferSize = sizeof(T) * sourceData.size();
+
+    auto [stagingBuffer, stagingMemory] =
+        device_.createBuffer(bufferSize, vk::BufferUsageFlagBits::eTransferSrc,
+                             vk::MemoryPropertyFlagBits::eHostVisible |
+                                 vk::MemoryPropertyFlagBits::eHostCoherent);
+
+    void *mappedMemory = stagingMemory.mapMemory(0, bufferSize);
+    std::memcpy(mappedMemory, sourceData.data(),
+                static_cast<std::size_t>(bufferSize));
+    stagingMemory.unmapMemory();
+
+    auto [deviceBuffer, deviceMemory] = device_.createBuffer(
+        bufferSize, vk::BufferUsageFlagBits::eTransferDst | finalUsage,
+        vk::MemoryPropertyFlagBits::eDeviceLocal);
+
+    device_.copyBuffer(*stagingBuffer, *deviceBuffer, bufferSize);
+    return {std::move(deviceBuffer), std::move(deviceMemory)};
+  };
+
+  auto [newVertexBuffer, newVertexBufferMemory] = uploadArryToDeviceLocalBuffer(
+      kVertices, vk::BufferUsageFlagBits::eVertexBuffer);
+
+  auto [newIndexBuffer, newIndexBufferMemory] = uploadArryToDeviceLocalBuffer(
+      kIndices, vk::BufferUsageFlagBits::eIndexBuffer);
+
+  std::uint32_t newIndexCount = static_cast<std::uint32_t>(kIndices.size());
+
+  using std::swap;
+  swap(vertexBuffer_, newVertexBuffer);
+  swap(vertexBufferMemory_, newVertexBufferMemory);
+  swap(indexBuffer_, newIndexBuffer);
+  swap(indexBufferMemory_, newIndexBufferMemory);
+  swap(indexCount_, newIndexCount);
 }
 
 Renderer::FrameResult Renderer::drawFrame() {
@@ -239,6 +340,10 @@ void Renderer::validateSwapChainState() const {
     throw std::runtime_error(
         "Renderer swapchain-dependent resource counts are inconsistent.");
   }
+  if (vertexBuffer_ == nullptr || indexBuffer_ == nullptr || indexCount_ == 0) {
+    throw std::runtime_error(
+        "Renderer geometry resources are not initialized.");
+  }
 }
 
 void Renderer::createCommandPool() {
@@ -282,7 +387,16 @@ vk::raii::Pipeline Renderer::createGraphicsPipeline(
       },
   };
 
-  vk::PipelineVertexInputStateCreateInfo vertexInputInfo{};
+  auto bindingDescription = Vertex::bindingDescription();
+  auto attributeDescriptions = Vertex::attributeDescriptions();
+
+  vk::PipelineVertexInputStateCreateInfo vertexInputInfo{
+      .vertexBindingDescriptionCount = 1,
+      .pVertexBindingDescriptions = &bindingDescription,
+      .vertexAttributeDescriptionCount =
+          static_cast<std::uint32_t>(attributeDescriptions.size()),
+      .pVertexAttributeDescriptions = attributeDescriptions.data(),
+  };
   vk::PipelineInputAssemblyStateCreateInfo inputAssembly{
       .topology = vk::PrimitiveTopology::eTriangleList,
       .primitiveRestartEnable = false,
@@ -397,8 +511,14 @@ void Renderer::recordCommandBuffer(vk::raii::CommandBuffer const &commandBuffer,
   };
 
   commandBuffer.beginRendering(renderingInfo);
+
   commandBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics,
                              *graphicsPipeline_);
+
+  vk::Buffer vertexBuffer = *vertexBuffer_;
+  vk::DeviceSize vertexOffset = 0;
+  commandBuffer.bindVertexBuffers(0, {vertexBuffer}, {vertexOffset});
+  commandBuffer.bindIndexBuffer(*indexBuffer_, 0, vk::IndexType::eUint32);
 
   vk::Viewport viewport{
       .x = 0.0f,
@@ -414,7 +534,11 @@ void Renderer::recordCommandBuffer(vk::raii::CommandBuffer const &commandBuffer,
   };
   commandBuffer.setViewport(0, {viewport});
   commandBuffer.setScissor(0, {scissor});
-  commandBuffer.draw(3, 1, 0, 0);
+  PushConstants pushConstants{};
+  commandBuffer.pushConstants<PushConstants>(
+      *pipelineLayout_, vk::ShaderStageFlagBits::eVertex, 0, pushConstants);
+  commandBuffer.drawIndexed(indexCount_, 1, 0, 0, 0);
+
   commandBuffer.endRendering();
 
   transitionSwapChainImage(commandBuffer, imageIndex,

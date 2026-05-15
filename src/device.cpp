@@ -33,8 +33,85 @@ std::uint32_t Device::presentQueueFamilyIndex() const {
   return queueFamilyIndices_.present;
 }
 
-Device::QueueFamilyIndices
-Device::findQueueFamilies(vk::raii::PhysicalDevice const &physicalDevice) const {
+std::uint32_t Device::findMemoryType(std::uint32_t typeFilter,
+                                     vk::MemoryPropertyFlags properties) const {
+  auto memoryProperties = physicalDevice_.getMemoryProperties();
+
+  for (std::uint32_t index = 0; index < memoryProperties.memoryTypeCount;
+       ++index) {
+    const bool supportsType = (typeFilter & (1u << index)) != 0;
+    const bool supportsProperties =
+        (memoryProperties.memoryTypes[index].propertyFlags & properties) ==
+        properties;
+
+    if (supportsType && supportsProperties) {
+      return index;
+    }
+  }
+  throw std::runtime_error("Failed to find suitable buffer memory type.");
+}
+
+std::pair<vk::raii::Buffer, vk::raii::DeviceMemory>
+Device::createBuffer(vk::DeviceSize size, vk::BufferUsageFlags usage,
+                     vk::MemoryPropertyFlags properties) const {
+  vk::BufferCreateInfo bufferCreateInfo{
+      .size = size,
+      .usage = usage,
+      .sharingMode = vk::SharingMode::eExclusive,
+  };
+  vk::raii::Buffer buffer(device_, bufferCreateInfo);
+
+  auto memoryRequirements = buffer.getMemoryRequirements();
+  vk::MemoryAllocateInfo allocatioInfo{
+      .allocationSize = memoryRequirements.size,
+      .memoryTypeIndex =
+          findMemoryType(memoryRequirements.memoryTypeBits, properties),
+  };
+  vk::raii::DeviceMemory bufferMemory(device_, allocatioInfo);
+
+  buffer.bindMemory(*bufferMemory, 0);
+  return {std::move(buffer), std::move(bufferMemory)};
+}
+
+void Device::copyBuffer(vk::Buffer sourceBuffer, vk::Buffer destinationBuffer,
+                        vk::DeviceSize size) const {
+  vk::CommandPoolCreateInfo commandCreatePoolInfo{
+      .flags = vk::CommandPoolCreateFlagBits::eTransient,
+      .queueFamilyIndex = graphicsQueueFamilyIndex(),
+  };
+  vk::raii::CommandPool commandPool(device_, commandCreatePoolInfo);
+
+  vk::CommandBufferAllocateInfo allocateInfo{
+      .commandPool = *commandPool,
+      .level = vk::CommandBufferLevel::ePrimary,
+      .commandBufferCount = 1,
+  };
+  vk::raii::CommandBuffers commandBuffers(device_, allocateInfo);
+  auto const &commandBuffer = commandBuffers.front();
+
+  commandBuffer.begin(vk::CommandBufferBeginInfo{
+      .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
+  });
+
+  vk::BufferCopy copyRegion{
+      .size = size,
+  };
+
+  commandBuffer.copyBuffer(sourceBuffer, destinationBuffer, {copyRegion});
+  commandBuffer.end();
+
+  vk::CommandBuffer rawCommandBuffer = *commandBuffer;
+  vk::SubmitInfo submitInfo{
+      .commandBufferCount = 1,
+      .pCommandBuffers = &rawCommandBuffer,
+  };
+
+  graphicsQueue_.submit({submitInfo}, nullptr);
+  graphicsQueue_.waitIdle();
+}
+
+Device::QueueFamilyIndices Device::findQueueFamilies(
+    vk::raii::PhysicalDevice const &physicalDevice) const {
   QueueFamilyIndices indices{};
 
   auto queueFamilies = physicalDevice.getQueueFamilyProperties();

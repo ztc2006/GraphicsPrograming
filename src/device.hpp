@@ -18,6 +18,16 @@ public:
          vk::raii::SurfaceKHR const &surface,
          std::vector<char const *> requiredDeviceExtensions);
 
+  std::pair<vk::raii::Buffer, vk::raii::DeviceMemory>
+  createBuffer(vk::DeviceSize size, vk::BufferUsageFlags usage,
+               vk::MemoryPropertyFlags properties) const;
+
+  std::uint32_t findMemoryType(std::uint32_t typeFilter,
+                               vk::MemoryPropertyFlags properties) const;
+
+  void copyBuffer(vk::Buffer sourceBuffer, vk::Buffer destinationBuffer,
+                  vk::DeviceSize size) const;
+
   vk::raii::Device const &logicalDevice() const;
   vk::raii::PhysicalDevice const &physicalDevice() const;
   vk::raii::Queue const &graphicsQueue() const;
