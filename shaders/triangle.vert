@@ -1,5 +1,9 @@
 #version 450
 
+layout(set = 0, binding = 0) uniform FrameUbo {
+  mat4 viewProj;
+} ubo;
+
 layout(push_constant) uniform PushConstants {
   mat4 transform;
 } pushConstants;
@@ -11,6 +15,6 @@ layout(location = 0) out vec3 outColor;
 
 void main()
 {
-  gl_Position = pushConstants.transform * vec4(inPosition, 0.0, 1.0);
+  gl_Position = ubo.viewProj * pushConstants.transform * vec4(inPosition, 0.0, 1.0);
   outColor = inColor;
 }

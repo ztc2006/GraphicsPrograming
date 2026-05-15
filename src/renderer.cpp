@@ -47,6 +47,10 @@ struct PushConstants {
   glm::mat4 transform{1.0f};
 };
 
+struct FrameUniformBufferObject {
+  glm::mat4 viewProj{1.0f};
+};
+
 const std::array<Vertex, 4> kVertices = {
     Vertex{{-0.5f, -0.5f}, {0.95f, 0.30f, 0.25f}},
     Vertex{{0.5f, -0.5f}, {0.20f, 0.75f, 0.35f}},
@@ -69,12 +73,15 @@ void Renderer::recreateForSwapChain(SwapChain const &swapChain) {
       .offset = 0,
       .size = sizeof(PushConstants),
   };
-  vk::PipelineLayoutCreateInfo PipelineLayoutCreateInfo{
+  vk::DescriptorSetLayout layout = *descriptorSetLayout_;
+  vk::PipelineLayoutCreateInfo pipelineLayoutCreateInfo{
+      .setLayoutCount = 1,
+      .pSetLayouts = &layout,
       .pushConstantRangeCount = 1,
       .pPushConstantRanges = &pushConstantRange,
   };
   vk::raii::PipelineLayout newPipelineLayout(device_.logicalDevice(),
-                                             PipelineLayoutCreateInfo);
+                                             pipelineLayoutCreateInfo);
 
   vk::raii::Pipeline newGraphicsPipeline =
       createGraphicsPipeline(swapChain, newPipelineLayout);
@@ -105,6 +112,9 @@ void Renderer::recreateForSwapChain(SwapChain const &swapChain) {
 void Renderer::createPersistentResources() {
   createCommandPool();
   createFrameResources();
+  createDescriptorSetLayout();
+  createDescriptorPool();
+  allocateAndWriteDescriptorSets();
   createCommandBuffers();
   createGeometryResources();
 }
@@ -120,6 +130,15 @@ void Renderer::createFrameResources() {
     frame.inFlightFence = vk::raii::Fence(
         device_.logicalDevice(),
         vk::FenceCreateInfo{.flags = vk::FenceCreateFlagBits::eSignaled});
+
+    auto [uniformBuffer, uniformBufferMemory] =
+        device_.createBuffer(sizeof(FrameUniformBufferObject),
+                             vk::BufferUsageFlagBits::eUniformBuffer,
+                             vk::MemoryPropertyFlagBits::eHostCoherent |
+                                 vk::MemoryPropertyFlagBits::eHostVisible);
+
+    frame.uniformBuffer = std::move(uniformBuffer);
+    frame.uniformBufferMemory = std::move(uniformBufferMemory);
     frames_.push_back(std::move(frame));
   }
 }
@@ -207,7 +226,8 @@ Renderer::FrameResult Renderer::drawFrame() {
   device_.logicalDevice().resetFences({*frame.inFlightFence});
 
   commandBuffer.reset();
-  recordCommandBuffer(commandBuffer, imageIndex);
+  updateFrameUniformBuffer(frame);
+  recordCommandBuffer(commandBuffer, frame, imageIndex);
 
   vk::Semaphore waitSemaphore = *frame.imageAvailableSemaphore;
   vk::PipelineStageFlags waitStage =
@@ -325,6 +345,10 @@ void Renderer::validateSwapChainState() const {
     throw std::runtime_error("Renderer graphics pipeline is not initialized.");
   }
 
+  if (descriptorSetLayout_ == nullptr || descriptorPool_ == nullptr) {
+    throw std::runtime_error("Renderer descriptor resources are not initialized.");
+  }
+
   auto const imageCount = swapChain_->images().size();
   if (imageCount == 0) {
     throw std::runtime_error("Renderer swapchain has no images.");
@@ -341,6 +365,15 @@ void Renderer::validateSwapChainState() const {
     throw std::runtime_error(
         "Renderer swapchain-dependent resource counts are inconsistent.");
   }
+
+  for (auto const &frame : frames_) {
+    if (frame.uniformBuffer == nullptr || frame.uniformBufferMemory == nullptr ||
+        frame.descriptorSet == nullptr) {
+      throw std::runtime_error(
+          "Renderer frame uniform resources are not initialized.");
+    }
+  }
+
   if (vertexBuffer_ == nullptr || indexBuffer_ == nullptr || indexCount_ == 0) {
     throw std::runtime_error(
         "Renderer geometry resources are not initialized.");
@@ -353,6 +386,65 @@ void Renderer::createCommandPool() {
       .queueFamilyIndex = device_.graphicsQueueFamilyIndex(),
   };
   commandPool_ = vk::raii::CommandPool(device_.logicalDevice(), createInfo);
+}
+
+void Renderer::createDescriptorSetLayout() {
+  vk::DescriptorSetLayoutBinding uniformBinding{
+      .binding = 0,
+      .descriptorType = vk::DescriptorType::eUniformBuffer,
+      .descriptorCount = 1,
+      .stageFlags = vk::ShaderStageFlagBits::eVertex,
+  };
+  vk::DescriptorSetLayoutCreateInfo createInfo{
+      .bindingCount = 1,
+      .pBindings = &uniformBinding,
+  };
+  descriptorSetLayout_ =
+      vk::raii::DescriptorSetLayout(device_.logicalDevice(), createInfo);
+}
+
+void Renderer::createDescriptorPool() {
+  vk::DescriptorPoolSize poolSize{
+      .type = vk::DescriptorType::eUniformBuffer,
+      .descriptorCount = kFramesInFlight,
+  };
+  vk::DescriptorPoolCreateInfo createInfo{
+      .maxSets = kFramesInFlight,
+      .poolSizeCount = 1,
+      .pPoolSizes = &poolSize,
+  };
+  descriptorPool_ =
+      vk::raii::DescriptorPool(device_.logicalDevice(), createInfo);
+}
+
+void Renderer::allocateAndWriteDescriptorSets() {
+  std::vector<vk::DescriptorSetLayout> layouts(frames_.size(),
+                                               *descriptorSetLayout_);
+  vk::DescriptorSetAllocateInfo allocateInfo{
+      .descriptorPool = *descriptorPool_,
+      .descriptorSetCount = static_cast<std::uint32_t>(layouts.size()),
+      .pSetLayouts = layouts.data(),
+  };
+  auto descriptorSets =
+      (*device_.logicalDevice()).allocateDescriptorSets(allocateInfo);
+
+  for (std::size_t index = 0; index < frames_.size(); ++index) {
+    frames_[index].descriptorSet = descriptorSets[index];
+
+    vk::DescriptorBufferInfo bufferInfo{
+        .buffer = *frames_[index].uniformBuffer,
+        .offset = 0,
+        .range = sizeof(FrameUniformBufferObject),
+    };
+    vk::WriteDescriptorSet writeDescriptorSet{
+        .dstSet = frames_[index].descriptorSet,
+        .dstBinding = 0,
+        .descriptorCount = 1,
+        .descriptorType = vk::DescriptorType::eUniformBuffer,
+        .pBufferInfo = &bufferInfo,
+    };
+    device_.logicalDevice().updateDescriptorSets({writeDescriptorSet}, {});
+  }
 }
 
 vk::raii::Pipeline Renderer::createGraphicsPipeline(
@@ -475,7 +567,28 @@ void Renderer::createCommandBuffers() {
       vk::raii::CommandBuffers(device_.logicalDevice(), allocateInfo);
 }
 
+void Renderer::updateFrameUniformBuffer(FrameContext &frame) const {
+  FrameUniformBufferObject ubo{};
+
+  glm::mat4 view =
+      glm::lookAt(glm::vec3(0.0f, 0.0f, 2.0f), glm::vec3(0.0f, 0.0f, 0.0f),
+                  glm::vec3(0.0f, 1.0f, 0.0f));
+
+  float aspect = static_cast<float>(swapChain_->extent().width) /
+                 static_cast<float>(swapChain_->extent().height);
+
+  glm::mat4 proj = glm::perspective(glm::radians(45.0f), aspect, 0.1f, 10.f);
+  proj[1][1] *= -1.0f;
+
+  ubo.viewProj = proj * view;
+
+  void *mapped = frame.uniformBufferMemory.mapMemory(0, sizeof(ubo));
+  std::memcpy(mapped, &ubo, sizeof(ubo));
+  frame.uniformBufferMemory.unmapMemory();
+}
+
 void Renderer::recordCommandBuffer(vk::raii::CommandBuffer const &commandBuffer,
+                                   FrameContext const &frame,
                                    std::uint32_t imageIndex) {
   commandBuffer.begin(vk::CommandBufferBeginInfo{
       .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
@@ -515,6 +628,9 @@ void Renderer::recordCommandBuffer(vk::raii::CommandBuffer const &commandBuffer,
 
   commandBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics,
                              *graphicsPipeline_);
+  commandBuffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics,
+                                   *pipelineLayout_, 0, {frame.descriptorSet},
+                                   {});
 
   vk::Buffer vertexBuffer = *vertexBuffer_;
   vk::DeviceSize vertexOffset = 0;

@@ -23,6 +23,9 @@ private:
   struct FrameContext {
     vk::raii::Semaphore imageAvailableSemaphore = nullptr;
     vk::raii::Fence inFlightFence = nullptr;
+    vk::raii::Buffer uniformBuffer = nullptr;
+    vk::raii::DeviceMemory uniformBufferMemory = nullptr;
+    vk::DescriptorSet descriptorSet = nullptr;
   };
 
   static constexpr std::uint32_t kFramesInFlight = 1;
@@ -34,6 +37,10 @@ private:
   void createGeometryResources();
   void createCommandBuffers();
   void createCommandPool();
+  void createDescriptorSetLayout();
+  void createDescriptorPool();
+  void allocateAndWriteDescriptorSets();
+  void updateFrameUniformBuffer(FrameContext &frame) const;
   void validateSwapChainCandidate(SwapChain const &swapChain) const;
   void validateSwapChainState() const;
   vk::raii::Pipeline
@@ -41,6 +48,7 @@ private:
                          vk::raii::PipelineLayout const &pipelineLayout) const;
 
   void recordCommandBuffer(vk::raii::CommandBuffer const &commandBuffer,
+                           FrameContext const &frame,
                            std::uint32_t imageIndex);
   void transitionSwapChainImage(vk::raii::CommandBuffer const &commandBuffer,
                                 std::uint32_t imageIndex,
@@ -69,4 +77,6 @@ private:
   vk::raii::Buffer indexBuffer_ = nullptr;
   vk::raii::DeviceMemory indexBufferMemory_ = nullptr;
   std::uint32_t indexCount_ = 0;
+  vk::raii::DescriptorSetLayout descriptorSetLayout_ = nullptr;
+  vk::raii::DescriptorPool descriptorPool_ = nullptr;
 };
