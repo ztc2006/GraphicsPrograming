@@ -3,7 +3,6 @@
 #include "renderer.hpp"
 
 #include <array>
-#include <cstddef>
 #include <cstring>
 #include <fstream>
 #include <limits>
@@ -12,37 +11,6 @@
 #include <utility>
 
 namespace {
-struct Vertex {
-  glm::vec2 position;
-  glm::vec3 color;
-
-  static vk::VertexInputBindingDescription bindingDescription() {
-    return vk::VertexInputBindingDescription{
-        .binding = 0,
-        .stride = sizeof(Vertex),
-        .inputRate = vk::VertexInputRate::eVertex,
-    };
-  }
-
-  static std::array<vk::VertexInputAttributeDescription, 2>
-  attributeDescriptions() {
-    return {
-        vk::VertexInputAttributeDescription{
-            .location = 0,
-            .binding = 0,
-            .format = vk::Format::eR32G32Sfloat,
-            .offset = offsetof(Vertex, position),
-        },
-        vk::VertexInputAttributeDescription{
-            .location = 1,
-            .binding = 0,
-            .format = vk::Format::eR32G32B32Sfloat,
-            .offset = offsetof(Vertex, color),
-        },
-    };
-  }
-};
-
 struct PushConstants {
   glm::mat4 transform{1.0f};
 };
@@ -50,15 +18,6 @@ struct PushConstants {
 struct FrameUniformBufferObject {
   glm::mat4 viewProj{1.0f};
 };
-
-const std::array<Vertex, 4> kVertices = {
-    Vertex{{-0.5f, -0.5f}, {0.95f, 0.30f, 0.25f}},
-    Vertex{{0.5f, -0.5f}, {0.20f, 0.75f, 0.35f}},
-    Vertex{{0.5f, 0.5f}, {0.15f, 0.45f, 0.95f}},
-    Vertex{{-0.5f, 0.5f}, {0.98f, 0.82f, 0.20f}},
-};
-
-const std::array<std::uint32_t, 6> kIndices = {0, 1, 2, 2, 3, 0};
 } // namespace
 
 Renderer::Renderer(Device const &device) : device_(device) {
@@ -116,7 +75,6 @@ void Renderer::createPersistentResources() {
   createDescriptorPool();
   allocateAndWriteDescriptorSets();
   createCommandBuffers();
-  createGeometryResources();
 }
 
 void Renderer::createFrameResources() {
@@ -143,10 +101,10 @@ void Renderer::createFrameResources() {
   }
 }
 
-void Renderer::createGeometryResources() {
-  auto uploadArryToDeviceLocalBuffer =
-      [this]<typename T, std::size_t N>(std::array<T, N> const &sourceData,
-                                        vk::BufferUsageFlags finalUsage)
+void Renderer::createGeometryResources(Mesh const &mesh) {
+  auto uploadVectorToDeviceLocalBuffer =
+      [this]<typename T>(std::vector<T> const &sourceData,
+                         vk::BufferUsageFlags finalUsage)
       -> std::pair<vk::raii::Buffer, vk::raii::DeviceMemory> {
     vk::DeviceSize const bufferSize = sizeof(T) * sourceData.size();
 
@@ -168,13 +126,16 @@ void Renderer::createGeometryResources() {
     return {std::move(deviceBuffer), std::move(deviceMemory)};
   };
 
-  auto [newVertexBuffer, newVertexBufferMemory] = uploadArryToDeviceLocalBuffer(
-      kVertices, vk::BufferUsageFlagBits::eVertexBuffer);
+  auto [newVertexBuffer, newVertexBufferMemory] =
+      uploadVectorToDeviceLocalBuffer(mesh.vertices,
+                                      vk::BufferUsageFlagBits::eVertexBuffer);
 
-  auto [newIndexBuffer, newIndexBufferMemory] = uploadArryToDeviceLocalBuffer(
-      kIndices, vk::BufferUsageFlagBits::eIndexBuffer);
+  auto [newIndexBuffer, newIndexBufferMemory] =
+      uploadVectorToDeviceLocalBuffer(mesh.indices,
+                                      vk::BufferUsageFlagBits::eIndexBuffer);
 
-  std::uint32_t newIndexCount = static_cast<std::uint32_t>(kIndices.size());
+  std::uint32_t newIndexCount =
+      static_cast<std::uint32_t>(mesh.indices.size());
 
   using std::swap;
   swap(vertexBuffer_, newVertexBuffer);
@@ -184,7 +145,19 @@ void Renderer::createGeometryResources() {
   swap(indexCount_, newIndexCount);
 }
 
-Renderer::FrameResult Renderer::drawFrame() {
+void Renderer::setMesh(Mesh const &mesh) {
+  if (mesh.vertices.empty()) {
+    throw std::runtime_error("Mesh has no vertices.");
+  }
+
+  if (mesh.indices.empty()) {
+    throw std::runtime_error("Mesh has no indices.");
+  }
+
+  createGeometryResources(mesh);
+}
+
+Renderer::FrameResult Renderer::drawFrame(glm::mat4 const &modelMatrix) {
   validateSwapChainState();
 
   auto &frame = frames_[currentFrame_];
@@ -227,7 +200,7 @@ Renderer::FrameResult Renderer::drawFrame() {
 
   commandBuffer.reset();
   updateFrameUniformBuffer(frame);
-  recordCommandBuffer(commandBuffer, frame, imageIndex);
+  recordCommandBuffer(commandBuffer, frame, imageIndex, modelMatrix);
 
   vk::Semaphore waitSemaphore = *frame.imageAvailableSemaphore;
   vk::PipelineStageFlags waitStage =
@@ -346,7 +319,8 @@ void Renderer::validateSwapChainState() const {
   }
 
   if (descriptorSetLayout_ == nullptr || descriptorPool_ == nullptr) {
-    throw std::runtime_error("Renderer descriptor resources are not initialized.");
+    throw std::runtime_error(
+        "Renderer descriptor resources are not initialized.");
   }
 
   auto const imageCount = swapChain_->images().size();
@@ -367,7 +341,8 @@ void Renderer::validateSwapChainState() const {
   }
 
   for (auto const &frame : frames_) {
-    if (frame.uniformBuffer == nullptr || frame.uniformBufferMemory == nullptr ||
+    if (frame.uniformBuffer == nullptr ||
+        frame.uniformBufferMemory == nullptr ||
         frame.descriptorSet == nullptr) {
       throw std::runtime_error(
           "Renderer frame uniform resources are not initialized.");
@@ -589,7 +564,8 @@ void Renderer::updateFrameUniformBuffer(FrameContext &frame) const {
 
 void Renderer::recordCommandBuffer(vk::raii::CommandBuffer const &commandBuffer,
                                    FrameContext const &frame,
-                                   std::uint32_t imageIndex) {
+                                   std::uint32_t imageIndex,
+                                   glm::mat4 const &modelMatrix) {
   commandBuffer.begin(vk::CommandBufferBeginInfo{
       .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
   });
@@ -651,7 +627,11 @@ void Renderer::recordCommandBuffer(vk::raii::CommandBuffer const &commandBuffer,
   };
   commandBuffer.setViewport(0, {viewport});
   commandBuffer.setScissor(0, {scissor});
-  PushConstants pushConstants{};
+
+  PushConstants pushConstants{
+      .transform = modelMatrix,
+  };
+
   commandBuffer.pushConstants<PushConstants>(
       *pipelineLayout_, vk::ShaderStageFlagBits::eVertex, 0, pushConstants);
   commandBuffer.drawIndexed(indexCount_, 1, 0, 0, 0);

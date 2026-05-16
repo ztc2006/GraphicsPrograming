@@ -1,8 +1,11 @@
 #pragma once
 
+#include <chrono>
 #include <memory>
 #include <vector>
 
+#include "mesh.hpp"
+#include "scene_object.hpp"
 #include "vulkan_include.hpp"
 
 class Device;
@@ -26,6 +29,9 @@ private:
   void createInstance();
   void setupDebugMessenger();
   void createSurface();
+  void updateScene();
+  void createScene();
+
   std::vector<char const *> getRequiredInstanceExtensions();
 
   static void framebufferResizeCallback(GLFWwindow *window, int width,
@@ -48,4 +54,8 @@ private:
   std::unique_ptr<SwapChain> swapChain_;
   std::unique_ptr<Renderer> renderer_;
   std::vector<char const *> requiredDeviceExtensions_;
+  Mesh rectangleMesh_{};
+  SceneObject object_{};
+  std::chrono::steady_clock::time_point animationStartTime_ =
+      std::chrono::steady_clock::now();
 };

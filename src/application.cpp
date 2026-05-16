@@ -66,20 +66,24 @@ void Application::initVulkan() {
   createInstance();
   setupDebugMessenger();
   createSurface();
+  createScene();
 
   requiredDeviceExtensions_ = {vk::KHRSwapchainExtensionName};
   device_ =
       std::make_unique<Device>(instance_, surface_, requiredDeviceExtensions_);
   swapChain_ = std::make_unique<SwapChain>(*device_, surface_, window_);
   renderer_ = std::make_unique<Renderer>(*device_);
+  renderer_->setMesh(*object_.mesh);
   renderer_->recreateForSwapChain(*swapChain_);
 }
 
 void Application::mainLoop() {
   while (!glfwWindowShouldClose(window_)) {
     glfwPollEvents();
+    updateScene();
 
-    auto frameResult = renderer_->drawFrame();
+    glm::mat4 modelMatrix = object_.transform.matrix();
+    auto frameResult = renderer_->drawFrame(object_.transform.matrix());
     if (frameResult != Renderer::FrameResult::eSuccess || framebufferResized_) {
       recreateSwapChain();
     }
@@ -229,6 +233,25 @@ void Application::createSurface() {
   }
 
   surface_ = vk::raii::SurfaceKHR(instance_, rawSurface);
+}
+
+void Application::updateScene() {
+  auto const now = std::chrono::steady_clock::now();
+  float const elapsedSeconds =
+      std::chrono::duration<float>(now - animationStartTime_).count();
+  object_.transform.rotation.z = glm::radians(45.0f) * elapsedSeconds;
+}
+
+void Application::createScene() {
+  rectangleMesh_.vertices = {
+      {{-0.5f, -0.5f, 0.0f}, {0.95f, 0.30f, 0.25f}},
+      {{0.5f, -0.5f, 0.0f}, {0.20f, 0.75f, 0.35f}},
+      {{0.5f, 0.5f, 0.0f}, {0.15f, 0.45f, 0.95f}},
+      {{-0.5f, 0.5f, 0.0f}, {0.98f, 0.82f, 0.20f}},
+  };
+
+  rectangleMesh_.indices = {0, 1, 2, 2, 3, 0};
+  object_.mesh = &rectangleMesh_;
 }
 
 std::vector<char const *> Application::getRequiredInstanceExtensions() {

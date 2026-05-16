@@ -1,9 +1,11 @@
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <vector>
 
 #include "device.hpp"
+#include "mesh.hpp"
 #include "swap_chain.hpp"
 
 class Renderer {
@@ -16,7 +18,8 @@ public:
 
   explicit Renderer(Device const &device);
 
-  FrameResult drawFrame();
+  void setMesh(Mesh const &mesh);
+  FrameResult drawFrame(glm::mat4 const &modelMatrix);
   void recreateForSwapChain(SwapChain const &swapChain);
 
 private:
@@ -34,7 +37,7 @@ private:
 
   void createPersistentResources();
   void createFrameResources();
-  void createGeometryResources();
+  void createGeometryResources(Mesh const &mesh);
   void createCommandBuffers();
   void createCommandPool();
   void createDescriptorSetLayout();
@@ -48,8 +51,9 @@ private:
                          vk::raii::PipelineLayout const &pipelineLayout) const;
 
   void recordCommandBuffer(vk::raii::CommandBuffer const &commandBuffer,
-                           FrameContext const &frame,
-                           std::uint32_t imageIndex);
+                           FrameContext const &frame, std::uint32_t imageIndex,
+                           glm::mat4 const &modelMatrix);
+
   void transitionSwapChainImage(vk::raii::CommandBuffer const &commandBuffer,
                                 std::uint32_t imageIndex,
                                 vk::ImageLayout newLayout,

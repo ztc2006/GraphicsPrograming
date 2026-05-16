@@ -1,0 +1,44 @@
+#pragma once
+
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <vector>
+
+#include "glm_include.hpp"
+#include "vulkan_include.hpp"
+
+struct Vertex {
+  glm::vec3 position;
+  glm::vec3 color;
+
+  static vk::VertexInputBindingDescription bindingDescription() {
+    return vk::VertexInputBindingDescription{
+        .binding = 0,
+        .stride = sizeof(Vertex),
+        .inputRate = vk::VertexInputRate::eVertex,
+    };
+  }
+
+  static std::array<vk::VertexInputAttributeDescription, 2>
+  attributeDescriptions() {
+    return {
+        vk::VertexInputAttributeDescription{
+            .location = 0,
+            .binding = 0,
+            .format = vk::Format::eR32G32B32Sfloat,
+            .offset = offsetof(Vertex, position),
+        },
+        vk::VertexInputAttributeDescription{
+            .location = 1,
+            .binding = 0,
+            .format = vk::Format::eR32G32B32Sfloat,
+            .offset = offsetof(Vertex, color),
+        },
+    };
+  }
+};
+struct Mesh {
+  std::vector<Vertex> vertices;
+  std::vector<std::uint32_t> indices;
+};
