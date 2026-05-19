@@ -1,9 +1,11 @@
 #pragma once
 
-#include "mesh.hpp"
 #include "transform.hpp"
+#include <cstdint>
+
+using MeshId = std::uint32_t;
 
 struct SceneObject {
   Transform transform{};
-  Mesh const *mesh = nullptr;
+  MeshId meshId = 0;
 };

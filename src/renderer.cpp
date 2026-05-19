@@ -25,6 +25,11 @@ Renderer::Renderer(Device const &device) : device_(device) {
 }
 
 void Renderer::recreateForSwapChain(SwapChain const &swapChain) {
+  if (activeFrame_.has_value()) {
+    throw std::runtime_error("Cannot recreate renderer swapchain resources "
+                             "while a frame is in progress.");
+  }
+
   validateSwapChainCandidate(swapChain);
 
   vk::PushConstantRange pushConstantRange{
@@ -66,6 +71,7 @@ void Renderer::recreateForSwapChain(SwapChain const &swapChain) {
   swap(imagesInFlight_, newImagesInFlight);
   swap(swapChain_, newSwapChain);
   currentFrame_ = 0;
+  activeFrame_.reset();
 }
 
 void Renderer::createPersistentResources() {
@@ -101,7 +107,7 @@ void Renderer::createFrameResources() {
   }
 }
 
-void Renderer::createGeometryResources(Mesh const &mesh) {
+Renderer::MeshGpuResources Renderer::createGeometryResources(Mesh const &mesh) {
   auto uploadVectorToDeviceLocalBuffer =
       [this]<typename T>(std::vector<T> const &sourceData,
                          vk::BufferUsageFlags finalUsage)
@@ -126,42 +132,59 @@ void Renderer::createGeometryResources(Mesh const &mesh) {
     return {std::move(deviceBuffer), std::move(deviceMemory)};
   };
 
-  auto [newVertexBuffer, newVertexBufferMemory] =
-      uploadVectorToDeviceLocalBuffer(mesh.vertices,
-                                      vk::BufferUsageFlagBits::eVertexBuffer);
+  auto [vertexBuffer, vertexBufferMemory] = uploadVectorToDeviceLocalBuffer(
+      mesh.vertices, vk::BufferUsageFlagBits::eVertexBuffer);
 
-  auto [newIndexBuffer, newIndexBufferMemory] =
-      uploadVectorToDeviceLocalBuffer(mesh.indices,
-                                      vk::BufferUsageFlagBits::eIndexBuffer);
+  auto [indexBuffer, indexBufferMemory] = uploadVectorToDeviceLocalBuffer(
+      mesh.indices, vk::BufferUsageFlagBits::eIndexBuffer);
 
-  std::uint32_t newIndexCount =
-      static_cast<std::uint32_t>(mesh.indices.size());
+  std::uint32_t newIndexCount = static_cast<std::uint32_t>(mesh.indices.size());
 
-  using std::swap;
-  swap(vertexBuffer_, newVertexBuffer);
-  swap(vertexBufferMemory_, newVertexBufferMemory);
-  swap(indexBuffer_, newIndexBuffer);
-  swap(indexBufferMemory_, newIndexBufferMemory);
-  swap(indexCount_, newIndexCount);
+  MeshGpuResources resources{};
+  resources.vertexBuffer = std::move(vertexBuffer);
+  resources.vertexBufferMemory = std::move(vertexBufferMemory);
+  resources.indexBuffer = std::move(indexBuffer);
+  resources.indexBufferMemory = std::move(indexBufferMemory);
+  resources.indexCount = static_cast<std::uint32_t>(mesh.indices.size());
+  return resources;
 }
 
-void Renderer::setMesh(Mesh const &mesh) {
-  if (mesh.vertices.empty()) {
-    throw std::runtime_error("Mesh has no vertices.");
+void Renderer::setMeshes(std::vector<Mesh> const &meshes) {
+  if (activeFrame_.has_value()) {
+    throw std::runtime_error(
+        "Cannot replace renderer meshes while a frame is in progress");
   }
 
-  if (mesh.indices.empty()) {
-    throw std::runtime_error("Mesh has no indices.");
+  if (meshes.empty()) {
+    throw std::runtime_error("Renderer requires at least one mesh.");
   }
 
-  createGeometryResources(mesh);
+  std::vector<MeshGpuResources> newMeshGpuResources;
+  newMeshGpuResources.reserve(meshes.size());
+
+  for (Mesh const &mesh : meshes) {
+    if (mesh.vertices.empty()) {
+      throw std::runtime_error("Mesh has no vertices.");
+    }
+    if (mesh.indices.empty()) {
+      throw std::runtime_error("Mesh has no indices.");
+    }
+    newMeshGpuResources.push_back(createGeometryResources(mesh));
+  }
+  meshGpuResources_.swap(newMeshGpuResources);
 }
 
-Renderer::FrameResult Renderer::drawFrame(glm::mat4 const &modelMatrix) {
+Renderer::FrameResult Renderer::beginFrame(glm::mat4 const &viewProjMatrix) {
   validateSwapChainState();
 
-  auto &frame = frames_[currentFrame_];
-  auto &commandBuffer = commandBuffers_[currentFrame_];
+  if (activeFrame_.has_value()) {
+    throw std::runtime_error(
+        "Cannot begin a new frame while another frame is in progress.");
+  }
+
+  std::uint32_t const frameIndex = currentFrame_;
+  auto &frame = frames_[frameIndex];
+  auto &commandBuffer = commandBuffers_[frameIndex];
 
   (void)device_.logicalDevice().waitForFences(
       {*frame.inFlightFence}, true, std::numeric_limits<std::uint64_t>::max());
@@ -185,7 +208,7 @@ Renderer::FrameResult Renderer::drawFrame(glm::mat4 const &modelMatrix) {
   }
 
   if (imageIndex >= renderFinishedSemaphores_.size()) {
-    throw std::runtime_error("Acquired swapchain image index is out of range.");
+    throw std::runtime_error("Acquire swapchain image index is out of range");
   }
 
   if (imagesInFlight_[imageIndex]) {
@@ -199,14 +222,73 @@ Renderer::FrameResult Renderer::drawFrame(glm::mat4 const &modelMatrix) {
   device_.logicalDevice().resetFences({*frame.inFlightFence});
 
   commandBuffer.reset();
-  updateFrameUniformBuffer(frame);
-  recordCommandBuffer(commandBuffer, frame, imageIndex, modelMatrix);
+  updateFrameUniformBuffer(frame, viewProjMatrix);
+  beginCommandBuffer(commandBuffer, frame, imageIndex);
+
+  activeFrame_ = ActiveFrameState{
+      .frameIndex = frameIndex,
+      .imageIndex = imageIndex,
+      .acquireResult = acquireResult,
+  };
+
+  return FrameResult::eSuccess;
+}
+
+void Renderer::drawObject(MeshId meshId, glm::mat4 const &modelMatrix) {
+  if (!activeFrame_.has_value()) {
+    throw std::runtime_error("Cannot draw without an active frame.");
+  }
+
+  if (meshId >= meshGpuResources_.size()) {
+    throw std::runtime_error("Renderer mesh id is out of range.");
+  }
+
+  MeshGpuResources const &meshResources = meshGpuResources_[meshId];
+  if (meshResources.vertexBuffer == nullptr ||
+      meshResources.vertexBufferMemory == nullptr ||
+      meshResources.indexBuffer == nullptr ||
+      meshResources.indexBufferMemory == nullptr ||
+      meshResources.indexCount == 0) {
+    throw std::runtime_error(
+        "Renderer mesh GPU resources are not initialized.");
+  }
+
+  auto const &frameState = *activeFrame_;
+  auto &commandBuffer = commandBuffers_[frameState.frameIndex];
+
+  vk::Buffer vertexBuffer = *meshResources.vertexBuffer;
+  vk::DeviceSize vertexOffset = 0;
+  commandBuffer.bindVertexBuffers(0, {vertexBuffer}, {vertexOffset});
+  commandBuffer.bindIndexBuffer(*meshResources.indexBuffer, 0,
+                                vk::IndexType::eUint32);
+
+  PushConstants pushConstants{
+      .transform = modelMatrix,
+  };
+
+  commandBuffer.pushConstants<PushConstants>(
+      *pipelineLayout_, vk::ShaderStageFlagBits::eVertex, 0, pushConstants);
+  commandBuffer.drawIndexed(meshResources.indexCount, 1, 0, 0, 0);
+}
+
+Renderer::FrameResult Renderer::endFrame() {
+  if (!activeFrame_.has_value()) {
+    throw std::runtime_error(
+        "Cannot end a frame when no frame is in progress.");
+  }
+
+  ActiveFrameState const frameState = *activeFrame_;
+  auto &frame = frames_[frameState.frameIndex];
+  auto &commandBuffer = commandBuffers_[frameState.frameIndex];
+
+  endCommandBuffer(commandBuffer, frameState.imageIndex);
 
   vk::Semaphore waitSemaphore = *frame.imageAvailableSemaphore;
   vk::PipelineStageFlags waitStage =
       vk::PipelineStageFlagBits::eColorAttachmentOutput;
   vk::CommandBuffer rawCommandBuffer = *commandBuffer;
-  vk::Semaphore signalSemaphore = *renderFinishedSemaphores_[imageIndex];
+  vk::Semaphore signalSemaphore =
+      *renderFinishedSemaphores_[frameState.imageIndex];
 
   vk::SubmitInfo submitInfo{
       .waitSemaphoreCount = 1,
@@ -226,7 +308,7 @@ Renderer::FrameResult Renderer::drawFrame(glm::mat4 const &modelMatrix) {
       .pWaitSemaphores = &signalSemaphore,
       .swapchainCount = 1,
       .pSwapchains = &swapChainHandle,
-      .pImageIndices = &imageIndex,
+      .pImageIndices = &frameState.imageIndex,
   };
 
   auto advanceFrame = [this]() {
@@ -237,6 +319,7 @@ Renderer::FrameResult Renderer::drawFrame(glm::mat4 const &modelMatrix) {
   try {
     presentResult = device_.presentQueue().presentKHR(presentInfo);
   } catch (vk::OutOfDateKHRError const &) {
+    activeFrame_.reset();
     advanceFrame();
     return FrameResult::eSwapChainOutOfDate;
   }
@@ -246,7 +329,9 @@ Renderer::FrameResult Renderer::drawFrame(glm::mat4 const &modelMatrix) {
     throw std::runtime_error("Failed to present swapchain image.");
   }
 
-  if (acquireResult == vk::Result::eSuboptimalKHR ||
+  activeFrame_.reset();
+
+  if (frameState.acquireResult == vk::Result::eSuboptimalKHR ||
       presentResult == vk::Result::eSuboptimalKHR) {
     advanceFrame();
     return FrameResult::eSwapChainSuboptimal;
@@ -254,6 +339,18 @@ Renderer::FrameResult Renderer::drawFrame(glm::mat4 const &modelMatrix) {
 
   advanceFrame();
   return FrameResult::eSuccess;
+}
+
+Renderer::FrameResult Renderer::drawFrame(MeshId meshId,
+                                          glm::mat4 const &modelMatrix,
+                                          glm::mat4 const &viewProjMatrix) {
+  FrameResult beginResult = beginFrame(viewProjMatrix);
+  if (beginResult != FrameResult::eSuccess) {
+    return beginResult;
+  }
+
+  drawObject(meshId, modelMatrix);
+  return endFrame();
 }
 
 std::vector<char> Renderer::readBinaryFile(char const *path) {
@@ -310,6 +407,22 @@ void Renderer::validateSwapChainState() const {
     throw std::runtime_error("Renderer current frame index is out of range.");
   }
 
+  auto const imageCount = swapChain_->images().size();
+  if (imageCount == 0) {
+    throw std::runtime_error("Renderer swapchain has no images.");
+  }
+
+  if (activeFrame_.has_value()) {
+    if (activeFrame_->frameIndex >= frames_.size()) {
+      throw std::runtime_error("Renderer active frame index is out of range.");
+    }
+
+    if (activeFrame_->imageIndex >= imageCount) {
+      throw std::runtime_error(
+          "Renderer active swapchain image index is out of range.");
+    }
+  }
+
   if (pipelineLayout_ == nullptr) {
     throw std::runtime_error("Renderer pipeline layout is not initialized.");
   }
@@ -321,11 +434,6 @@ void Renderer::validateSwapChainState() const {
   if (descriptorSetLayout_ == nullptr || descriptorPool_ == nullptr) {
     throw std::runtime_error(
         "Renderer descriptor resources are not initialized.");
-  }
-
-  auto const imageCount = swapChain_->images().size();
-  if (imageCount == 0) {
-    throw std::runtime_error("Renderer swapchain has no images.");
   }
 
   if (swapChain_->imageViews().size() != imageCount) {
@@ -349,9 +457,20 @@ void Renderer::validateSwapChainState() const {
     }
   }
 
-  if (vertexBuffer_ == nullptr || indexBuffer_ == nullptr || indexCount_ == 0) {
+  if (meshGpuResources_.empty()) {
     throw std::runtime_error(
-        "Renderer geometry resources are not initialized.");
+        "Renderer mesh GPU resources are not initialized.");
+  }
+
+  for (auto const &meshResources : meshGpuResources_) {
+    if (meshResources.vertexBuffer == nullptr ||
+        meshResources.vertexBufferMemory == nullptr ||
+        meshResources.indexBuffer == nullptr ||
+        meshResources.indexBufferMemory == nullptr ||
+        meshResources.indexCount == 0) {
+      throw std::runtime_error(
+          "Renderer mesh GPU resources  are not initialized.");
+    }
   }
 }
 
@@ -542,30 +661,19 @@ void Renderer::createCommandBuffers() {
       vk::raii::CommandBuffers(device_.logicalDevice(), allocateInfo);
 }
 
-void Renderer::updateFrameUniformBuffer(FrameContext &frame) const {
+void Renderer::updateFrameUniformBuffer(FrameContext &frame,
+                                        glm::mat4 const &viewProjMatrix) const {
   FrameUniformBufferObject ubo{};
-
-  glm::mat4 view =
-      glm::lookAt(glm::vec3(0.0f, 0.0f, 2.0f), glm::vec3(0.0f, 0.0f, 0.0f),
-                  glm::vec3(0.0f, 1.0f, 0.0f));
-
-  float aspect = static_cast<float>(swapChain_->extent().width) /
-                 static_cast<float>(swapChain_->extent().height);
-
-  glm::mat4 proj = glm::perspective(glm::radians(45.0f), aspect, 0.1f, 10.f);
-  proj[1][1] *= -1.0f;
-
-  ubo.viewProj = proj * view;
+  ubo.viewProj = viewProjMatrix;
 
   void *mapped = frame.uniformBufferMemory.mapMemory(0, sizeof(ubo));
   std::memcpy(mapped, &ubo, sizeof(ubo));
   frame.uniformBufferMemory.unmapMemory();
 }
 
-void Renderer::recordCommandBuffer(vk::raii::CommandBuffer const &commandBuffer,
-                                   FrameContext const &frame,
-                                   std::uint32_t imageIndex,
-                                   glm::mat4 const &modelMatrix) {
+void Renderer::beginCommandBuffer(vk::raii::CommandBuffer const &commandBuffer,
+                                  FrameContext const &frame,
+                                  std::uint32_t imageIndex) {
   commandBuffer.begin(vk::CommandBufferBeginInfo{
       .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
   });
@@ -608,11 +716,6 @@ void Renderer::recordCommandBuffer(vk::raii::CommandBuffer const &commandBuffer,
                                    *pipelineLayout_, 0, {frame.descriptorSet},
                                    {});
 
-  vk::Buffer vertexBuffer = *vertexBuffer_;
-  vk::DeviceSize vertexOffset = 0;
-  commandBuffer.bindVertexBuffers(0, {vertexBuffer}, {vertexOffset});
-  commandBuffer.bindIndexBuffer(*indexBuffer_, 0, vk::IndexType::eUint32);
-
   vk::Viewport viewport{
       .x = 0.0f,
       .y = 0.0f,
@@ -627,15 +730,10 @@ void Renderer::recordCommandBuffer(vk::raii::CommandBuffer const &commandBuffer,
   };
   commandBuffer.setViewport(0, {viewport});
   commandBuffer.setScissor(0, {scissor});
+}
 
-  PushConstants pushConstants{
-      .transform = modelMatrix,
-  };
-
-  commandBuffer.pushConstants<PushConstants>(
-      *pipelineLayout_, vk::ShaderStageFlagBits::eVertex, 0, pushConstants);
-  commandBuffer.drawIndexed(indexCount_, 1, 0, 0, 0);
-
+void Renderer::endCommandBuffer(vk::raii::CommandBuffer const &commandBuffer,
+                                std::uint32_t imageIndex) {
   commandBuffer.endRendering();
 
   transitionSwapChainImage(commandBuffer, imageIndex,

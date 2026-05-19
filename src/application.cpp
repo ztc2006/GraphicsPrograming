@@ -73,7 +73,13 @@ void Application::initVulkan() {
       std::make_unique<Device>(instance_, surface_, requiredDeviceExtensions_);
   swapChain_ = std::make_unique<SwapChain>(*device_, surface_, window_);
   renderer_ = std::make_unique<Renderer>(*device_);
-  renderer_->setMesh(*object_.mesh);
+  if (scene_.objects.empty()) {
+    throw std::runtime_error("Scene has no objects.");
+  }
+  if (scene_.meshes.empty()) {
+    throw std::runtime_error("Scene has no meshes.");
+  }
+  renderer_->setMeshes(scene_.meshes);
   renderer_->recreateForSwapChain(*swapChain_);
 }
 
@@ -81,9 +87,38 @@ void Application::mainLoop() {
   while (!glfwWindowShouldClose(window_)) {
     glfwPollEvents();
     updateScene();
+    if (scene_.cameras.empty()) {
+      throw std::runtime_error("Scene has no cameras.");
+    }
 
-    glm::mat4 modelMatrix = object_.transform.matrix();
-    auto frameResult = renderer_->drawFrame(object_.transform.matrix());
+    if (scene_.activeCameraIndex >= scene_.cameras.size()) {
+      throw std::runtime_error("Active camera index is out of range.");
+    }
+
+    if (scene_.objects.empty()) {
+      throw std::runtime_error("Scene has no objects.");
+    }
+
+    float aspect = static_cast<float>(swapChain_->extent().width) /
+                   static_cast<float>(swapChain_->extent().height);
+
+    glm::mat4 viewProjMatrix =
+        scene_.cameras[scene_.activeCameraIndex].viewProj(aspect);
+
+    auto beginResult = renderer_->beginFrame(viewProjMatrix);
+    if (beginResult != Renderer::FrameResult::eSuccess) {
+      recreateSwapChain();
+      continue;
+    }
+
+    for (SceneObject const &object : scene_.objects) {
+      if (object.meshId >= scene_.meshes.size()) {
+        throw std::runtime_error("Scene object mesh id is out of range.");
+      }
+      renderer_->drawObject(object.meshId, object.transform.matrix());
+    }
+
+    auto frameResult = renderer_->endFrame();
     if (frameResult != Renderer::FrameResult::eSuccess || framebufferResized_) {
       recreateSwapChain();
     }
@@ -236,22 +271,56 @@ void Application::createSurface() {
 }
 
 void Application::updateScene() {
+  if (scene_.objects.size() < 3) {
+    throw std::runtime_error(
+        "Scene must contain at least 3 objects for animation.");
+  }
+
   auto const now = std::chrono::steady_clock::now();
   float const elapsedSeconds =
       std::chrono::duration<float>(now - animationStartTime_).count();
-  object_.transform.rotation.z = glm::radians(45.0f) * elapsedSeconds;
+  scene_.objects[1].transform.rotation.z = glm::radians(45.0f) * elapsedSeconds;
 }
 
 void Application::createScene() {
-  rectangleMesh_.vertices = {
-      {{-0.5f, -0.5f, 0.0f}, {0.95f, 0.30f, 0.25f}},
-      {{0.5f, -0.5f, 0.0f}, {0.20f, 0.75f, 0.35f}},
-      {{0.5f, 0.5f, 0.0f}, {0.15f, 0.45f, 0.95f}},
-      {{-0.5f, 0.5f, 0.0f}, {0.98f, 0.82f, 0.20f}},
+  scene_.meshes.clear();
+  scene_.objects.clear();
+  scene_.cameras.clear();
+
+  scene_.meshes.push_back(Mesh{
+      .vertices =
+          {
+              {{-0.5f, -0.5f, 0.0f}, {0.95f, 0.30f, 0.25f}},
+              {{0.5f, -0.5f, 0.0f}, {0.20f, 0.75f, 0.35f}},
+              {{0.5f, 0.5f, 0.0f}, {0.15f, 0.45f, 0.95f}},
+              {{-0.5f, 0.5f, 0.0f}, {0.98f, 0.82f, 0.20f}},
+          },
+      .indices = {0, 1, 2, 2, 3, 0},
+  });
+
+  scene_.meshes.push_back(Mesh{
+      .vertices =
+          {
+              {{0.0f, -0.55f, 0.0f}, {0.95f, 0.40f, 0.20f}},
+              {{0.55f, 0.45f, 0.0f}, {0.20f, 0.85f, 0.35f}},
+              {{-0.55f, 0.45f, 0.0f}, {0.20f, 0.45f, 0.95f}},
+          },
+      .indices = {0, 1, 2},
+  });
+
+  auto makeObject = [](float x, MeshId meshId) {
+    SceneObject object{};
+    object.transform.translation = {x, 0.0f, 0.0f};
+    object.meshId = meshId;
+    return object;
   };
 
-  rectangleMesh_.indices = {0, 1, 2, 2, 3, 0};
-  object_.mesh = &rectangleMesh_;
+  scene_.objects.push_back(makeObject(-0.8f, 0));
+  scene_.objects.push_back(makeObject(0.0f, 1));
+  scene_.objects.push_back(makeObject(0.8f, 0));
+
+  scene_.cameras.push_back(Camera{});
+  scene_.activeCameraIndex = 0;
 }
 
 std::vector<char const *> Application::getRequiredInstanceExtensions() {

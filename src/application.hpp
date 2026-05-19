@@ -4,8 +4,7 @@
 #include <memory>
 #include <vector>
 
-#include "mesh.hpp"
-#include "scene_object.hpp"
+#include "scene.hpp"
 #include "vulkan_include.hpp"
 
 class Device;
@@ -54,8 +53,7 @@ private:
   std::unique_ptr<SwapChain> swapChain_;
   std::unique_ptr<Renderer> renderer_;
   std::vector<char const *> requiredDeviceExtensions_;
-  Mesh rectangleMesh_{};
-  SceneObject object_{};
+  Scene scene_{};
   std::chrono::steady_clock::time_point animationStartTime_ =
       std::chrono::steady_clock::now();
 };
