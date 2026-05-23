@@ -47,7 +47,20 @@ void Application::run() {
 
 void Application::initWindow() {
   if (glfwInit() != GLFW_TRUE) {
-    throw std::runtime_error("Failed to initialize GLFW.");
+    char const *errorDescription = nullptr;
+    int const errorCode = glfwGetError(&errorDescription);
+    std::string message = "Failed to initialize GLFW.";
+    if (errorCode != GLFW_NO_ERROR && errorDescription != nullptr) {
+      message += " ";
+      message += errorDescription;
+    }
+    char const *display = std::getenv("DISPLAY");
+    char const *waylandDisplay = std::getenv("WAYLAND_DISPLAY");
+    if ((display == nullptr || std::strlen(display) == 0) &&
+        (waylandDisplay == nullptr || std::strlen(waylandDisplay) == 0)) {
+      message += " DISPLAY and WAYLAND_DISPLAY are both unset.";
+    }
+    throw std::runtime_error(message);
   }
 
   glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
@@ -190,7 +203,8 @@ void Application::createInstance() {
   };
 
   std::vector<char const *> requiredLayers;
-  if (kEnableValidationLayers) {
+  validationLayersEnabled_ = kEnableValidationLayers;
+  if (validationLayersEnabled_) {
     requiredLayers.assign(kValidationLayers.begin(), kValidationLayers.end());
   }
 
@@ -204,8 +218,10 @@ void Application::createInstance() {
       });
 
   if (unsupportedLayerIt != requiredLayers.end()) {
-    throw std::runtime_error("Required layer not supported: " +
-                             std::string(*unsupportedLayerIt));
+    std::cerr << "Validation layer not supported (" << *unsupportedLayerIt
+              << "), continuing without validation layers.\n";
+    validationLayersEnabled_ = false;
+    requiredLayers.clear();
   }
 
   auto requiredExtensions = getRequiredInstanceExtensions();
@@ -239,7 +255,7 @@ void Application::createInstance() {
 }
 
 void Application::setupDebugMessenger() {
-  if (!kEnableValidationLayers) {
+  if (!validationLayersEnabled_) {
     return;
   }
 
@@ -315,9 +331,12 @@ void Application::createScene() {
     return object;
   };
 
-  scene_.objects.push_back(makeObject(-0.8f, 0));
+  scene_.objects.push_back(makeObject(-0.25f, 0));
+  scene_.objects.back().transform.translation.z = -0.35f;
   scene_.objects.push_back(makeObject(0.0f, 1));
-  scene_.objects.push_back(makeObject(0.8f, 0));
+  scene_.objects.back().transform.translation.z = 0.15f;
+  scene_.objects.push_back(makeObject(0.25f, 0));
+  scene_.objects.back().transform.translation.z = -0.15f;
 
   scene_.cameras.push_back(Camera{});
   scene_.activeCameraIndex = 0;
@@ -329,7 +348,7 @@ std::vector<char const *> Application::getRequiredInstanceExtensions() {
 
   std::vector<char const *> extensions(glfwExtensions,
                                        glfwExtensions + glfwExtensionCount);
-  if (kEnableValidationLayers) {
+  if (validationLayersEnabled_) {
     extensions.push_back(vk::EXTDebugUtilsExtensionName);
   }
 

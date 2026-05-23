@@ -13,9 +13,6 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # -------------------------------------------------------
 #--: Dependences
-set(VULKAN_SDK_PATH "E:/OpenGL")
-set(Vulakn_INCLUDE_DIR "${VULKAN_SDK_PATH}/Include")
-set(Vulkan_LIBRARY "${VULKAN_SDK_PATH}/Lib/vulkan-1.lib")
 find_package(Vulkan REQUIRED)
 
 add_subdirectory(${CMAKE_SOURCE_DIR}/deps/glfw)
@@ -41,8 +38,10 @@ target_include_directories(${PROJECT_NAME} PRIVATE
 
 target_compile_definitions(${PROJECT_NAME} PRIVATE
   VULKAN_HPP_NO_CONSTRUCTORS
-  VK_USE_PLATFORM_WIN32_KHR
 )
+if(WIN32)
+  target_compile_definitions(${PROJECT_NAME} PRIVATE VK_USE_PLATFORM_WIN32_KHR)
+endif()
 
 target_link_libraries(${PROJECT_NAME} PRIVATE
   Vulkan::Vulkan
@@ -52,13 +51,28 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
 )
 
 set(SHADER_OUTPUT_FILES)
+
+if(TARGET Vulkan::glslangValidator)
+  set(GLSLANG_VALIDATOR "$<TARGET_FILE:Vulkan::glslangValidator>")
+else()
+  find_program(GLSLANG_VALIDATOR
+    NAMES glslangValidator glslangValidator.exe
+    HINTS
+      "$ENV{VULKAN_SDK}/Bin"
+  )
+endif()
+
+if(NOT GLSLANG_VALIDATOR)
+  message(FATAL_ERROR "glslangValidator not found. Install Vulkan SDK or add glslangValidator to PATH.")
+endif()
+
 foreach(SHADER_SOURCE ${SHADER_SOURCE_FILES})
   get_filename_component(SHADER_NAME "${SHADER_SOURCE}" NAME)
   set(SHADER_OUTPUT "${CMAKE_BINARY_DIR}/shaders/${SHADER_NAME}.spv")
   add_custom_command(
     OUTPUT "${SHADER_OUTPUT}"
     COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_BINARY_DIR}/shaders"
-    COMMAND "${VULKAN_SDK_PATH}/Bin/glslangValidator.exe" -V "${SHADER_SOURCE}" -o "${SHADER_OUTPUT}"
+    COMMAND "${GLSLANG_VALIDATOR}" -V "${SHADER_SOURCE}" -o "${SHADER_OUTPUT}"
     DEPENDS "${SHADER_SOURCE}"
     COMMENT "Compiling shader ${SHADER_NAME}"
     VERBATIM

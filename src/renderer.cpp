@@ -62,6 +62,7 @@ void Renderer::recreateForSwapChain(SwapChain const &swapChain) {
   std::vector<vk::Fence> newImagesInFlight(swapChain.images().size(),
                                            vk::Fence{});
   SwapChain const *newSwapChain = &swapChain;
+  DepthResources newDepthResource = createDepthResources(swapChain);
 
   using std::swap;
   swap(pipelineLayout_, newPipelineLayout);
@@ -70,6 +71,7 @@ void Renderer::recreateForSwapChain(SwapChain const &swapChain) {
   swap(swapChainImageLayouts_, newSwapChainImageLayouts);
   swap(imagesInFlight_, newImagesInFlight);
   swap(swapChain_, newSwapChain);
+  swap(depthResources_, newDepthResource);
   currentFrame_ = 0;
   activeFrame_.reset();
 }
@@ -149,6 +151,61 @@ Renderer::MeshGpuResources Renderer::createGeometryResources(Mesh const &mesh) {
   return resources;
 }
 
+Renderer::DepthResources
+Renderer::createDepthResources(SwapChain const &swapChain) const {
+  vk::ImageCreateInfo imageCreateInfo{
+      .imageType = vk::ImageType::e2D,
+      .format = kDepthFormat,
+      .extent =
+          {
+              .width = swapChain.extent().width,
+              .height = swapChain.extent().height,
+              .depth = 1,
+          },
+      .mipLevels = 1,
+      .arrayLayers = 1,
+      .samples = vk::SampleCountFlagBits::e1,
+      .tiling = vk::ImageTiling::eOptimal,
+      .usage = vk::ImageUsageFlagBits::eDepthStencilAttachment,
+      .sharingMode = vk::SharingMode::eExclusive,
+      .initialLayout = vk::ImageLayout::eUndefined,
+  };
+
+  vk::raii::Image image(device_.logicalDevice(), imageCreateInfo);
+  auto memoryRequirements = image.getMemoryRequirements();
+
+  vk::MemoryAllocateInfo allocateInfo{
+      .allocationSize = memoryRequirements.size,
+      .memoryTypeIndex =
+          device_.findMemoryType(memoryRequirements.memoryTypeBits,
+                                 vk::MemoryPropertyFlagBits::eDeviceLocal),
+  };
+
+  vk::raii::DeviceMemory memory(device_.logicalDevice(), allocateInfo);
+  image.bindMemory(*memory, 0);
+
+  vk::ImageViewCreateInfo imageViewCreateInfo{
+      .image = *image,
+      .viewType = vk::ImageViewType::e2D,
+      .format = kDepthFormat,
+      .subresourceRange =
+          {
+              .aspectMask = vk::ImageAspectFlagBits::eDepth,
+              .baseMipLevel = 0,
+              .levelCount = 1,
+              .baseArrayLayer = 0,
+              .layerCount = 1,
+          },
+  };
+  DepthResources resources{};
+  resources.image = std::move(image);
+  resources.memory = std::move(memory);
+  resources.imageView =
+      vk::raii::ImageView(device_.logicalDevice(), imageViewCreateInfo);
+  resources.layout = vk::ImageLayout::eUndefined;
+  return resources;
+}
+
 void Renderer::setMeshes(std::vector<Mesh> const &meshes) {
   if (activeFrame_.has_value()) {
     throw std::runtime_error(
@@ -196,8 +253,8 @@ Renderer::FrameResult Renderer::beginFrame(glm::mat4 const &viewProjMatrix) {
     auto acquire = swapChain_->handle().acquireNextImage(
         std::numeric_limits<std::uint64_t>::max(),
         *frame.imageAvailableSemaphore, nullptr);
-    acquireResult = acquire.first;
-    imageIndex = acquire.second;
+    acquireResult = acquire.result;
+    imageIndex = acquire.value;
   } catch (vk::OutOfDateKHRError const &) {
     return FrameResult::eSwapChainOutOfDate;
   }
@@ -462,6 +519,11 @@ void Renderer::validateSwapChainState() const {
         "Renderer mesh GPU resources are not initialized.");
   }
 
+  if (depthResources_.image == nullptr || depthResources_.memory == nullptr ||
+      depthResources_.imageView == nullptr) {
+    throw std::runtime_error("Renderer depth resources are not initialized.");
+  }
+
   for (auto const &meshResources : meshGpuResources_) {
     if (meshResources.vertexBuffer == nullptr ||
         meshResources.vertexBufferMemory == nullptr ||
@@ -618,6 +680,14 @@ vk::raii::Pipeline Renderer::createGraphicsPipeline(
       .pAttachments = &colorBlendAttachment,
   };
 
+  vk::PipelineDepthStencilStateCreateInfo depthStencil{
+      .depthTestEnable = true,
+      .depthWriteEnable = true,
+      .depthCompareOp = vk::CompareOp::eLess,
+      .depthBoundsTestEnable = false,
+      .stencilTestEnable = false,
+  };
+
   std::array dynamicStates = {
       vk::DynamicState::eViewport,
       vk::DynamicState::eScissor,
@@ -631,6 +701,7 @@ vk::raii::Pipeline Renderer::createGraphicsPipeline(
   vk::PipelineRenderingCreateInfo pipelineRenderingCreateInfo{
       .colorAttachmentCount = 1,
       .pColorAttachmentFormats = &colorAttachmentFormat,
+      .depthAttachmentFormat = kDepthFormat,
   };
 
   vk::GraphicsPipelineCreateInfo pipelineCreateInfo{
@@ -642,6 +713,7 @@ vk::raii::Pipeline Renderer::createGraphicsPipeline(
       .pViewportState = &viewportState,
       .pRasterizationState = &rasterizer,
       .pMultisampleState = &multisampling,
+      .pDepthStencilState = &depthStencil,
       .pColorBlendState = &colorBlending,
       .pDynamicState = &dynamicState,
       .layout = *pipelineLayout,
@@ -678,6 +750,14 @@ void Renderer::beginCommandBuffer(vk::raii::CommandBuffer const &commandBuffer,
       .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
   });
 
+  vk::ClearValue depthClearValue{
+      .depthStencil =
+          vk::ClearDepthStencilValue{
+              .depth = 1.0f,
+              .stencil = 0,
+          },
+  };
+
   transitionSwapChainImage(commandBuffer, imageIndex,
                            vk::ImageLayout::eColorAttachmentOptimal,
                            vk::PipelineStageFlagBits2::eAllCommands,
@@ -688,6 +768,23 @@ void Renderer::beginCommandBuffer(vk::raii::CommandBuffer const &commandBuffer,
   vk::ClearValue clearValue{
       .color =
           vk::ClearColorValue(std::array<float, 4>{0.05f, 0.07f, 0.10f, 1.0f}),
+  };
+
+  transitionDepthImage(commandBuffer, vk::ImageLayout::eDepthAttachmentOptimal,
+                       vk::PipelineStageFlagBits2::eEarlyFragmentTests |
+                           vk::PipelineStageFlagBits2::eLateFragmentTests,
+                       {},
+                       vk::PipelineStageFlagBits2::eEarlyFragmentTests |
+                           vk::PipelineStageFlagBits2::eLateFragmentTests,
+                       vk::AccessFlagBits2::eDepthStencilAttachmentRead |
+                           vk::AccessFlagBits2::eDepthStencilAttachmentWrite);
+
+  vk::RenderingAttachmentInfo depthAttachment{
+      .imageView = *depthResources_.imageView,
+      .imageLayout = vk::ImageLayout::eDepthAttachmentOptimal,
+      .loadOp = vk::AttachmentLoadOp::eClear,
+      .storeOp = vk::AttachmentStoreOp::eDontCare,
+      .clearValue = depthClearValue,
   };
 
   vk::RenderingAttachmentInfo colorAttachment{
@@ -706,6 +803,7 @@ void Renderer::beginCommandBuffer(vk::raii::CommandBuffer const &commandBuffer,
       .layerCount = 1,
       .colorAttachmentCount = 1,
       .pColorAttachments = &colorAttachment,
+      .pDepthAttachment = &depthAttachment,
   };
 
   commandBuffer.beginRendering(renderingInfo);
@@ -777,4 +875,36 @@ void Renderer::transitionSwapChainImage(
 
   commandBuffer.pipelineBarrier2(dependencyInfo);
   swapChainImageLayouts_[imageIndex] = newLayout;
+}
+
+void Renderer::transitionDepthImage(
+    vk::raii::CommandBuffer const &commanderBuffer, vk::ImageLayout newLayout,
+    vk::PipelineStageFlags2 srcStageMask, vk::AccessFlags2 srcAccessMask,
+    vk::PipelineStageFlags2 dstStageMask, vk::AccessFlags2 dstAccessMask) {
+  vk::ImageMemoryBarrier2 barrier{
+      .srcStageMask = srcStageMask,
+      .srcAccessMask = srcAccessMask,
+      .dstStageMask = dstStageMask,
+      .dstAccessMask = dstAccessMask,
+      .oldLayout = depthResources_.layout,
+      .newLayout = newLayout,
+      .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+      .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+      .image = *depthResources_.image,
+      .subresourceRange =
+          {
+              .aspectMask = vk::ImageAspectFlagBits::eDepth,
+              .baseMipLevel = 0,
+              .levelCount = 1,
+              .baseArrayLayer = 0,
+              .layerCount = 1,
+          },
+  };
+  vk::DependencyInfo dependencyInfo{
+      .imageMemoryBarrierCount = 1,
+      .pImageMemoryBarriers = &barrier,
+  };
+
+  commanderBuffer.pipelineBarrier2(dependencyInfo);
+  depthResources_.layout = newLayout;
 }

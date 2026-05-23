@@ -53,6 +53,12 @@ private:
     vk::raii::DeviceMemory indexBufferMemory = nullptr;
     std::uint32_t indexCount = 0;
   };
+  struct DepthResources {
+    vk::raii::Image image = nullptr;
+    vk::raii::DeviceMemory memory = nullptr;
+    vk::raii::ImageView imageView = nullptr;
+    vk::ImageLayout layout = vk::ImageLayout::eUndefined;
+  };
 
   static constexpr std::uint32_t kFramesInFlight = 1;
 
@@ -80,6 +86,9 @@ private:
   void endCommandBuffer(vk::raii::CommandBuffer const &commandBuffer,
                         std::uint32_t imageIndex);
 
+  static constexpr vk::Format kDepthFormat = vk::Format::eD32Sfloat;
+
+  DepthResources createDepthResources(SwapChain const &swapChain) const;
   void transitionSwapChainImage(vk::raii::CommandBuffer const &commandBuffer,
                                 std::uint32_t imageIndex,
                                 vk::ImageLayout newLayout,
@@ -88,7 +97,16 @@ private:
                                 vk::PipelineStageFlags2 dstStageMask,
                                 vk::AccessFlags2 dstAccessMask);
 
+  void transitionDepthImage(vk::raii::CommandBuffer const &commanderBuffer,
+                            vk::ImageLayout newLayout,
+                            vk::PipelineStageFlags2 srcStageMask,
+                            vk::AccessFlags2 srcAccessMask,
+                            vk::PipelineStageFlags2 dstStageMask,
+                            vk::AccessFlags2 dstAccessMask);
+
 private:
+  DepthResources depthResources_{};
+
   Device const &device_;
   SwapChain const *swapChain_ = nullptr;
 
