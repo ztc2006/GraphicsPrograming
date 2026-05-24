@@ -11,6 +11,7 @@
 struct Vertex {
   glm::vec3 position;
   glm::vec3 color;
+  glm::vec2 uv;
 
   static vk::VertexInputBindingDescription bindingDescription() {
     return vk::VertexInputBindingDescription{
@@ -20,7 +21,7 @@ struct Vertex {
     };
   }
 
-  static std::array<vk::VertexInputAttributeDescription, 2>
+  static std::array<vk::VertexInputAttributeDescription, 3>
   attributeDescriptions() {
     return {
         vk::VertexInputAttributeDescription{
@@ -34,6 +35,12 @@ struct Vertex {
             .binding = 0,
             .format = vk::Format::eR32G32B32Sfloat,
             .offset = offsetof(Vertex, color),
+        },
+        vk::VertexInputAttributeDescription{
+            .location = 2,
+            .binding = 0,
+            .format = vk::Format::eR32G32Sfloat,
+            .offset = offsetof(Vertex, uv),
         },
     };
   }

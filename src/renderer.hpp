@@ -60,6 +60,14 @@ private:
     vk::ImageLayout layout = vk::ImageLayout::eUndefined;
   };
 
+  struct TextureResources {
+    vk::raii::Image image = nullptr;
+    vk::raii::DeviceMemory memory = nullptr;
+    vk::raii::ImageView imageView = nullptr;
+    vk::raii::Sampler sampler = nullptr;
+    vk::ImageLayout layout = vk::ImageLayout::eUndefined;
+  };
+
   static constexpr std::uint32_t kFramesInFlight = 1;
 
   static std::vector<char> readBinaryFile(char const *path);
@@ -104,8 +112,19 @@ private:
                             vk::PipelineStageFlags2 dstStageMask,
                             vk::AccessFlags2 dstAccessMask);
 
+  TextureResources createCheckerTextureResources();
+  void transitionTextureImage(TextureResources &texture,
+                              vk::ImageLayout newLayout,
+                              vk::PipelineStageFlags2 srcStageMask,
+                              vk::AccessFlags2 srcAccessMask,
+                              vk::PipelineStageFlags2 dstStageMask,
+                              vk::AccessFlags2 dstAccessMask);
+  void copyBufferToImage(vk::Buffer sourceBuffer, vk::Image destinationImage,
+                         std::uint32_t width, std::uint32_t height);
+
 private:
   DepthResources depthResources_{};
+  TextureResources checkerTexture_{};
 
   Device const &device_;
   SwapChain const *swapChain_ = nullptr;
