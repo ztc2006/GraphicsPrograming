@@ -11,6 +11,7 @@
 #include "scene.hpp"
 #include "scene_object.hpp"
 #include "swap_chain.hpp"
+#include "texture.hpp"
 
 class Renderer {
 public:
@@ -80,14 +81,6 @@ private:
     vk::ImageLayout layout = vk::ImageLayout::eUndefined;
   };
 
-  struct TextureResources {
-    vk::raii::Image image = nullptr;
-    vk::raii::DeviceMemory memory = nullptr;
-    vk::raii::ImageView imageView = nullptr;
-    vk::raii::Sampler sampler = nullptr;
-    vk::ImageLayout layout = vk::ImageLayout::eUndefined;
-  };
-
   struct MaterialGpuResources {
     TextureResources albedoTexture;
     vk::DescriptorSet descriptorSet = nullptr;
@@ -138,22 +131,11 @@ private:
                             vk::PipelineStageFlags2 dstStageMask,
                             vk::AccessFlags2 dstAccessMask);
 
-  TextureResources createCheckerTextureResources();
-  void transitionTextureImage(TextureResources &texture,
-                              vk::ImageLayout newLayout,
-                              vk::PipelineStageFlags2 srcStageMask,
-                              vk::AccessFlags2 srcAccessMask,
-                              vk::PipelineStageFlags2 dstStageMask,
-                              vk::AccessFlags2 dstAccessMask);
-  void copyBufferToImage(vk::Buffer sourceBuffer, vk::Image destinationImage,
-                         std::uint32_t width, std::uint32_t height);
-
   void createFrameDescriptorSetLayout();
   void createMaterialDescriptorSetLayout();
   void createFrameDescriptorPool();
   void allocateAndWriteFrameDescriptorSets();
 
-  TextureResources createTextureResourcesFromFile(std::string const &path);
   vk::raii::DescriptorPool
   createMaterialDescriptorPool(std::uint32_t materialCount) const;
   void writeMaterialDescriptorSets();
