@@ -5,8 +5,6 @@
 #include <algorithm>
 #include <cmath>
 
-#include <GLFW/glfw3.h>
-
 void OrbitCameraController::attach(Camera const &camera) {
   position_ = camera.position;
   glm::vec3 const direction = glm::normalize(camera.target - camera.position);
@@ -38,48 +36,43 @@ void OrbitCameraController::update(Camera &camera) const {
   camera.up = up;
 }
 
-void OrbitCameraController::move(float forwardAmount, float rightAmount,
-                                 float deltaSeconds) {
+void OrbitCameraController::updateFromInput(InputState const &input,
+                                            float deltaSeconds) {
+  if (!input.rightMouseCaptured) {
+    return;
+  }
+
+  yawRadians_ -= static_cast<float>(input.cursorDeltaX) * rotateSensitivity_;
+  pitchRadians_ -= static_cast<float>(input.cursorDeltaY) * rotateSensitivity_;
+  pitchRadians_ = glm::clamp(pitchRadians_, kMinPitch, kMaxPitch);
+
+  float const scale = 1.0f - static_cast<float>(input.scrollDeltaY) *
+                                  zoomSensitivity_;
+  moveSpeed_ = glm::clamp(moveSpeed_ * scale, 0.1f, 20.0f);
+
+  float forwardAmount = 0.0f;
+  float rightAmount = 0.0f;
+  if (input.isKeyDown(GLFW_KEY_W)) {
+    forwardAmount += 1.0f;
+  }
+  if (input.isKeyDown(GLFW_KEY_S)) {
+    forwardAmount -= 1.0f;
+  }
+  if (input.isKeyDown(GLFW_KEY_D)) {
+    rightAmount += 1.0f;
+  }
+  if (input.isKeyDown(GLFW_KEY_A)) {
+    rightAmount -= 1.0f;
+  }
+
   float const cosPitch = std::cos(pitchRadians_);
   glm::vec3 const forward{
       std::sin(yawRadians_) * cosPitch,
       0.0f,
       std::cos(yawRadians_) * cosPitch,
   };
-  glm::vec3 const right = glm::normalize(glm::cross(forward, {0.0f, 1.0f, 0.0f}));
+  glm::vec3 const right =
+      glm::normalize(glm::cross(forward, {0.0f, 1.0f, 0.0f}));
   position_ += forward * (forwardAmount * moveSpeed_ * deltaSeconds);
   position_ += right * (rightAmount * moveSpeed_ * deltaSeconds);
-}
-
-void OrbitCameraController::beginRotate(GLFWwindow *window, double cursorX,
-                                        double cursorY) {
-  rotating_ = true;
-  lastCursorX_ = cursorX;
-  lastCursorY_ = cursorY;
-  glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
-}
-
-void OrbitCameraController::rotate(double cursorX, double cursorY) {
-  if (!rotating_) {
-    return;
-  }
-
-  double const deltaX = cursorX - lastCursorX_;
-  double const deltaY = cursorY - lastCursorY_;
-  lastCursorX_ = cursorX;
-  lastCursorY_ = cursorY;
-
-  yawRadians_ -= static_cast<float>(deltaX) * rotateSensitivity_;
-  pitchRadians_ -= static_cast<float>(deltaY) * rotateSensitivity_;
-  pitchRadians_ = glm::clamp(pitchRadians_, kMinPitch, kMaxPitch);
-}
-
-void OrbitCameraController::endRotate(GLFWwindow *window) {
-  rotating_ = false;
-  glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
-}
-
-void OrbitCameraController::zoom(double yOffset) {
-  float const scale = 1.0f - static_cast<float>(yOffset) * zoomSensitivity_;
-  moveSpeed_ = glm::clamp(moveSpeed_ * scale, 0.1f, 20.0f);
 }

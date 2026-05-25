@@ -394,6 +394,19 @@ void Renderer::setUiDrawCallback(
   uiDrawCallback_ = std::move(callback);
 }
 
+void Renderer::setRasterizerDebugSettings(
+    RasterizerDebugSettings settings) {
+  if (activeFrame_.has_value()) {
+    throw std::runtime_error(
+        "Cannot change rasterizer settings while a frame is in progress.");
+  }
+
+  rasterizerDebugSettings_ = settings;
+  if (swapChain_ != nullptr) {
+    recreateForSwapChain(*swapChain_);
+  }
+}
+
 Renderer::TextureResources
 Renderer::createTextureResourcesFromFile(std::string const &path) {
   int width = 0;
@@ -1018,8 +1031,8 @@ vk::raii::Pipeline Renderer::createGraphicsPipeline(
       .depthClampEnable = false,
       .rasterizerDiscardEnable = false,
       .polygonMode = vk::PolygonMode::eFill,
-      .cullMode = vk::CullModeFlagBits::eNone,
-      .frontFace = vk::FrontFace::eCounterClockwise,
+      .cullMode = rasterizerDebugSettings_.cullMode,
+      .frontFace = rasterizerDebugSettings_.frontFace,
       .depthBiasEnable = false,
       .lineWidth = 1.0f,
   };

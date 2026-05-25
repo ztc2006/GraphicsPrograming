@@ -4,6 +4,7 @@
 #include <memory>
 #include <vector>
 
+#include "input_state.hpp"
 #include "orbit_camera_controller.hpp"
 #include "scene.hpp"
 #include "vulkan_include.hpp"
@@ -71,6 +72,7 @@ private:
   std::vector<char const *> requiredDeviceExtensions_;
   bool validationLayersEnabled_ = false;
   bool imguiInitialized_ = false;
+  InputState input_{};
   Scene scene_{};
   OrbitCameraController orbitCameraController_{};
   std::chrono::steady_clock::time_point animationStartTime_ =

@@ -14,6 +14,11 @@
 
 class Renderer {
 public:
+  struct RasterizerDebugSettings {
+    vk::CullModeFlagBits cullMode = vk::CullModeFlagBits::eNone;
+    vk::FrontFace frontFace = vk::FrontFace::eCounterClockwise;
+  };
+
   enum class FrameResult {
     eSuccess,
     eSwapChainOutOfDate,
@@ -26,6 +31,10 @@ public:
   void setMaterials(std::vector<Material> const &materials);
   void setMaterialTint(MaterialId materialId, glm::vec4 const &tint);
   void setUiDrawCallback(std::function<void(vk::CommandBuffer)> callback);
+  RasterizerDebugSettings rasterizerDebugSettings() const {
+    return rasterizerDebugSettings_;
+  }
+  void setRasterizerDebugSettings(RasterizerDebugSettings settings);
 
   FrameResult beginFrame(glm::mat4 const &viewProjMatrix,
                          glm::vec3 const &cameraPosition,
@@ -175,4 +184,5 @@ private:
   std::vector<vk::Fence> imagesInFlight_;
   std::vector<MeshGpuResources> meshGpuResources_;
   std::function<void(vk::CommandBuffer)> uiDrawCallback_;
+  RasterizerDebugSettings rasterizerDebugSettings_{};
 };

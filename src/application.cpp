@@ -137,26 +137,9 @@ void Application::mainLoop() {
                    static_cast<float>(swapChain_->extent().height);
 
     auto &camera = scene_.cameras[scene_.activeCameraIndex];
-    if (orbitCameraController_.isRotating()) {
-      float forwardAmount = 0.0f;
-      float rightAmount = 0.0f;
-      if (glfwGetKey(window_, GLFW_KEY_W) == GLFW_PRESS) {
-        forwardAmount += 1.0f;
-      }
-      if (glfwGetKey(window_, GLFW_KEY_S) == GLFW_PRESS) {
-        forwardAmount -= 1.0f;
-      }
-      if (glfwGetKey(window_, GLFW_KEY_D) == GLFW_PRESS) {
-        rightAmount += 1.0f;
-      }
-      if (glfwGetKey(window_, GLFW_KEY_A) == GLFW_PRESS) {
-        rightAmount -= 1.0f;
-      }
-      if (forwardAmount != 0.0f || rightAmount != 0.0f) {
-        orbitCameraController_.move(forwardAmount, rightAmount, deltaSeconds);
-      }
-    }
+    orbitCameraController_.updateFromInput(input_, deltaSeconds);
     orbitCameraController_.update(camera);
+    input_.clearFrameDeltas();
     glm::mat4 viewProjMatrix = camera.viewProj(aspect);
 
     auto beginResult = renderer_->beginFrame(viewProjMatrix, camera.position,
@@ -372,6 +355,46 @@ void Application::drawImGui() {
     }
   }
   ImGui::End();
+
+  if (ImGui::Begin("Render Debug")) {
+    Renderer::RasterizerDebugSettings settings =
+        renderer_->rasterizerDebugSettings();
+
+    int cullMode = 0;
+    if (settings.cullMode == vk::CullModeFlagBits::eBack) {
+      cullMode = 1;
+    } else if (settings.cullMode == vk::CullModeFlagBits::eFront) {
+      cullMode = 2;
+    }
+
+    bool changed = false;
+    char const *cullLabels[] = {"None", "Back", "Front"};
+    if (ImGui::Combo("Cull Mode", &cullMode, cullLabels, 3)) {
+      if (cullMode == 1) {
+        settings.cullMode = vk::CullModeFlagBits::eBack;
+      } else if (cullMode == 2) {
+        settings.cullMode = vk::CullModeFlagBits::eFront;
+      } else {
+        settings.cullMode = vk::CullModeFlagBits::eNone;
+      }
+      changed = true;
+    }
+
+    int frontFace =
+        settings.frontFace == vk::FrontFace::eCounterClockwise ? 0 : 1;
+    char const *frontFaceLabels[] = {"Counter-clockwise", "Clockwise"};
+    if (ImGui::Combo("Front Face", &frontFace, frontFaceLabels, 2)) {
+      settings.frontFace = frontFace == 0 ? vk::FrontFace::eCounterClockwise
+                                          : vk::FrontFace::eClockwise;
+      changed = true;
+    }
+
+    if (changed) {
+      device_->logicalDevice().waitIdle();
+      renderer_->setRasterizerDebugSettings(settings);
+    }
+  }
+  ImGui::End();
 }
 
 void Application::cleanupImGui() {
@@ -396,10 +419,21 @@ void Application::framebufferResizeCallback(GLFWwindow *window, int width,
 
 void Application::windowFocusCallback(GLFWwindow *window, int focused) {
   ImGui_ImplGlfw_WindowFocusCallback(window, focused);
+
+  auto *app = static_cast<Application *>(glfwGetWindowUserPointer(window));
+  if (app != nullptr && focused == GLFW_FALSE) {
+    app->input_.clearAll();
+    glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+  }
 }
 
 void Application::cursorEnterCallback(GLFWwindow *window, int entered) {
   ImGui_ImplGlfw_CursorEnterCallback(window, entered);
+
+  auto *app = static_cast<Application *>(glfwGetWindowUserPointer(window));
+  if (app != nullptr) {
+    app->input_.cursorEntered = entered == GLFW_TRUE;
+  }
 }
 
 void Application::mouseButtonCallback(GLFWwindow *window, int button,
@@ -407,18 +441,33 @@ void Application::mouseButtonCallback(GLFWwindow *window, int button,
   ImGui_ImplGlfw_MouseButtonCallback(window, button, action, mods);
 
   auto *app = static_cast<Application *>(glfwGetWindowUserPointer(window));
-  if (app == nullptr || button != GLFW_MOUSE_BUTTON_RIGHT) {
+  if (app == nullptr) {
     return;
   }
 
-  double cursorX = 0.0;
-  double cursorY = 0.0;
-  glfwGetCursorPos(window, &cursorX, &cursorY);
+  if (button >= 0 &&
+      button < static_cast<int>(app->input_.mouseButtons.size())) {
+    if (action == GLFW_PRESS) {
+      app->input_.mouseButtons[button] = true;
+    } else if (action == GLFW_RELEASE) {
+      app->input_.mouseButtons[button] = false;
+    }
+  }
+
+  if (button != GLFW_MOUSE_BUTTON_RIGHT) {
+    return;
+  }
 
   if (action == GLFW_PRESS) {
-    app->orbitCameraController_.beginRotate(window, cursorX, cursorY);
+    app->input_.rightMouseCaptured = true;
+    glfwGetCursorPos(window, &app->input_.cursorX, &app->input_.cursorY);
+    app->input_.cursorDeltaX = 0.0;
+    app->input_.cursorDeltaY = 0.0;
+    app->input_.hasCursorPosition = true;
+    glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
   } else if (action == GLFW_RELEASE) {
-    app->orbitCameraController_.endRotate(window);
+    app->input_.rightMouseCaptured = false;
+    glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
   }
 }
 
@@ -431,7 +480,13 @@ void Application::cursorPositionCallback(GLFWwindow *window, double xpos,
     return;
   }
 
-  app->orbitCameraController_.rotate(xpos, ypos);
+  if (app->input_.hasCursorPosition) {
+    app->input_.cursorDeltaX += xpos - app->input_.cursorX;
+    app->input_.cursorDeltaY += ypos - app->input_.cursorY;
+  }
+  app->input_.cursorX = xpos;
+  app->input_.cursorY = ypos;
+  app->input_.hasCursorPosition = true;
 }
 
 void Application::scrollCallback(GLFWwindow *window, double xoffset,
@@ -443,12 +498,25 @@ void Application::scrollCallback(GLFWwindow *window, double xoffset,
     return;
   }
 
-  app->orbitCameraController_.zoom(yoffset);
+  app->input_.scrollDeltaX += xoffset;
+  app->input_.scrollDeltaY += yoffset;
 }
 
 void Application::keyCallback(GLFWwindow *window, int key, int scancode,
                               int action, int mods) {
   ImGui_ImplGlfw_KeyCallback(window, key, scancode, action, mods);
+
+  auto *app = static_cast<Application *>(glfwGetWindowUserPointer(window));
+  if (app == nullptr || key < 0 ||
+      key >= static_cast<int>(app->input_.keys.size())) {
+    return;
+  }
+
+  if (action == GLFW_PRESS) {
+    app->input_.keys[key] = true;
+  } else if (action == GLFW_RELEASE) {
+    app->input_.keys[key] = false;
+  }
 }
 
 void Application::charCallback(GLFWwindow *window, unsigned int codepoint) {
