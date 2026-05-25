@@ -27,7 +27,8 @@ public:
   void setUiDrawCallback(std::function<void(vk::CommandBuffer)> callback);
 
   FrameResult beginFrame(glm::mat4 const &viewProjMatrix,
-                         glm::vec3 const &cameraPosition);
+                         glm::vec3 const &cameraPosition,
+                         LightingSettings const &lighting);
   void drawObject(MeshId meshId, MaterialId materialId,
                   glm::mat4 const &modelMatrix);
 
@@ -36,7 +37,8 @@ public:
   FrameResult drawFrame(MeshId meshId, MaterialId materialId,
                         glm::mat4 const &modelMatrix,
                         glm::mat4 const &viewProjMatrix,
-                        glm::vec3 const &cameraPosition);
+                        glm::vec3 const &cameraPosition,
+                        LightingSettings const &lighting);
   void recreateForSwapChain(SwapChain const &swapChain);
 
 private:
@@ -93,7 +95,8 @@ private:
   void createCommandPool();
   void updateFrameUniformBuffer(FrameContext &frame,
                                 glm::mat4 const &viewProjMatrix,
-                                glm::vec3 const &cameraPosition) const;
+                                glm::vec3 const &cameraPosition,
+                                LightingSettings const &lighting) const;
 
   void validateSwapChainCandidate(SwapChain const &swapChain) const;
   void validateSwapChainState() const;

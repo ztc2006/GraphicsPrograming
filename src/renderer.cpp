@@ -23,6 +23,7 @@ struct FrameUniformBufferObject {
   glm::vec4 lightDirection{0.0f, 1.0f, 0.3f, 0.0f};
   glm::vec4 lightColor{1.0f, 0.98f, 0.92f, 1.0f};
   glm::vec4 ambientColor{0.08f, 0.08f, 0.1f, 1.0f};
+  glm::vec4 lightingParams{1.0f, 0.35f, 32.0f, 0.0f};
 };
 } // namespace
 
@@ -619,7 +620,8 @@ void Renderer::writeMaterialDescriptorSets() {
 }
 
 Renderer::FrameResult Renderer::beginFrame(glm::mat4 const &viewProjMatrix,
-                                           glm::vec3 const &cameraPosition) {
+                                           glm::vec3 const &cameraPosition,
+                                           LightingSettings const &lighting) {
   validateSwapChainState();
 
   if (activeFrame_.has_value()) {
@@ -667,7 +669,7 @@ Renderer::FrameResult Renderer::beginFrame(glm::mat4 const &viewProjMatrix,
   device_.logicalDevice().resetFences({*frame.inFlightFence});
 
   commandBuffer.reset();
-  updateFrameUniformBuffer(frame, viewProjMatrix, cameraPosition);
+  updateFrameUniformBuffer(frame, viewProjMatrix, cameraPosition, lighting);
   beginCommandBuffer(commandBuffer, frame, imageIndex);
 
   activeFrame_ = ActiveFrameState{
@@ -796,8 +798,10 @@ Renderer::FrameResult Renderer::endFrame() {
 Renderer::FrameResult Renderer::drawFrame(MeshId meshId, MaterialId materialId,
                                           glm::mat4 const &modelMatrix,
                                           glm::mat4 const &viewProjMatrix,
-                                          glm::vec3 const &cameraPosition) {
-  FrameResult beginResult = beginFrame(viewProjMatrix, cameraPosition);
+                                          glm::vec3 const &cameraPosition,
+                                          LightingSettings const &lighting) {
+  FrameResult beginResult =
+      beginFrame(viewProjMatrix, cameraPosition, lighting);
   if (beginResult != FrameResult::eSuccess) {
     return beginResult;
   }
@@ -1083,12 +1087,23 @@ void Renderer::createCommandBuffers() {
 
 void Renderer::updateFrameUniformBuffer(FrameContext &frame,
                                         glm::mat4 const &viewProjMatrix,
-                                        glm::vec3 const &cameraPosition) const {
+                                        glm::vec3 const &cameraPosition,
+                                        LightingSettings const &lighting) const {
   FrameUniformBufferObject ubo{};
   ubo.viewProj = viewProjMatrix;
   ubo.cameraPosition = glm::vec4(cameraPosition, 1.0f);
-  ubo.lightDirection =
-      glm::vec4(glm::normalize(glm::vec3{-0.4f, 1.0f, 0.3f}), 0.0f);
+  glm::vec3 lightDirection = lighting.direction;
+  if (glm::length(lightDirection) <= 0.0001f) {
+    lightDirection = {0.0f, 1.0f, 0.0f};
+  }
+  ubo.lightDirection = glm::vec4(glm::normalize(lightDirection), 0.0f);
+  glm::vec3 const lightColor = lighting.color * lighting.intensity;
+  ubo.lightColor = glm::vec4(lightColor, 1.0f);
+  ubo.ambientColor =
+      glm::vec4(lightColor * lighting.ambientStrength, 1.0f);
+  ubo.lightingParams = glm::vec4(lighting.diffuseStrength,
+                                 lighting.specularStrength,
+                                 lighting.shininess, 0.0f);
 
   void *mapped = frame.uniformBufferMemory.mapMemory(0, sizeof(ubo));
   std::memcpy(mapped, &ubo, sizeof(ubo));

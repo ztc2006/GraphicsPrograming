@@ -13,6 +13,7 @@ layout(set = 0, binding = 0) uniform FrameUbo {
   vec4 lightDirection;
   vec4 lightColor;
   vec4 ambientColor;
+  vec4 lightingParams;
 } ubo;
 
 layout(location = 0) in vec3 inColor;
@@ -35,8 +36,10 @@ void main()
   vec3 H = normalize(L + V);
 
   float nDotL = dot(N, L);
-  float diffuse = max(nDotL, 0.0);
-  float specular = nDotL > 0.0 ? pow(max(dot(N, H), 0.0), 32.0) : 0.0;
+  float diffuse = max(nDotL, 0.0) * ubo.lightingParams.x;
+  float specular = nDotL > 0.0 ? pow(max(dot(N, H), 0.0), ubo.lightingParams.z)
+                                     * ubo.lightingParams.y
+                               : 0.0;
 
   vec3 lit = albedo * (ubo.ambientColor.rgb + ubo.lightColor.rgb * diffuse)
       + ubo.lightColor.rgb * specular;

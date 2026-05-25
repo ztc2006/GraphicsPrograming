@@ -135,7 +135,8 @@ void Application::mainLoop() {
     orbitCameraController_.update(camera);
     glm::mat4 viewProjMatrix = camera.viewProj(aspect);
 
-    auto beginResult = renderer_->beginFrame(viewProjMatrix, camera.position);
+    auto beginResult = renderer_->beginFrame(viewProjMatrix, camera.position,
+                                             scene_.lighting);
     if (beginResult != Renderer::FrameResult::eSuccess) {
       recreateSwapChain();
       continue;
@@ -279,15 +280,23 @@ void Application::drawImGui() {
     ImGui::Text("Target: %.2f, %.2f, %.2f", camera.target.x, camera.target.y,
                 camera.target.z);
     ImGui::Text("FOV: %.1f deg", glm::degrees(camera.fovRadians));
-    ImGui::TextUnformatted("Middle mouse drag: orbit");
+    ImGui::TextUnformatted("Right mouse drag: orbit");
     ImGui::TextUnformatted("Wheel: zoom");
   }
   ImGui::End();
 
   if (ImGui::Begin("Lighting")) {
     ImGui::TextUnformatted("Directional Blinn-Phong");
-    ImGui::TextUnformatted("Light params are currently fixed in Frame UBO.");
-    ImGui::TextUnformatted("Next slice: expose editable light values.");
+    ImGui::DragFloat3("Direction", &scene_.lighting.direction.x, 0.01f);
+    ImGui::SliderFloat("Intensity", &scene_.lighting.intensity, 0.0f, 4.0f);
+    ImGui::ColorEdit3("Color", &scene_.lighting.color.x);
+    ImGui::SliderFloat("Ambient", &scene_.lighting.ambientStrength, 0.0f,
+                       0.5f);
+    ImGui::SliderFloat("Diffuse", &scene_.lighting.diffuseStrength, 0.0f,
+                       2.0f);
+    ImGui::SliderFloat("Specular", &scene_.lighting.specularStrength, 0.0f,
+                       4.0f);
+    ImGui::SliderFloat("Shininess", &scene_.lighting.shininess, 1.0f, 128.0f);
   }
   ImGui::End();
 }
@@ -325,7 +334,7 @@ void Application::mouseButtonCallback(GLFWwindow *window, int button,
   ImGui_ImplGlfw_MouseButtonCallback(window, button, action, mods);
 
   auto *app = static_cast<Application *>(glfwGetWindowUserPointer(window));
-  if (app == nullptr || button != GLFW_MOUSE_BUTTON_MIDDLE) {
+  if (app == nullptr || button != GLFW_MOUSE_BUTTON_RIGHT) {
     return;
   }
 
@@ -553,6 +562,7 @@ void Application::createScene() {
   scene_.cameras.push_back(Camera{});
   scene_.activeCameraIndex = 0;
   orbitCameraController_.attach(scene_.cameras[scene_.activeCameraIndex]);
+  scene_.lighting = LightingSettings{};
 }
 
 std::vector<char const *> Application::getRequiredInstanceExtensions() {
