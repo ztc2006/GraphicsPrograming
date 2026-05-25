@@ -298,12 +298,36 @@ void Application::drawImGui() {
                                ImGuiDockNodeFlags_PassthruCentralNode);
 
   if (ImGui::Begin("Camera")) {
-    Camera const &camera = scene_.cameras[scene_.activeCameraIndex];
+    Camera &camera = scene_.cameras[scene_.activeCameraIndex];
     ImGui::Text("Position: %.2f, %.2f, %.2f", camera.position.x,
                 camera.position.y, camera.position.z);
     ImGui::Text("Target: %.2f, %.2f, %.2f", camera.target.x, camera.target.y,
                 camera.target.z);
-    ImGui::Text("FOV: %.1f deg", glm::degrees(camera.fovRadians));
+
+    float fovDegrees = glm::degrees(camera.fovRadians);
+    if (ImGui::SliderFloat("FOV", &fovDegrees, 20.0f, 90.0f, "%.1f deg")) {
+      camera.fovRadians = glm::radians(fovDegrees);
+    }
+    ImGui::DragFloat("Near", &camera.nearPlane, 0.01f, 0.01f,
+                     camera.farPlane - 0.01f);
+    ImGui::DragFloat("Far", &camera.farPlane, 0.1f,
+                     camera.nearPlane + 0.01f, 200.0f);
+
+    float moveSpeed = orbitCameraController_.moveSpeed();
+    if (ImGui::SliderFloat("Move Speed", &moveSpeed, 0.1f, 20.0f)) {
+      orbitCameraController_.setMoveSpeed(moveSpeed);
+    }
+    float sensitivity = orbitCameraController_.rotateSensitivity();
+    if (ImGui::SliderFloat("Look Sensitivity", &sensitivity, 0.0005f, 0.05f,
+                           "%.4f")) {
+      orbitCameraController_.setRotateSensitivity(sensitivity);
+    }
+
+    if (ImGui::Button("Reset Camera")) {
+      camera = Camera{};
+      orbitCameraController_.reset(camera);
+    }
+
     ImGui::TextUnformatted("Right mouse: look");
     ImGui::TextUnformatted("Right mouse + WASD: fly");
     ImGui::TextUnformatted("Wheel: speed");

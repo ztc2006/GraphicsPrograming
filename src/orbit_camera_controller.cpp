@@ -15,6 +15,14 @@ void OrbitCameraController::attach(Camera const &camera) {
   pitchRadians_ = glm::clamp(pitchRadians_, kMinPitch, kMaxPitch);
 }
 
+void OrbitCameraController::setMoveSpeed(float speed) {
+  moveSpeed_ = glm::clamp(speed, 0.1f, 20.0f);
+}
+
+void OrbitCameraController::setRotateSensitivity(float sensitivity) {
+  rotateSensitivity_ = glm::clamp(sensitivity, 0.0005f, 0.05f);
+}
+
 void OrbitCameraController::update(Camera &camera) const {
   float const cosPitch = std::cos(pitchRadians_);
   glm::vec3 const forward{
