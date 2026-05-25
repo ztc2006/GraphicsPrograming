@@ -15,6 +15,12 @@ public:
   void move(float forwardAmount, float rightAmount, float deltaSeconds);
   void zoom(double yOffset);
   bool isRotating() const { return rotating_; }
+  void reset(Camera const &camera) { attach(camera); }
+
+  float moveSpeed() const { return moveSpeed_; }
+  void setMoveSpeed(float speed);
+  float rotateSensitivity() const { return rotateSensitivity_; }
+  void setRotateSensitivity(float sensitivity);
 
 private:
   static constexpr float kMinPitch = -1.45f;
