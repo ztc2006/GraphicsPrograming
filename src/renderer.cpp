@@ -6,6 +6,7 @@
 #include <cstring>
 #include <fstream>
 #include <limits>
+#include <stb_image.h>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -13,6 +14,7 @@
 namespace {
 struct PushConstants {
   glm::mat4 transform{1.0f};
+  glm::vec4 materialTint{1.0f};
 };
 
 struct FrameUniformBufferObject {
@@ -33,14 +35,20 @@ void Renderer::recreateForSwapChain(SwapChain const &swapChain) {
   validateSwapChainCandidate(swapChain);
 
   vk::PushConstantRange pushConstantRange{
-      .stageFlags = vk::ShaderStageFlagBits::eVertex,
+      .stageFlags =
+          vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment,
       .offset = 0,
       .size = sizeof(PushConstants),
   };
-  vk::DescriptorSetLayout layout = *descriptorSetLayout_;
+
+  std::array layouts = {
+      *frameDescriptorSetLayout_,
+      *materialDescriptorSetLayout_,
+  };
+
   vk::PipelineLayoutCreateInfo pipelineLayoutCreateInfo{
-      .setLayoutCount = 1,
-      .pSetLayouts = &layout,
+      .setLayoutCount = static_cast<std::uint32_t>(layouts.size()),
+      .pSetLayouts = layouts.data(),
       .pushConstantRangeCount = 1,
       .pPushConstantRanges = &pushConstantRange,
   };
@@ -79,10 +87,10 @@ void Renderer::recreateForSwapChain(SwapChain const &swapChain) {
 void Renderer::createPersistentResources() {
   createCommandPool();
   createFrameResources();
-  checkerTexture_ = createCheckerTextureResources();
-  createDescriptorSetLayout();
-  createDescriptorPool();
-  allocateAndWriteDescriptorSets();
+  createFrameDescriptorSetLayout();
+  createMaterialDescriptorSetLayout();
+  createFrameDescriptorPool();
+  allocateAndWriteFrameDescriptorSets();
   createCommandBuffers();
 }
 
@@ -337,6 +345,269 @@ void Renderer::setMeshes(std::vector<Mesh> const &meshes) {
   meshGpuResources_.swap(newMeshGpuResources);
 }
 
+void Renderer::setMaterials(std::vector<Material> const &materials) {
+  if (activeFrame_.has_value()) {
+    throw std::runtime_error(
+        "Cannot replace renderer materials while a frame is in progress.");
+  }
+  if (materials.empty()) {
+    throw std::runtime_error("Renderer requires at least one material.");
+  }
+
+  std::vector<MaterialGpuResources> newMaterials;
+  newMaterials.reserve(materials.size());
+
+  for (Material const &material : materials) {
+    if (material.albedoPath.empty()) {
+      throw std::runtime_error("Material albedo path is empty.");
+    }
+
+    MaterialGpuResources resources{};
+    resources.albedoTexture =
+        createTextureResourcesFromFile(material.albedoPath);
+    resources.tint = material.tint;
+    newMaterials.push_back(std::move(resources));
+  }
+
+  vk::raii::DescriptorPool newPool = createMaterialDescriptorPool(
+      static_cast<std::uint32_t>(newMaterials.size()));
+  materialGpuResources_.swap(newMaterials);
+  materialDescriptorPool_ = std::move(newPool);
+  writeMaterialDescriptorSets();
+}
+
+Renderer::TextureResources
+Renderer::createTextureResourcesFromFile(std::string const &path) {
+  int width = 0;
+  int height = 0;
+  int channels = 0;
+
+  std::unique_ptr<stbi_uc, decltype(&stbi_image_free)> pixels(
+      stbi_load(path.c_str(), &width, &height, &channels, STBI_rgb_alpha),
+      stbi_image_free);
+
+  if (!pixels) {
+    throw std::runtime_error("Failed to load texture: " + path + " (" +
+                             stbi_failure_reason() + ")");
+  }
+  if (width <= 0 || height <= 0) {
+    throw std::runtime_error("Texture has invalid dimensions: " + path);
+  }
+
+  vk::DeviceSize imageSize = static_cast<vk::DeviceSize>(width) *
+                             static_cast<vk::DeviceSize>(height) * 4;
+
+  auto [stagingBuffer, stagingMemory] =
+      device_.createBuffer(imageSize, vk::BufferUsageFlagBits::eTransferSrc,
+                           vk::MemoryPropertyFlagBits::eHostVisible |
+                               vk::MemoryPropertyFlagBits::eHostCoherent);
+
+  void *mapped = stagingMemory.mapMemory(0, imageSize);
+  std::memcpy(mapped, pixels.get(), static_cast<std::size_t>(imageSize));
+  stagingMemory.unmapMemory();
+
+  vk::ImageCreateInfo imageCreateInfo{
+      .imageType = vk::ImageType::e2D,
+      .format = vk::Format::eR8G8B8A8Unorm,
+      .extent = {static_cast<std::uint32_t>(width),
+                 static_cast<std::uint32_t>(height), 1},
+      .mipLevels = 1,
+      .arrayLayers = 1,
+      .samples = vk::SampleCountFlagBits::e1,
+      .tiling = vk::ImageTiling::eOptimal,
+      .usage = vk::ImageUsageFlagBits::eTransferDst |
+               vk::ImageUsageFlagBits::eSampled,
+      .sharingMode = vk::SharingMode::eExclusive,
+      .initialLayout = vk::ImageLayout::eUndefined,
+  };
+
+  vk::raii::Image image(device_.logicalDevice(), imageCreateInfo);
+  auto memoryRequirements = image.getMemoryRequirements();
+
+  vk::MemoryAllocateInfo allocteInfo{
+      .allocationSize = memoryRequirements.size,
+      .memoryTypeIndex =
+          device_.findMemoryType(memoryRequirements.memoryTypeBits,
+                                 vk::MemoryPropertyFlagBits::eDeviceLocal),
+  };
+
+  vk::raii::DeviceMemory memory(device_.logicalDevice(), allocteInfo);
+  image.bindMemory(*memory, 0);
+
+  TextureResources resources{};
+  resources.image = std::move(image);
+  resources.memory = std::move(memory);
+
+  transitionTextureImage(resources, vk::ImageLayout::eTransferDstOptimal,
+                         vk::PipelineStageFlagBits2::eTopOfPipe, {},
+                         vk::PipelineStageFlagBits2::eTransfer,
+                         vk::AccessFlagBits2::eTransferWrite);
+
+  copyBufferToImage(*stagingBuffer, *resources.image,
+                    static_cast<std::uint32_t>(width),
+                    static_cast<std::uint32_t>(height));
+
+  transitionTextureImage(resources, vk::ImageLayout::eShaderReadOnlyOptimal,
+                         vk::PipelineStageFlagBits2::eTransfer,
+                         vk::AccessFlagBits2::eTransferWrite,
+                         vk::PipelineStageFlagBits2::eFragmentShader,
+                         vk::AccessFlagBits2::eShaderSampledRead);
+
+  vk::ImageViewCreateInfo imageViewCreateInfo{
+      .image = *resources.image,
+      .viewType = vk::ImageViewType::e2D,
+      .format = vk::Format::eR8G8B8A8Unorm,
+      .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+  };
+  resources.imageView =
+      vk::raii::ImageView(device_.logicalDevice(), imageViewCreateInfo);
+
+  vk::SamplerCreateInfo samplerCreateInfo{
+      .magFilter = vk::Filter::eLinear,
+      .minFilter = vk::Filter::eLinear,
+      .mipmapMode = vk::SamplerMipmapMode::eNearest,
+      .addressModeU = vk::SamplerAddressMode::eRepeat,
+      .addressModeV = vk::SamplerAddressMode::eRepeat,
+      .addressModeW = vk::SamplerAddressMode::eRepeat,
+      .maxAnisotropy = 1.0f,
+      .compareOp = vk::CompareOp::eAlways,
+      .borderColor = vk::BorderColor::eIntOpaqueBlack,
+  };
+  resources.sampler =
+      vk::raii::Sampler(device_.logicalDevice(), samplerCreateInfo);
+
+  return resources;
+}
+void Renderer::createFrameDescriptorSetLayout() {
+  vk::DescriptorSetLayoutBinding binding{
+      .binding = 0,
+      .descriptorType = vk::DescriptorType::eUniformBuffer,
+      .descriptorCount = 1,
+      .stageFlags = vk::ShaderStageFlagBits::eVertex,
+  };
+
+  vk::DescriptorSetLayoutCreateInfo createInfo{
+      .bindingCount = 1,
+      .pBindings = &binding,
+  };
+  frameDescriptorSetLayout_ =
+      vk::raii::DescriptorSetLayout(device_.logicalDevice(), createInfo);
+}
+
+void Renderer::createMaterialDescriptorSetLayout() {
+  vk::DescriptorSetLayoutBinding binding{
+      .binding = 0,
+      .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+      .descriptorCount = 1,
+      .stageFlags = vk::ShaderStageFlagBits::eFragment,
+  };
+
+  vk::DescriptorSetLayoutCreateInfo createInfo{
+      .bindingCount = 1,
+      .pBindings = &binding,
+  };
+  materialDescriptorSetLayout_ =
+      vk::raii::DescriptorSetLayout(device_.logicalDevice(), createInfo);
+}
+
+void Renderer::createFrameDescriptorPool() {
+  vk::DescriptorPoolSize poolSize{
+      .type = vk::DescriptorType::eUniformBuffer,
+      .descriptorCount = kFramesInFlight,
+  };
+
+  vk::DescriptorPoolCreateInfo createInfo{
+      .maxSets = kFramesInFlight,
+      .poolSizeCount = 1,
+      .pPoolSizes = &poolSize,
+  };
+  frameDescriptorPool_ =
+      vk::raii::DescriptorPool(device_.logicalDevice(), createInfo);
+}
+
+vk::raii::DescriptorPool
+Renderer::createMaterialDescriptorPool(std::uint32_t materialCount) const {
+  vk::DescriptorPoolSize poolSize{
+      .type = vk::DescriptorType::eCombinedImageSampler,
+      .descriptorCount = materialCount,
+  };
+
+  vk::DescriptorPoolCreateInfo createInfo{
+      .maxSets = materialCount,
+      .poolSizeCount = 1,
+      .pPoolSizes = &poolSize,
+  };
+  return vk::raii::DescriptorPool(device_.logicalDevice(), createInfo);
+}
+
+void Renderer::allocateAndWriteFrameDescriptorSets() {
+  std::vector<vk::DescriptorSetLayout> layouts(frames_.size(),
+                                               *frameDescriptorSetLayout_);
+  vk::DescriptorSetAllocateInfo allocateInfo{
+      .descriptorPool = *frameDescriptorPool_,
+      .descriptorSetCount = static_cast<std::uint32_t>(layouts.size()),
+      .pSetLayouts = layouts.data(),
+  };
+
+  auto descriptorSets =
+      (*device_.logicalDevice()).allocateDescriptorSets(allocateInfo);
+
+  for (std::size_t index = 0; index < frames_.size(); ++index) {
+    frames_[index].descriptorSet = descriptorSets[index];
+
+    vk::DescriptorBufferInfo bufferInfo{
+        .buffer = *frames_[index].uniformBuffer,
+        .offset = 0,
+        .range = sizeof(FrameUniformBufferObject),
+    };
+
+    vk::WriteDescriptorSet write{
+        .dstSet = frames_[index].descriptorSet,
+        .dstBinding = 0,
+        .descriptorCount = 1,
+        .descriptorType = vk::DescriptorType::eUniformBuffer,
+        .pBufferInfo = &bufferInfo,
+    };
+
+    device_.logicalDevice().updateDescriptorSets({write}, {});
+  }
+}
+
+void Renderer::writeMaterialDescriptorSets() {
+  std::vector<vk::DescriptorSetLayout> layouts(materialGpuResources_.size(),
+                                               *materialDescriptorSetLayout_);
+
+  vk::DescriptorSetAllocateInfo allocateInfo{
+      .descriptorPool = *materialDescriptorPool_,
+      .descriptorSetCount = static_cast<std::uint32_t>(layouts.size()),
+      .pSetLayouts = layouts.data(),
+  };
+
+  auto descriptorSets =
+      (*device_.logicalDevice()).allocateDescriptorSets(allocateInfo);
+
+  for (std::size_t index = 0; index < materialGpuResources_.size(); ++index) {
+    auto &material = materialGpuResources_[index];
+    material.descriptorSet = descriptorSets[index];
+
+    vk::DescriptorImageInfo imageInfo{
+        .sampler = *material.albedoTexture.sampler,
+        .imageView = *material.albedoTexture.imageView,
+        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+    };
+
+    vk::WriteDescriptorSet write{
+        .dstSet = material.descriptorSet,
+        .dstBinding = 0,
+        .descriptorCount = 1,
+        .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+        .pImageInfo = &imageInfo,
+    };
+
+    device_.logicalDevice().updateDescriptorSets({write}, {});
+  }
+}
+
 Renderer::FrameResult Renderer::beginFrame(glm::mat4 const &viewProjMatrix) {
   validateSwapChainState();
 
@@ -397,7 +668,8 @@ Renderer::FrameResult Renderer::beginFrame(glm::mat4 const &viewProjMatrix) {
   return FrameResult::eSuccess;
 }
 
-void Renderer::drawObject(MeshId meshId, glm::mat4 const &modelMatrix) {
+void Renderer::drawObject(MeshId meshId, MaterialId materialId,
+                          glm::mat4 const &modelMatrix) {
   if (!activeFrame_.has_value()) {
     throw std::runtime_error("Cannot draw without an active frame.");
   }
@@ -406,15 +678,13 @@ void Renderer::drawObject(MeshId meshId, glm::mat4 const &modelMatrix) {
     throw std::runtime_error("Renderer mesh id is out of range.");
   }
 
-  MeshGpuResources const &meshResources = meshGpuResources_[meshId];
-  if (meshResources.vertexBuffer == nullptr ||
-      meshResources.vertexBufferMemory == nullptr ||
-      meshResources.indexBuffer == nullptr ||
-      meshResources.indexBufferMemory == nullptr ||
-      meshResources.indexCount == 0) {
-    throw std::runtime_error(
-        "Renderer mesh GPU resources are not initialized.");
+  if (materialId >= materialGpuResources_.size()) {
+    throw std::runtime_error("Renderer material id is out of range.");
   }
+
+  MeshGpuResources const &meshResources = meshGpuResources_[meshId];
+  MaterialGpuResources const &materialResource =
+      materialGpuResources_[materialId];
 
   auto const &frameState = *activeFrame_;
   auto &commandBuffer = commandBuffers_[frameState.frameIndex];
@@ -425,12 +695,20 @@ void Renderer::drawObject(MeshId meshId, glm::mat4 const &modelMatrix) {
   commandBuffer.bindIndexBuffer(*meshResources.indexBuffer, 0,
                                 vk::IndexType::eUint32);
 
+  commandBuffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics,
+                                   *pipelineLayout_, 1,
+                                   {materialResource.descriptorSet}, {});
+
   PushConstants pushConstants{
       .transform = modelMatrix,
+      .materialTint = materialResource.tint,
   };
 
   commandBuffer.pushConstants<PushConstants>(
-      *pipelineLayout_, vk::ShaderStageFlagBits::eVertex, 0, pushConstants);
+      *pipelineLayout_,
+      vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0,
+      pushConstants);
+
   commandBuffer.drawIndexed(meshResources.indexCount, 1, 0, 0, 0);
 }
 
@@ -505,6 +783,7 @@ Renderer::FrameResult Renderer::endFrame() {
 }
 
 Renderer::FrameResult Renderer::drawFrame(MeshId meshId,
+                                          MaterialId materialId,
                                           glm::mat4 const &modelMatrix,
                                           glm::mat4 const &viewProjMatrix) {
   FrameResult beginResult = beginFrame(viewProjMatrix);
@@ -512,7 +791,7 @@ Renderer::FrameResult Renderer::drawFrame(MeshId meshId,
     return beginResult;
   }
 
-  drawObject(meshId, modelMatrix);
+  drawObject(meshId, materialId, modelMatrix);
   return endFrame();
 }
 
@@ -594,11 +873,6 @@ void Renderer::validateSwapChainState() const {
     throw std::runtime_error("Renderer graphics pipeline is not initialized.");
   }
 
-  if (descriptorSetLayout_ == nullptr || descriptorPool_ == nullptr) {
-    throw std::runtime_error(
-        "Renderer descriptor resources are not initialized.");
-  }
-
   if (swapChain_->imageViews().size() != imageCount) {
     throw std::runtime_error(
         "Renderer swapchain image view count does not match image count.");
@@ -625,6 +899,11 @@ void Renderer::validateSwapChainState() const {
         "Renderer mesh GPU resources are not initialized.");
   }
 
+  if (materialGpuResources_.empty()) {
+    throw std::runtime_error(
+        "Renderer material GPU resources are not initialized.");
+  }
+
   if (depthResources_.image == nullptr || depthResources_.memory == nullptr ||
       depthResources_.imageView == nullptr) {
     throw std::runtime_error("Renderer depth resources are not initialized.");
@@ -637,14 +916,19 @@ void Renderer::validateSwapChainState() const {
         meshResources.indexBufferMemory == nullptr ||
         meshResources.indexCount == 0) {
       throw std::runtime_error(
-          "Renderer mesh GPU resources  are not initialized.");
+          "Renderer mesh GPU resources are not initialized.");
     }
   }
 
-  if (checkerTexture_.image == nullptr || checkerTexture_.memory == nullptr ||
-      checkerTexture_.imageView == nullptr ||
-      checkerTexture_.sampler == nullptr) {
-    throw std::runtime_error("Renderer checker texture is not initialized.");
+  for (auto const &materialResources : materialGpuResources_) {
+    if (materialResources.albedoTexture.image == nullptr ||
+        materialResources.albedoTexture.memory == nullptr ||
+        materialResources.albedoTexture.imageView == nullptr ||
+        materialResources.albedoTexture.sampler == nullptr ||
+        materialResources.descriptorSet == nullptr) {
+      throw std::runtime_error(
+          "Renderer material GPU resources are not initialized.");
+    }
   }
 }
 
@@ -654,98 +938,6 @@ void Renderer::createCommandPool() {
       .queueFamilyIndex = device_.graphicsQueueFamilyIndex(),
   };
   commandPool_ = vk::raii::CommandPool(device_.logicalDevice(), createInfo);
-}
-
-void Renderer::createDescriptorSetLayout() {
-  std::array bindings = {
-      vk::DescriptorSetLayoutBinding{
-          .binding = 0,
-          .descriptorType = vk::DescriptorType::eUniformBuffer,
-          .descriptorCount = 1,
-          .stageFlags = vk::ShaderStageFlagBits::eVertex,
-      },
-      vk::DescriptorSetLayoutBinding{
-          .binding = 1,
-          .descriptorType = vk::DescriptorType::eCombinedImageSampler,
-          .descriptorCount = 1,
-          .stageFlags = vk::ShaderStageFlagBits::eFragment,
-      },
-  };
-
-  vk::DescriptorSetLayoutCreateInfo createInfo{
-      .bindingCount = static_cast<std::uint32_t>(bindings.size()),
-      .pBindings = bindings.data(),
-  };
-
-  descriptorSetLayout_ =
-      vk::raii::DescriptorSetLayout(device_.logicalDevice(), createInfo);
-}
-
-void Renderer::createDescriptorPool() {
-  std::array poolSizes = {
-      vk::DescriptorPoolSize{
-          .type = vk::DescriptorType::eUniformBuffer,
-          .descriptorCount = kFramesInFlight,
-      },
-      vk::DescriptorPoolSize{
-          .type = vk::DescriptorType::eCombinedImageSampler,
-          .descriptorCount = kFramesInFlight,
-      },
-  };
-
-  vk::DescriptorPoolCreateInfo createInfo{
-      .maxSets = kFramesInFlight,
-      .poolSizeCount = static_cast<std::uint32_t>(poolSizes.size()),
-      .pPoolSizes = poolSizes.data(),
-  };
-  descriptorPool_ =
-      vk::raii::DescriptorPool(device_.logicalDevice(), createInfo);
-}
-
-void Renderer::allocateAndWriteDescriptorSets() {
-  std::vector<vk::DescriptorSetLayout> layouts(frames_.size(),
-                                               *descriptorSetLayout_);
-  vk::DescriptorSetAllocateInfo allocateInfo{
-      .descriptorPool = *descriptorPool_,
-      .descriptorSetCount = static_cast<std::uint32_t>(layouts.size()),
-      .pSetLayouts = layouts.data(),
-  };
-  auto descriptorSets =
-      (*device_.logicalDevice()).allocateDescriptorSets(allocateInfo);
-
-  for (std::size_t index = 0; index < frames_.size(); ++index) {
-    frames_[index].descriptorSet = descriptorSets[index];
-
-    vk::DescriptorBufferInfo bufferInfo{
-        .buffer = *frames_[index].uniformBuffer,
-        .offset = 0,
-        .range = sizeof(FrameUniformBufferObject),
-    };
-
-    vk::DescriptorImageInfo imageInfo{
-        .sampler = *checkerTexture_.sampler,
-        .imageView = *checkerTexture_.imageView,
-        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
-    };
-
-    std::array write = {
-        vk::WriteDescriptorSet{
-            .dstSet = frames_[index].descriptorSet,
-            .dstBinding = 0,
-            .descriptorCount = 1,
-            .descriptorType = vk::DescriptorType::eUniformBuffer,
-            .pBufferInfo = &bufferInfo,
-        },
-        vk::WriteDescriptorSet{
-            .dstSet = frames_[index].descriptorSet,
-            .dstBinding = 1,
-            .descriptorCount = 1,
-            .descriptorType = vk::DescriptorType::eCombinedImageSampler,
-            .pImageInfo = &imageInfo,
-        },
-    };
-    device_.logicalDevice().updateDescriptorSets(write, {});
-  }
 }
 
 vk::raii::Pipeline Renderer::createGraphicsPipeline(

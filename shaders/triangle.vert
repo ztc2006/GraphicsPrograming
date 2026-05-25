@@ -6,6 +6,7 @@ layout(set = 0, binding = 0) uniform FrameUbo {
 
 layout(push_constant) uniform PushConstants {
   mat4 transform;
+  vec4 materialTint;
 } pushConstants;
 
 layout(location = 0) in vec3 inPosition;

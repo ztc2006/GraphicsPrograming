@@ -93,6 +93,10 @@ void Application::initVulkan() {
     throw std::runtime_error("Scene has no meshes.");
   }
   renderer_->setMeshes(scene_.meshes);
+  if (scene_.materials.empty()) {
+    throw std::runtime_error("Scene has no materials.");
+  }
+  renderer_->setMaterials(scene_.materials);
   renderer_->recreateForSwapChain(*swapChain_);
 }
 
@@ -128,7 +132,11 @@ void Application::mainLoop() {
       if (object.meshId >= scene_.meshes.size()) {
         throw std::runtime_error("Scene object mesh id is out of range.");
       }
-      renderer_->drawObject(object.meshId, object.transform.matrix());
+      if (object.materialId >= scene_.materials.size()) {
+        throw std::runtime_error("Scene object material id is out of range.");
+      }
+      renderer_->drawObject(object.meshId, object.materialId,
+                            object.transform.matrix());
     }
 
     auto frameResult = renderer_->endFrame();
@@ -300,8 +308,10 @@ void Application::updateScene() {
 
 void Application::createScene() {
   scene_.meshes.clear();
+  scene_.materials.clear();
   scene_.objects.clear();
   scene_.cameras.clear();
+  scene_.materials.clear();
 
   scene_.meshes.push_back(Mesh{
       .vertices =
@@ -324,18 +334,28 @@ void Application::createScene() {
       .indices = {0, 1, 2},
   });
 
-  auto makeObject = [](float x, MeshId meshId) {
+  scene_.materials.push_back(Material{
+      .albedoPath = "texture/image.jpg",
+      .tint = {1.0f, 0.85f, 0.85f, 1.0f},
+  });
+  scene_.materials.push_back(Material{
+      .albedoPath = "texture/smile.png",
+      .tint = {0.85f, 1.0f, 0.85f, 1.0f},
+  });
+
+  auto makeObject = [](float x, MeshId meshId, MaterialId materialId) {
     SceneObject object{};
     object.transform.translation = {x, 0.0f, 0.0f};
     object.meshId = meshId;
+    object.materialId = materialId;
     return object;
   };
 
-  scene_.objects.push_back(makeObject(-0.25f, 0));
+  scene_.objects.push_back(makeObject(-0.25f, 0, 0));
   scene_.objects.back().transform.translation.z = -0.35f;
-  scene_.objects.push_back(makeObject(0.0f, 1));
+  scene_.objects.push_back(makeObject(0.0f, 1, 1));
   scene_.objects.back().transform.translation.z = 0.15f;
-  scene_.objects.push_back(makeObject(0.25f, 0));
+  scene_.objects.push_back(makeObject(0.25f, 0, 0));
   scene_.objects.back().transform.translation.z = -0.15f;
 
   scene_.cameras.push_back(Camera{});

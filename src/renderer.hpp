@@ -7,6 +7,7 @@
 
 #include "device.hpp"
 #include "mesh.hpp"
+#include "scene.hpp"
 #include "scene_object.hpp"
 #include "swap_chain.hpp"
 
@@ -20,14 +21,17 @@ public:
 
   explicit Renderer(Device const &device);
 
-  // Transitional single-mesh upload path until multi-object submission lands.
   void setMeshes(std::vector<Mesh> const &meshes);
+  void setMaterials(std::vector<Material> const &materials);
 
   FrameResult beginFrame(glm::mat4 const &viewProjMatrix);
-  void drawObject(MeshId meshId, glm::mat4 const &modelMatrix);
+  void drawObject(MeshId meshId, MaterialId materialId,
+                  glm::mat4 const &modelMatrix);
+
   FrameResult endFrame();
 
-  FrameResult drawFrame(MeshId meshId, glm::mat4 const &modelMatrix,
+  FrameResult drawFrame(MeshId meshId, MaterialId materialId,
+                        glm::mat4 const &modelMatrix,
                         glm::mat4 const &viewProjMatrix);
   void recreateForSwapChain(SwapChain const &swapChain);
 
@@ -68,6 +72,12 @@ private:
     vk::ImageLayout layout = vk::ImageLayout::eUndefined;
   };
 
+  struct MaterialGpuResources {
+    TextureResources albedoTexture;
+    vk::DescriptorSet descriptorSet = nullptr;
+    glm::vec4 tint{1.0f};
+  };
+
   static constexpr std::uint32_t kFramesInFlight = 1;
 
   static std::vector<char> readBinaryFile(char const *path);
@@ -77,9 +87,6 @@ private:
   MeshGpuResources createGeometryResources(Mesh const &mesh);
   void createCommandBuffers();
   void createCommandPool();
-  void createDescriptorSetLayout();
-  void createDescriptorPool();
-  void allocateAndWriteDescriptorSets();
   void updateFrameUniformBuffer(FrameContext &frame,
                                 glm::mat4 const &viewProjMatrix) const;
   void validateSwapChainCandidate(SwapChain const &swapChain) const;
@@ -122,9 +129,18 @@ private:
   void copyBufferToImage(vk::Buffer sourceBuffer, vk::Image destinationImage,
                          std::uint32_t width, std::uint32_t height);
 
+  void createFrameDescriptorSetLayout();
+  void createMaterialDescriptorSetLayout();
+  void createFrameDescriptorPool();
+  void allocateAndWriteFrameDescriptorSets();
+
+  TextureResources createTextureResourcesFromFile(std::string const &path);
+  vk::raii::DescriptorPool
+  createMaterialDescriptorPool(std::uint32_t materialCount) const;
+  void writeMaterialDescriptorSets();
+
 private:
   DepthResources depthResources_{};
-  TextureResources checkerTexture_{};
 
   Device const &device_;
   SwapChain const *swapChain_ = nullptr;
@@ -135,12 +151,17 @@ private:
   std::uint32_t currentFrame_ = 0;
   std::optional<ActiveFrameState> activeFrame_;
 
+  std::vector<MaterialGpuResources> materialGpuResources_;
+
+  vk::raii::DescriptorSetLayout frameDescriptorSetLayout_ = nullptr;
+  vk::raii::DescriptorSetLayout materialDescriptorSetLayout_ = nullptr;
+  vk::raii::DescriptorPool frameDescriptorPool_ = nullptr;
+  vk::raii::DescriptorPool materialDescriptorPool_ = nullptr;
+
   vk::raii::PipelineLayout pipelineLayout_ = nullptr;
   vk::raii::Pipeline graphicsPipeline_ = nullptr;
   std::vector<vk::raii::Semaphore> renderFinishedSemaphores_;
   std::vector<vk::ImageLayout> swapChainImageLayouts_;
   std::vector<vk::Fence> imagesInFlight_;
   std::vector<MeshGpuResources> meshGpuResources_;
-  vk::raii::DescriptorSetLayout descriptorSetLayout_ = nullptr;
-  vk::raii::DescriptorPool descriptorPool_ = nullptr;
 };

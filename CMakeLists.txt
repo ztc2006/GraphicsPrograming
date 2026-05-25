@@ -34,6 +34,7 @@ target_precompile_headers(${PROJECT_NAME} PRIVATE src/pch.hpp)
 
 target_include_directories(${PROJECT_NAME} PRIVATE
   include
+  deps/stb
 )
 
 target_compile_definitions(${PROJECT_NAME} PRIVATE
@@ -84,3 +85,9 @@ if(SHADER_OUTPUT_FILES)
   add_custom_target(compile_shaders ALL DEPENDS ${SHADER_OUTPUT_FILES})
   add_dependencies(${PROJECT_NAME} compile_shaders)
 endif()
+
+add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+  COMMAND "${CMAKE_COMMAND}" -E copy_directory
+          "${CMAKE_SOURCE_DIR}/texture"
+          "${CMAKE_BINARY_DIR}/texture"
+)
