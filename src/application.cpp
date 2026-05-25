@@ -119,10 +119,11 @@ void Application::mainLoop() {
     float aspect = static_cast<float>(swapChain_->extent().width) /
                    static_cast<float>(swapChain_->extent().height);
 
+    auto const &camera = scene_.cameras[scene_.activeCameraIndex];
     glm::mat4 viewProjMatrix =
         scene_.cameras[scene_.activeCameraIndex].viewProj(aspect);
 
-    auto beginResult = renderer_->beginFrame(viewProjMatrix);
+    auto beginResult = renderer_->beginFrame(viewProjMatrix, camera.position);
     if (beginResult != Renderer::FrameResult::eSuccess) {
       recreateSwapChain();
       continue;
@@ -316,10 +317,22 @@ void Application::createScene() {
   scene_.meshes.push_back(Mesh{
       .vertices =
           {
-              {{-0.5f, -0.5f, 0.0f}, {0.95f, 0.30f, 0.25f}, {0.0f, 1.0f}},
-              {{0.5f, -0.5f, 0.0f}, {0.20f, 0.75f, 0.35f}, {1.0f, 1.0f}},
-              {{0.5f, 0.5f, 0.0f}, {0.15f, 0.45f, 0.95f}, {1.0f, 0.0f}},
-              {{-0.5f, 0.5f, 0.0f}, {0.98f, 0.82f, 0.20f}, {0.0f, 0.0f}},
+              {{-0.5f, -0.5f, 0.0f},
+               {0.95f, 0.30f, 0.25f},
+               {0.0f, 0.0f, 1.0f},
+               {0.0f, 1.0f}},
+              {{0.5f, -0.5f, 0.0f},
+               {0.20f, 0.75f, 0.35f},
+               {0.0f, 0.0f, 1.0f},
+               {1.0f, 1.0f}},
+              {{0.5f, 0.5f, 0.0f},
+               {0.15f, 0.45f, 0.95f},
+               {0.0f, 0.0f, 1.0f},
+               {1.0f, 0.0f}},
+              {{-0.5f, 0.5f, 0.0f},
+               {0.98f, 0.82f, 0.20f},
+               {0.0f, 0.0f, 1.0f},
+               {0.0f, 0.0f}},
           },
       .indices = {0, 1, 2, 2, 3, 0},
   });
@@ -327,9 +340,18 @@ void Application::createScene() {
   scene_.meshes.push_back(Mesh{
       .vertices =
           {
-              {{0.0f, -0.55f, 0.0f}, {0.95f, 0.40f, 0.20f}, {0.5f, 1.0f}},
-              {{0.55f, 0.45f, 0.0f}, {0.20f, 0.85f, 0.35f}, {1.0f, 0.0f}},
-              {{-0.55f, 0.45f, 0.0f}, {0.20f, 0.45f, 0.95f}, {0.0f, 0.0f}},
+              {{0.0f, -0.55f, 0.0f},
+               {0.95f, 0.40f, 0.20f},
+               {0.0f, 0.0f, 1.0f},
+               {0.5f, 1.0f}},
+              {{0.55f, 0.45f, 0.0f},
+               {0.20f, 0.85f, 0.35f},
+               {0.0f, 0.0f, 1.0f},
+               {1.0f, 0.0f}},
+              {{-0.55f, 0.45f, 0.0f},
+               {0.20f, 0.45f, 0.95f},
+               {0.0f, 0.0f, 1.0f},
+               {0.0f, 0.0f}},
           },
       .indices = {0, 1, 2},
   });

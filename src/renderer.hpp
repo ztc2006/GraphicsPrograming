@@ -24,7 +24,8 @@ public:
   void setMeshes(std::vector<Mesh> const &meshes);
   void setMaterials(std::vector<Material> const &materials);
 
-  FrameResult beginFrame(glm::mat4 const &viewProjMatrix);
+  FrameResult beginFrame(glm::mat4 const &viewProjMatrix,
+                         glm::vec3 const &cameraPosition);
   void drawObject(MeshId meshId, MaterialId materialId,
                   glm::mat4 const &modelMatrix);
 
@@ -32,7 +33,8 @@ public:
 
   FrameResult drawFrame(MeshId meshId, MaterialId materialId,
                         glm::mat4 const &modelMatrix,
-                        glm::mat4 const &viewProjMatrix);
+                        glm::mat4 const &viewProjMatrix,
+                        glm::vec3 const &cameraPosition);
   void recreateForSwapChain(SwapChain const &swapChain);
 
 private:
@@ -88,7 +90,9 @@ private:
   void createCommandBuffers();
   void createCommandPool();
   void updateFrameUniformBuffer(FrameContext &frame,
-                                glm::mat4 const &viewProjMatrix) const;
+                                glm::mat4 const &viewProjMatrix,
+                                glm::vec3 const &cameraPosition) const;
+
   void validateSwapChainCandidate(SwapChain const &swapChain) const;
   void validateSwapChainState() const;
   vk::raii::Pipeline
