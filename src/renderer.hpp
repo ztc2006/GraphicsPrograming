@@ -24,6 +24,7 @@ public:
 
   void setMeshes(std::vector<Mesh> const &meshes);
   void setMaterials(std::vector<Material> const &materials);
+  void setMaterialTint(MaterialId materialId, glm::vec4 const &tint);
   void setUiDrawCallback(std::function<void(vk::CommandBuffer)> callback);
 
   FrameResult beginFrame(glm::mat4 const &viewProjMatrix,

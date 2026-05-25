@@ -381,6 +381,14 @@ void Renderer::setMaterials(std::vector<Material> const &materials) {
   writeMaterialDescriptorSets();
 }
 
+void Renderer::setMaterialTint(MaterialId materialId, glm::vec4 const &tint) {
+  if (materialId >= materialGpuResources_.size()) {
+    throw std::runtime_error("Renderer material id is out of range.");
+  }
+
+  materialGpuResources_[materialId].tint = tint;
+}
+
 void Renderer::setUiDrawCallback(
     std::function<void(vk::CommandBuffer)> callback) {
   uiDrawCallback_ = std::move(callback);

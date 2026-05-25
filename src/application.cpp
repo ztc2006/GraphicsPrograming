@@ -113,6 +113,11 @@ void Application::initVulkan() {
 
 void Application::mainLoop() {
   while (!glfwWindowShouldClose(window_)) {
+    auto const now = std::chrono::steady_clock::now();
+    float const deltaSeconds =
+        std::chrono::duration<float>(now - lastFrameTime_).count();
+    lastFrameTime_ = now;
+
     glfwPollEvents();
     beginImGuiFrame();
     updateScene();
@@ -132,6 +137,25 @@ void Application::mainLoop() {
                    static_cast<float>(swapChain_->extent().height);
 
     auto &camera = scene_.cameras[scene_.activeCameraIndex];
+    if (orbitCameraController_.isRotating()) {
+      float forwardAmount = 0.0f;
+      float rightAmount = 0.0f;
+      if (glfwGetKey(window_, GLFW_KEY_W) == GLFW_PRESS) {
+        forwardAmount += 1.0f;
+      }
+      if (glfwGetKey(window_, GLFW_KEY_S) == GLFW_PRESS) {
+        forwardAmount -= 1.0f;
+      }
+      if (glfwGetKey(window_, GLFW_KEY_D) == GLFW_PRESS) {
+        rightAmount += 1.0f;
+      }
+      if (glfwGetKey(window_, GLFW_KEY_A) == GLFW_PRESS) {
+        rightAmount -= 1.0f;
+      }
+      if (forwardAmount != 0.0f || rightAmount != 0.0f) {
+        orbitCameraController_.move(forwardAmount, rightAmount, deltaSeconds);
+      }
+    }
     orbitCameraController_.update(camera);
     glm::mat4 viewProjMatrix = camera.viewProj(aspect);
 
@@ -280,8 +304,9 @@ void Application::drawImGui() {
     ImGui::Text("Target: %.2f, %.2f, %.2f", camera.target.x, camera.target.y,
                 camera.target.z);
     ImGui::Text("FOV: %.1f deg", glm::degrees(camera.fovRadians));
-    ImGui::TextUnformatted("Right mouse drag: orbit");
-    ImGui::TextUnformatted("Wheel: zoom");
+    ImGui::TextUnformatted("Right mouse: look");
+    ImGui::TextUnformatted("Right mouse + WASD: fly");
+    ImGui::TextUnformatted("Wheel: speed");
   }
   ImGui::End();
 
@@ -297,6 +322,30 @@ void Application::drawImGui() {
     ImGui::SliderFloat("Specular", &scene_.lighting.specularStrength, 0.0f,
                        4.0f);
     ImGui::SliderFloat("Shininess", &scene_.lighting.shininess, 1.0f, 128.0f);
+  }
+  ImGui::End();
+
+  if (ImGui::Begin("Material")) {
+    if (scene_.materials.empty()) {
+      ImGui::TextUnformatted("No materials");
+    } else {
+      if (selectedMaterialIndex_ >= scene_.materials.size()) {
+        selectedMaterialIndex_ = 0;
+      }
+
+      int selectedMaterial = static_cast<int>(selectedMaterialIndex_);
+      int const maxMaterialIndex =
+          static_cast<int>(scene_.materials.size() - 1);
+      ImGui::SliderInt("Material", &selectedMaterial, 0, maxMaterialIndex);
+      selectedMaterialIndex_ = static_cast<std::size_t>(selectedMaterial);
+
+      Material &material = scene_.materials[selectedMaterialIndex_];
+      ImGui::Text("Texture: %s", material.albedoPath.c_str());
+      if (ImGui::ColorEdit4("Tint", &material.tint.x)) {
+        renderer_->setMaterialTint(static_cast<MaterialId>(selectedMaterialIndex_),
+                                   material.tint);
+      }
+    }
   }
   ImGui::End();
 }
