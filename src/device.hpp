@@ -32,6 +32,10 @@ public:
   vk::raii::PhysicalDevice const &physicalDevice() const;
   vk::raii::Queue const &graphicsQueue() const;
   vk::raii::Queue const &presentQueue() const;
+  vk::Instance instanceHandle() const;
+  vk::PhysicalDevice physicalDeviceHandle() const;
+  vk::Device deviceHandle() const;
+  vk::Queue graphicsQueueHandle() const;
   std::uint32_t graphicsQueueFamilyIndex() const;
   std::uint32_t presentQueueFamilyIndex() const;
 

@@ -27,6 +27,16 @@ vk::raii::Queue const &Device::graphicsQueue() const { return graphicsQueue_; }
 
 vk::raii::Queue const &Device::presentQueue() const { return presentQueue_; }
 
+vk::Instance Device::instanceHandle() const { return *instance_; }
+
+vk::PhysicalDevice Device::physicalDeviceHandle() const {
+  return *physicalDevice_;
+}
+
+vk::Device Device::deviceHandle() const { return *device_; }
+
+vk::Queue Device::graphicsQueueHandle() const { return *graphicsQueue_; }
+
 std::uint32_t Device::graphicsQueueFamilyIndex() const {
   return queueFamilyIndices_.graphics;
 }

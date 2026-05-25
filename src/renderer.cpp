@@ -380,6 +380,11 @@ void Renderer::setMaterials(std::vector<Material> const &materials) {
   writeMaterialDescriptorSets();
 }
 
+void Renderer::setUiDrawCallback(
+    std::function<void(vk::CommandBuffer)> callback) {
+  uiDrawCallback_ = std::move(callback);
+}
+
 Renderer::TextureResources
 Renderer::createTextureResourcesFromFile(std::string const &path) {
   int width = 0;
@@ -1179,6 +1184,10 @@ void Renderer::beginCommandBuffer(vk::raii::CommandBuffer const &commandBuffer,
 
 void Renderer::endCommandBuffer(vk::raii::CommandBuffer const &commandBuffer,
                                 std::uint32_t imageIndex) {
+  if (uiDrawCallback_) {
+    uiDrawCallback_(*commandBuffer);
+  }
+
   commandBuffer.endRendering();
 
   transitionSwapChainImage(commandBuffer, imageIndex,

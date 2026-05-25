@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <vector>
 
@@ -23,6 +24,7 @@ public:
 
   void setMeshes(std::vector<Mesh> const &meshes);
   void setMaterials(std::vector<Material> const &materials);
+  void setUiDrawCallback(std::function<void(vk::CommandBuffer)> callback);
 
   FrameResult beginFrame(glm::mat4 const &viewProjMatrix,
                          glm::vec3 const &cameraPosition);
@@ -168,4 +170,5 @@ private:
   std::vector<vk::ImageLayout> swapChainImageLayouts_;
   std::vector<vk::Fence> imagesInFlight_;
   std::vector<MeshGpuResources> meshGpuResources_;
+  std::function<void(vk::CommandBuffer)> uiDrawCallback_;
 };

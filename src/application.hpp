@@ -31,17 +31,26 @@ private:
   void createSurface();
   void updateScene();
   void createScene();
+  void initImGui();
+  void beginImGuiFrame();
+  void drawImGui();
+  void cleanupImGui();
 
   std::vector<char const *> getRequiredInstanceExtensions();
 
   static void framebufferResizeCallback(GLFWwindow *window, int width,
                                         int height);
+  static void windowFocusCallback(GLFWwindow *window, int focused);
+  static void cursorEnterCallback(GLFWwindow *window, int entered);
   static void mouseButtonCallback(GLFWwindow *window, int button, int action,
                                   int mods);
   static void cursorPositionCallback(GLFWwindow *window, double xpos,
                                      double ypos);
   static void scrollCallback(GLFWwindow *window, double xoffset,
                              double yoffset);
+  static void keyCallback(GLFWwindow *window, int key, int scancode, int action,
+                          int mods);
+  static void charCallback(GLFWwindow *window, unsigned int codepoint);
 
   static VKAPI_ATTR vk::Bool32 VKAPI_CALL debugCallback(
       vk::DebugUtilsMessageSeverityFlagBitsEXT severity,
@@ -61,6 +70,7 @@ private:
   std::unique_ptr<Renderer> renderer_;
   std::vector<char const *> requiredDeviceExtensions_;
   bool validationLayersEnabled_ = false;
+  bool imguiInitialized_ = false;
   Scene scene_{};
   OrbitCameraController orbitCameraController_{};
   std::chrono::steady_clock::time_point animationStartTime_ =

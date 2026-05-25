@@ -9,6 +9,9 @@
 #include <string>
 
 #include <GLFW/glfw3.h>
+#include <imgui.h>
+#include <imgui_impl_glfw.h>
+#include <imgui_impl_vulkan.h>
 
 #include "device.hpp"
 #include "renderer.hpp"
@@ -73,9 +76,13 @@ void Application::initWindow() {
 
   glfwSetWindowUserPointer(window_, this);
   glfwSetFramebufferSizeCallback(window_, framebufferResizeCallback);
+  glfwSetWindowFocusCallback(window_, windowFocusCallback);
+  glfwSetCursorEnterCallback(window_, cursorEnterCallback);
   glfwSetMouseButtonCallback(window_, mouseButtonCallback);
   glfwSetCursorPosCallback(window_, cursorPositionCallback);
   glfwSetScrollCallback(window_, scrollCallback);
+  glfwSetKeyCallback(window_, keyCallback);
+  glfwSetCharCallback(window_, charCallback);
 }
 
 void Application::initVulkan() {
@@ -101,11 +108,13 @@ void Application::initVulkan() {
   }
   renderer_->setMaterials(scene_.materials);
   renderer_->recreateForSwapChain(*swapChain_);
+  initImGui();
 }
 
 void Application::mainLoop() {
   while (!glfwWindowShouldClose(window_)) {
     glfwPollEvents();
+    beginImGuiFrame();
     updateScene();
     if (scene_.cameras.empty()) {
       throw std::runtime_error("Scene has no cameras.");
@@ -155,6 +164,8 @@ void Application::cleanup() {
     device_->logicalDevice().waitIdle();
   }
 
+  cleanupImGui();
+
   if (window_ != nullptr) {
     glfwDestroyWindow(window_);
     window_ = nullptr;
@@ -198,6 +209,101 @@ void Application::recreateSwapChain() {
   framebufferResized_ = false;
 }
 
+void Application::initImGui() {
+  if (imguiInitialized_) {
+    return;
+  }
+
+  IMGUI_CHECKVERSION();
+  ImGui::CreateContext();
+  ImGuiIO &io = ImGui::GetIO();
+  io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+  io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
+  io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
+  ImGui::StyleColorsDark();
+
+  ImGui_ImplGlfw_InitForVulkan(window_, false);
+
+  VkFormat colorAttachmentFormat = static_cast<VkFormat>(swapChain_->imageFormat());
+  VkPipelineRenderingCreateInfo pipelineRenderingCreateInfo{
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
+      .colorAttachmentCount = 1,
+      .pColorAttachmentFormats = &colorAttachmentFormat,
+  };
+
+  ImGui_ImplVulkan_InitInfo initInfo{};
+  initInfo.ApiVersion = VK_API_VERSION_1_3;
+  initInfo.Instance = static_cast<VkInstance>(device_->instanceHandle());
+  initInfo.PhysicalDevice =
+      static_cast<VkPhysicalDevice>(device_->physicalDeviceHandle());
+  initInfo.Device = static_cast<VkDevice>(device_->deviceHandle());
+  initInfo.QueueFamily = device_->graphicsQueueFamilyIndex();
+  initInfo.Queue = static_cast<VkQueue>(device_->graphicsQueueHandle());
+  initInfo.DescriptorPoolSize = 64;
+  initInfo.MinImageCount = 2;
+  initInfo.ImageCount = static_cast<std::uint32_t>(swapChain_->images().size());
+  initInfo.UseDynamicRendering = true;
+  initInfo.PipelineInfoMain.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
+  initInfo.PipelineInfoMain.PipelineRenderingCreateInfo =
+      pipelineRenderingCreateInfo;
+  ImGui_ImplVulkan_Init(&initInfo);
+
+  renderer_->setUiDrawCallback([](vk::CommandBuffer commandBuffer) {
+    ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(),
+                                    static_cast<VkCommandBuffer>(commandBuffer));
+  });
+
+  imguiInitialized_ = true;
+}
+
+void Application::beginImGuiFrame() {
+  if (!imguiInitialized_) {
+    return;
+  }
+
+  ImGui_ImplVulkan_NewFrame();
+  ImGui_ImplGlfw_NewFrame();
+  ImGui::NewFrame();
+  drawImGui();
+  ImGui::Render();
+}
+
+void Application::drawImGui() {
+  ImGui::DockSpaceOverViewport(0, ImGui::GetMainViewport(),
+                               ImGuiDockNodeFlags_PassthruCentralNode);
+
+  if (ImGui::Begin("Camera")) {
+    Camera const &camera = scene_.cameras[scene_.activeCameraIndex];
+    ImGui::Text("Position: %.2f, %.2f, %.2f", camera.position.x,
+                camera.position.y, camera.position.z);
+    ImGui::Text("Target: %.2f, %.2f, %.2f", camera.target.x, camera.target.y,
+                camera.target.z);
+    ImGui::Text("FOV: %.1f deg", glm::degrees(camera.fovRadians));
+    ImGui::TextUnformatted("Middle mouse drag: orbit");
+    ImGui::TextUnformatted("Wheel: zoom");
+  }
+  ImGui::End();
+
+  if (ImGui::Begin("Lighting")) {
+    ImGui::TextUnformatted("Directional Blinn-Phong");
+    ImGui::TextUnformatted("Light params are currently fixed in Frame UBO.");
+    ImGui::TextUnformatted("Next slice: expose editable light values.");
+  }
+  ImGui::End();
+}
+
+void Application::cleanupImGui() {
+  if (!imguiInitialized_) {
+    return;
+  }
+
+  renderer_->setUiDrawCallback({});
+  ImGui_ImplVulkan_Shutdown();
+  ImGui_ImplGlfw_Shutdown();
+  ImGui::DestroyContext();
+  imguiInitialized_ = false;
+}
+
 void Application::framebufferResizeCallback(GLFWwindow *window, int width,
                                             int height) {
   auto *app = static_cast<Application *>(glfwGetWindowUserPointer(window));
@@ -206,10 +312,20 @@ void Application::framebufferResizeCallback(GLFWwindow *window, int width,
   }
 }
 
+void Application::windowFocusCallback(GLFWwindow *window, int focused) {
+  ImGui_ImplGlfw_WindowFocusCallback(window, focused);
+}
+
+void Application::cursorEnterCallback(GLFWwindow *window, int entered) {
+  ImGui_ImplGlfw_CursorEnterCallback(window, entered);
+}
+
 void Application::mouseButtonCallback(GLFWwindow *window, int button,
-                                      int action, int) {
+                                      int action, int mods) {
+  ImGui_ImplGlfw_MouseButtonCallback(window, button, action, mods);
+
   auto *app = static_cast<Application *>(glfwGetWindowUserPointer(window));
-  if (app == nullptr || button != GLFW_MOUSE_BUTTON_RIGHT) {
+  if (app == nullptr || button != GLFW_MOUSE_BUTTON_MIDDLE) {
     return;
   }
 
@@ -226,6 +342,8 @@ void Application::mouseButtonCallback(GLFWwindow *window, int button,
 
 void Application::cursorPositionCallback(GLFWwindow *window, double xpos,
                                          double ypos) {
+  ImGui_ImplGlfw_CursorPosCallback(window, xpos, ypos);
+
   auto *app = static_cast<Application *>(glfwGetWindowUserPointer(window));
   if (app == nullptr) {
     return;
@@ -234,13 +352,25 @@ void Application::cursorPositionCallback(GLFWwindow *window, double xpos,
   app->orbitCameraController_.rotate(xpos, ypos);
 }
 
-void Application::scrollCallback(GLFWwindow *window, double, double yoffset) {
+void Application::scrollCallback(GLFWwindow *window, double xoffset,
+                                 double yoffset) {
+  ImGui_ImplGlfw_ScrollCallback(window, xoffset, yoffset);
+
   auto *app = static_cast<Application *>(glfwGetWindowUserPointer(window));
   if (app == nullptr) {
     return;
   }
 
   app->orbitCameraController_.zoom(yoffset);
+}
+
+void Application::keyCallback(GLFWwindow *window, int key, int scancode,
+                              int action, int mods) {
+  ImGui_ImplGlfw_KeyCallback(window, key, scancode, action, mods);
+}
+
+void Application::charCallback(GLFWwindow *window, unsigned int codepoint) {
+  ImGui_ImplGlfw_CharCallback(window, codepoint);
 }
 
 void Application::createInstance() {

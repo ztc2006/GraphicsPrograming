@@ -30,11 +30,21 @@ file(GLOB SHADER_SOURCE_FILES CONFIGURE_DEPENDS
 
 add_executable(${PROJECT_NAME} )
 target_sources(${PROJECT_NAME} PRIVATE ${SOURCE_FILES})
+target_sources(${PROJECT_NAME} PRIVATE
+  deps/imgui/imgui.cpp
+  deps/imgui/imgui_draw.cpp
+  deps/imgui/imgui_tables.cpp
+  deps/imgui/imgui_widgets.cpp
+  deps/imgui/backends/imgui_impl_glfw.cpp
+  deps/imgui/backends/imgui_impl_vulkan.cpp
+)
 target_precompile_headers(${PROJECT_NAME} PRIVATE src/pch.hpp)
 
 target_include_directories(${PROJECT_NAME} PRIVATE
   include
   deps/stb
+  deps/imgui
+  deps/imgui/backends
 )
 
 target_compile_definitions(${PROJECT_NAME} PRIVATE
