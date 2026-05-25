@@ -73,6 +73,9 @@ void Application::initWindow() {
 
   glfwSetWindowUserPointer(window_, this);
   glfwSetFramebufferSizeCallback(window_, framebufferResizeCallback);
+  glfwSetMouseButtonCallback(window_, mouseButtonCallback);
+  glfwSetCursorPosCallback(window_, cursorPositionCallback);
+  glfwSetScrollCallback(window_, scrollCallback);
 }
 
 void Application::initVulkan() {
@@ -119,9 +122,9 @@ void Application::mainLoop() {
     float aspect = static_cast<float>(swapChain_->extent().width) /
                    static_cast<float>(swapChain_->extent().height);
 
-    auto const &camera = scene_.cameras[scene_.activeCameraIndex];
-    glm::mat4 viewProjMatrix =
-        scene_.cameras[scene_.activeCameraIndex].viewProj(aspect);
+    auto &camera = scene_.cameras[scene_.activeCameraIndex];
+    orbitCameraController_.update(camera);
+    glm::mat4 viewProjMatrix = camera.viewProj(aspect);
 
     auto beginResult = renderer_->beginFrame(viewProjMatrix, camera.position);
     if (beginResult != Renderer::FrameResult::eSuccess) {
@@ -201,6 +204,43 @@ void Application::framebufferResizeCallback(GLFWwindow *window, int width,
   if (app != nullptr) {
     app->framebufferResized_ = true;
   }
+}
+
+void Application::mouseButtonCallback(GLFWwindow *window, int button,
+                                      int action, int) {
+  auto *app = static_cast<Application *>(glfwGetWindowUserPointer(window));
+  if (app == nullptr || button != GLFW_MOUSE_BUTTON_RIGHT) {
+    return;
+  }
+
+  double cursorX = 0.0;
+  double cursorY = 0.0;
+  glfwGetCursorPos(window, &cursorX, &cursorY);
+
+  if (action == GLFW_PRESS) {
+    app->orbitCameraController_.beginRotate(window, cursorX, cursorY);
+  } else if (action == GLFW_RELEASE) {
+    app->orbitCameraController_.endRotate(window);
+  }
+}
+
+void Application::cursorPositionCallback(GLFWwindow *window, double xpos,
+                                         double ypos) {
+  auto *app = static_cast<Application *>(glfwGetWindowUserPointer(window));
+  if (app == nullptr) {
+    return;
+  }
+
+  app->orbitCameraController_.rotate(xpos, ypos);
+}
+
+void Application::scrollCallback(GLFWwindow *window, double, double yoffset) {
+  auto *app = static_cast<Application *>(glfwGetWindowUserPointer(window));
+  if (app == nullptr) {
+    return;
+  }
+
+  app->orbitCameraController_.zoom(yoffset);
 }
 
 void Application::createInstance() {
@@ -382,6 +422,7 @@ void Application::createScene() {
 
   scene_.cameras.push_back(Camera{});
   scene_.activeCameraIndex = 0;
+  orbitCameraController_.attach(scene_.cameras[scene_.activeCameraIndex]);
 }
 
 std::vector<char const *> Application::getRequiredInstanceExtensions() {

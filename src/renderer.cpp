@@ -1002,7 +1002,7 @@ vk::raii::Pipeline Renderer::createGraphicsPipeline(
       .rasterizerDiscardEnable = false,
       .polygonMode = vk::PolygonMode::eFill,
       .cullMode = vk::CullModeFlagBits::eNone,
-      .frontFace = vk::FrontFace::eClockwise,
+      .frontFace = vk::FrontFace::eCounterClockwise,
       .depthBiasEnable = false,
       .lineWidth = 1.0f,
   };

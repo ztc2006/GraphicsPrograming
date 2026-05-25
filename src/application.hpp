@@ -4,6 +4,7 @@
 #include <memory>
 #include <vector>
 
+#include "orbit_camera_controller.hpp"
 #include "scene.hpp"
 #include "vulkan_include.hpp"
 
@@ -35,6 +36,12 @@ private:
 
   static void framebufferResizeCallback(GLFWwindow *window, int width,
                                         int height);
+  static void mouseButtonCallback(GLFWwindow *window, int button, int action,
+                                  int mods);
+  static void cursorPositionCallback(GLFWwindow *window, double xpos,
+                                     double ypos);
+  static void scrollCallback(GLFWwindow *window, double xoffset,
+                             double yoffset);
 
   static VKAPI_ATTR vk::Bool32 VKAPI_CALL debugCallback(
       vk::DebugUtilsMessageSeverityFlagBitsEXT severity,
@@ -55,6 +62,7 @@ private:
   std::vector<char const *> requiredDeviceExtensions_;
   bool validationLayersEnabled_ = false;
   Scene scene_{};
+  OrbitCameraController orbitCameraController_{};
   std::chrono::steady_clock::time_point animationStartTime_ =
       std::chrono::steady_clock::now();
 };

@@ -27,12 +27,16 @@ void main()
   vec3 albedo = texel.rgb * inColor * pushConstants.materialTint.rgb;
 
   vec3 N = normalize(inWorldNormal);
+  if (!gl_FrontFacing) {
+    N = -N;
+  }
   vec3 L = normalize(ubo.lightDirection.xyz);
   vec3 V = normalize(ubo.cameraPosition.xyz - inWorldPos);
   vec3 H = normalize(L + V);
 
-  float diffuse = max(dot(N, L), 0.0f);
-  float specular = pow(max(dot(N, H), 0.0f), 32.0) * step(0.0f, diffuse);
+  float nDotL = dot(N, L);
+  float diffuse = max(nDotL, 0.0);
+  float specular = nDotL > 0.0 ? pow(max(dot(N, H), 0.0), 32.0) : 0.0;
 
   vec3 lit = albedo * (ubo.ambientColor.rgb + ubo.lightColor.rgb * diffuse)
       + ubo.lightColor.rgb * specular;

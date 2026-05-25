@@ -21,7 +21,7 @@ layout(location = 3) out vec3 outWorldNormal;
 
 void main()
 {
-  vec4 worldPos = pushConstants.transform * vec4(inPosition, 1.0f);
+  vec4 worldPos = pushConstants.transform * vec4(inPosition, 1.0);
   mat3 normalMatrix = transpose(inverse(mat3(pushConstants.transform)));
 
   gl_Position = ubo.viewProj * worldPos;
