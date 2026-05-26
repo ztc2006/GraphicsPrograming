@@ -26,7 +26,8 @@ struct FrameUniformBufferObject {
 };
 } // namespace
 
-Renderer::Renderer(Device const &device) : device_(device) {
+Renderer::Renderer(Device const &device)
+    : device_(device), materialGpuStore_(device) {
   createPersistentResources();
 }
 
@@ -47,7 +48,7 @@ void Renderer::recreateForSwapChain(SwapChain const &swapChain) {
 
   std::array layouts = {
       *frameDescriptorSetLayout_,
-      *materialDescriptorSetLayout_,
+      materialGpuStore_.descriptorSetLayout(),
   };
 
   vk::PipelineLayoutCreateInfo pipelineLayoutCreateInfo{
@@ -92,7 +93,6 @@ void Renderer::createPersistentResources() {
   createCommandPool();
   createFrameResources();
   createFrameDescriptorSetLayout();
-  createMaterialDescriptorSetLayout();
   createFrameDescriptorPool();
   allocateAndWriteFrameDescriptorSets();
   createCommandBuffers();
@@ -247,38 +247,11 @@ void Renderer::setMaterials(std::vector<Material> const &materials) {
     throw std::runtime_error(
         "Cannot replace renderer materials while a frame is in progress.");
   }
-  if (materials.empty()) {
-    throw std::runtime_error("Renderer requires at least one material.");
-  }
-
-  std::vector<MaterialGpuResources> newMaterials;
-  newMaterials.reserve(materials.size());
-  TextureLoader textureLoader(device_);
-
-  for (Material const &material : materials) {
-    if (material.albedoPath.empty()) {
-      throw std::runtime_error("Material albedo path is empty.");
-    }
-
-    MaterialGpuResources resources{};
-    resources.albedoTexture = textureLoader.createFromFile(material.albedoPath);
-    resources.tint = material.tint;
-    newMaterials.push_back(std::move(resources));
-  }
-
-  vk::raii::DescriptorPool newPool = createMaterialDescriptorPool(
-      static_cast<std::uint32_t>(newMaterials.size()));
-  materialGpuResources_.swap(newMaterials);
-  materialDescriptorPool_ = std::move(newPool);
-  writeMaterialDescriptorSets();
+  materialGpuStore_.setMaterials(materials);
 }
 
 void Renderer::setMaterialTint(MaterialId materialId, glm::vec4 const &tint) {
-  if (materialId >= materialGpuResources_.size()) {
-    throw std::runtime_error("Renderer material id is out of range.");
-  }
-
-  materialGpuResources_[materialId].tint = tint;
+  materialGpuStore_.setMaterialTint(materialId, tint);
 }
 
 void Renderer::setUiDrawCallback(
@@ -286,8 +259,7 @@ void Renderer::setUiDrawCallback(
   uiDrawCallback_ = std::move(callback);
 }
 
-void Renderer::setRasterizerDebugSettings(
-    RasterizerDebugSettings settings) {
+void Renderer::setRasterizerDebugSettings(RasterizerDebugSettings settings) {
   if (activeFrame_.has_value()) {
     throw std::runtime_error(
         "Cannot change rasterizer settings while a frame is in progress.");
@@ -316,22 +288,6 @@ void Renderer::createFrameDescriptorSetLayout() {
       vk::raii::DescriptorSetLayout(device_.logicalDevice(), createInfo);
 }
 
-void Renderer::createMaterialDescriptorSetLayout() {
-  vk::DescriptorSetLayoutBinding binding{
-      .binding = 0,
-      .descriptorType = vk::DescriptorType::eCombinedImageSampler,
-      .descriptorCount = 1,
-      .stageFlags = vk::ShaderStageFlagBits::eFragment,
-  };
-
-  vk::DescriptorSetLayoutCreateInfo createInfo{
-      .bindingCount = 1,
-      .pBindings = &binding,
-  };
-  materialDescriptorSetLayout_ =
-      vk::raii::DescriptorSetLayout(device_.logicalDevice(), createInfo);
-}
-
 void Renderer::createFrameDescriptorPool() {
   vk::DescriptorPoolSize poolSize{
       .type = vk::DescriptorType::eUniformBuffer,
@@ -345,21 +301,6 @@ void Renderer::createFrameDescriptorPool() {
   };
   frameDescriptorPool_ =
       vk::raii::DescriptorPool(device_.logicalDevice(), createInfo);
-}
-
-vk::raii::DescriptorPool
-Renderer::createMaterialDescriptorPool(std::uint32_t materialCount) const {
-  vk::DescriptorPoolSize poolSize{
-      .type = vk::DescriptorType::eCombinedImageSampler,
-      .descriptorCount = materialCount,
-  };
-
-  vk::DescriptorPoolCreateInfo createInfo{
-      .maxSets = materialCount,
-      .poolSizeCount = 1,
-      .pPoolSizes = &poolSize,
-  };
-  return vk::raii::DescriptorPool(device_.logicalDevice(), createInfo);
 }
 
 void Renderer::allocateAndWriteFrameDescriptorSets() {
@@ -389,41 +330,6 @@ void Renderer::allocateAndWriteFrameDescriptorSets() {
         .descriptorCount = 1,
         .descriptorType = vk::DescriptorType::eUniformBuffer,
         .pBufferInfo = &bufferInfo,
-    };
-
-    device_.logicalDevice().updateDescriptorSets({write}, {});
-  }
-}
-
-void Renderer::writeMaterialDescriptorSets() {
-  std::vector<vk::DescriptorSetLayout> layouts(materialGpuResources_.size(),
-                                               *materialDescriptorSetLayout_);
-
-  vk::DescriptorSetAllocateInfo allocateInfo{
-      .descriptorPool = *materialDescriptorPool_,
-      .descriptorSetCount = static_cast<std::uint32_t>(layouts.size()),
-      .pSetLayouts = layouts.data(),
-  };
-
-  auto descriptorSets =
-      (*device_.logicalDevice()).allocateDescriptorSets(allocateInfo);
-
-  for (std::size_t index = 0; index < materialGpuResources_.size(); ++index) {
-    auto &material = materialGpuResources_[index];
-    material.descriptorSet = descriptorSets[index];
-
-    vk::DescriptorImageInfo imageInfo{
-        .sampler = *material.albedoTexture.sampler,
-        .imageView = *material.albedoTexture.imageView,
-        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
-    };
-
-    vk::WriteDescriptorSet write{
-        .dstSet = material.descriptorSet,
-        .dstBinding = 0,
-        .descriptorCount = 1,
-        .descriptorType = vk::DescriptorType::eCombinedImageSampler,
-        .pImageInfo = &imageInfo,
     };
 
     device_.logicalDevice().updateDescriptorSets({write}, {});
@@ -502,13 +408,8 @@ void Renderer::drawObject(MeshId meshId, MaterialId materialId,
     throw std::runtime_error("Renderer mesh id is out of range.");
   }
 
-  if (materialId >= materialGpuResources_.size()) {
-    throw std::runtime_error("Renderer material id is out of range.");
-  }
-
   MeshGpuResources const &meshResources = meshGpuResources_[meshId];
-  MaterialGpuResources const &materialResource =
-      materialGpuResources_[materialId];
+  auto const &materialResource = materialGpuStore_.material(materialId);
 
   auto const &frameState = *activeFrame_;
   auto &commandBuffer = commandBuffers_[frameState.frameIndex];
@@ -725,7 +626,7 @@ void Renderer::validateSwapChainState() const {
         "Renderer mesh GPU resources are not initialized.");
   }
 
-  if (materialGpuResources_.empty()) {
+  if (materialGpuStore_.empty()) {
     throw std::runtime_error(
         "Renderer material GPU resources are not initialized.");
   }
@@ -743,17 +644,6 @@ void Renderer::validateSwapChainState() const {
         meshResources.indexCount == 0) {
       throw std::runtime_error(
           "Renderer mesh GPU resources are not initialized.");
-    }
-  }
-
-  for (auto const &materialResources : materialGpuResources_) {
-    if (materialResources.albedoTexture.image == nullptr ||
-        materialResources.albedoTexture.memory == nullptr ||
-        materialResources.albedoTexture.imageView == nullptr ||
-        materialResources.albedoTexture.sampler == nullptr ||
-        materialResources.descriptorSet == nullptr) {
-      throw std::runtime_error(
-          "Renderer material GPU resources are not initialized.");
     }
   }
 }
@@ -896,10 +786,9 @@ void Renderer::createCommandBuffers() {
       vk::raii::CommandBuffers(device_.logicalDevice(), allocateInfo);
 }
 
-void Renderer::updateFrameUniformBuffer(FrameContext &frame,
-                                        glm::mat4 const &viewProjMatrix,
-                                        glm::vec3 const &cameraPosition,
-                                        LightingSettings const &lighting) const {
+void Renderer::updateFrameUniformBuffer(
+    FrameContext &frame, glm::mat4 const &viewProjMatrix,
+    glm::vec3 const &cameraPosition, LightingSettings const &lighting) const {
   FrameUniformBufferObject ubo{};
   ubo.viewProj = viewProjMatrix;
   ubo.cameraPosition = glm::vec4(cameraPosition, 1.0f);
@@ -910,11 +799,10 @@ void Renderer::updateFrameUniformBuffer(FrameContext &frame,
   ubo.lightDirection = glm::vec4(glm::normalize(lightDirection), 0.0f);
   glm::vec3 const lightColor = lighting.color * lighting.intensity;
   ubo.lightColor = glm::vec4(lightColor, 1.0f);
-  ubo.ambientColor =
-      glm::vec4(lightColor * lighting.ambientStrength, 1.0f);
-  ubo.lightingParams = glm::vec4(lighting.diffuseStrength,
-                                 lighting.specularStrength,
-                                 lighting.shininess, 0.0f);
+  ubo.ambientColor = glm::vec4(lightColor * lighting.ambientStrength, 1.0f);
+  ubo.lightingParams =
+      glm::vec4(lighting.diffuseStrength, lighting.specularStrength,
+                lighting.shininess, 0.0f);
 
   void *mapped = frame.uniformBufferMemory.mapMemory(0, sizeof(ubo));
   std::memcpy(mapped, &ubo, sizeof(ubo));

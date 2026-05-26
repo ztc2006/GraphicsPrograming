@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "device.hpp"
+#include "material_gpu_store.hpp"
 #include "mesh.hpp"
 #include "scene.hpp"
 #include "scene_object.hpp"
@@ -81,12 +82,6 @@ private:
     vk::ImageLayout layout = vk::ImageLayout::eUndefined;
   };
 
-  struct MaterialGpuResources {
-    TextureResources albedoTexture;
-    vk::DescriptorSet descriptorSet = nullptr;
-    glm::vec4 tint{1.0f};
-  };
-
   static constexpr std::uint32_t kFramesInFlight = 1;
 
   static std::vector<char> readBinaryFile(char const *path);
@@ -132,18 +127,14 @@ private:
                             vk::AccessFlags2 dstAccessMask);
 
   void createFrameDescriptorSetLayout();
-  void createMaterialDescriptorSetLayout();
   void createFrameDescriptorPool();
   void allocateAndWriteFrameDescriptorSets();
-
-  vk::raii::DescriptorPool
-  createMaterialDescriptorPool(std::uint32_t materialCount) const;
-  void writeMaterialDescriptorSets();
 
 private:
   DepthResources depthResources_{};
 
   Device const &device_;
+  MaterialGpuStore materialGpuStore_;
   SwapChain const *swapChain_ = nullptr;
 
   vk::raii::CommandPool commandPool_ = nullptr;
@@ -152,12 +143,8 @@ private:
   std::uint32_t currentFrame_ = 0;
   std::optional<ActiveFrameState> activeFrame_;
 
-  std::vector<MaterialGpuResources> materialGpuResources_;
-
   vk::raii::DescriptorSetLayout frameDescriptorSetLayout_ = nullptr;
-  vk::raii::DescriptorSetLayout materialDescriptorSetLayout_ = nullptr;
   vk::raii::DescriptorPool frameDescriptorPool_ = nullptr;
-  vk::raii::DescriptorPool materialDescriptorPool_ = nullptr;
 
   vk::raii::PipelineLayout pipelineLayout_ = nullptr;
   vk::raii::Pipeline graphicsPipeline_ = nullptr;

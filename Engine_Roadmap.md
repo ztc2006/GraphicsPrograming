@@ -1,6 +1,6 @@
 # Vulkan Engine Roadmap
 
-Last Updated: 2026-05-23
+Last Updated: 2026-05-25
 Primary Branch: `archlinux`
 
 ## 1. Current Project State
@@ -30,8 +30,8 @@ Current caveat:
 The project should move in two tracks:
 
 1. Ship visible rendering effects first.
-2. Only extract larger engine systems after the effect path proves the data and
-   resource boundaries.
+2. Only extract larger engine systems after the effect path proves the data,
+   pass, UI, and resource boundaries.
 
 This avoids building ECS, material systems, render graphs, or asset pipelines
 before the renderer has enough real pressure to justify their shape.
@@ -43,6 +43,10 @@ Confirmed decisions:
 - Build a minimal material path before a formal `MaterialSystem`.
 - Keep temporary technical debt local to scene/material binding code.
 - Prefer small verifiable milestones over broad architecture rewrites.
+- After the current material GPU resource split, make rendering quality the main
+  direction again: directional shadow mapping first, then PCF and bias tuning.
+- Treat logging and ImGui cleanup as support work for shadow debugging, not as
+  separate large milestones.
 
 ## 3. Milestone M1: Effect-First Rendering
 
@@ -50,11 +54,14 @@ Goal: reach a small but real 3D rendering loop with correct depth, textures,
 multiple objects/materials, basic lighting, and stable resize behavior.
 
 Status:
-- S1 depth path: implemented, pending runtime acceptance.
-- S2 texture sampling: next implementation target.
-- S3 multi-object/multi-material: multi-object exists; multi-material pending.
-- S4 Blinn-Phong lighting: pending.
-- S5 stability pass: pending.
+- S1 depth path: implemented and accepted.
+- S2 texture sampling: external file-backed texture loading is active.
+- S3 multi-object/multi-material: implemented through `Scene::materials` and
+  `SceneObject::materialId`.
+- S4 Blinn-Phong lighting: implemented with editable ImGui light controls.
+- S5 camera/debug UI: free-fly camera and quick ImGui docking shell are active.
+- S6 resource cleanup: texture extraction is done; material GPU resource
+  extraction is the next small cleanup.
 
 ### M1-S1 Depth Path
 
@@ -107,18 +114,32 @@ Target:
 - Implement Blinn-Phong diffuse and specular terms.
 - Verify specular response changes with camera/object motion.
 
-Out of scope for M1:
+Out of scope for this slice:
 - PBR.
 - IBL.
 - Shadows.
 - Multiple dynamic lights.
 
-### M1-S5 Stability And Cleanup
+### M1-S5 Camera, Debug UI, And Runtime Inspection
+
+Implemented:
+- Free-fly camera for inspecting lighting and material response.
+- ImGui docking shell.
+- Camera, light, material, and render debug panels.
+- Rasterizer debug controls for cull mode and front face.
+
+Purpose:
+- Give the renderer enough runtime inspection before starting multi-pass
+  rendering features.
+- Keep debug UI practical without turning it into an editor framework.
+
+### M1-S6 Stability And Cleanup
 
 Target:
 - Stress resize and minimize/restore.
 - Confirm no validation errors in the M1 path.
-- Clean temporary code that would block M2 extraction.
+- Finish small resource extractions that are already justified by the code:
+  `TextureLoader` / `TextureResources` first, then `MaterialGpuStore`.
 - Keep `cmake --build` and clangd non-blocking on Arch.
 
 M1 done means:
@@ -130,26 +151,30 @@ M1 done means:
 
 ## 4. Milestone M2: Material And Resource Structure
 
-Goal: turn the proven M1 resource flow into a small engine-facing structure.
+Goal: turn only the proven M1 resource flow into small engine-facing structure.
 
 Scope:
-- Extract a formal `MaterialSystem` or material manager.
+- Extract `MaterialGpuStore` from `Renderer` before the shadow milestone.
 - Introduce stable handles for textures/materials.
 - Separate CPU-side material descriptions from GPU-side bound resources.
 - Centralize texture destruction and recreation rules.
 - Keep renderer submission simple and explicit.
 
 Recommended order:
-1. Define handle types.
-2. Move material storage out of ad hoc scene/rendering code.
-3. Move texture lifetime into a dedicated owner.
-4. Make renderer consume stable material/texture references.
-5. Add error checks for missing resources and invalid handles.
+1. Keep `Scene::materials` as the CPU-side material source for now.
+2. Move GPU-side material resources, descriptor pool allocation, descriptor set
+   writes, texture loading, and tint sync into `MaterialGpuStore`.
+3. Keep `Renderer` responsible for frame lifecycle, pipeline, draw submission,
+   descriptor binding, and push constants.
+4. Add invalid material/resource checks where they help catch real mistakes.
+5. Reconsider a formal `MaterialSystem` after shadow mapping creates more
+   concrete pressure.
 
 Non-goals:
 - Full asset database.
 - Hot reload.
 - Editor-facing material graph.
+- Full material graph or PBR material model.
 
 ## 5. Milestone M3: Scene And ECS Foundation
 
@@ -197,26 +222,39 @@ Possible later additions:
 Non-goal:
 - A generic FrameGraph before there are multiple real passes to schedule.
 
-## 7. Milestone M5: Advanced Rendering Features
+## 7. Milestone M5: Shadow Mapping And Rendering Quality
 
-Goal: add features that make the renderer feel like a small engine rather than a
-tutorial project.
+Goal: move from single lit pass rendering into a small multi-pass renderer with
+visible quality improvements.
 
-Candidate features:
-- Shadow mapping.
-- Normal mapping.
-- Cubemap skybox.
-- Model loading with materials.
-- Basic post-processing.
-- GPU timing markers.
-- Debug draw utilities.
+Primary target:
+- Directional shadow map.
+- PCF filtering.
+- Depth bias tuning.
+- Shadow map visualization in ImGui.
 
 Recommended priority:
-1. Model loading with material preservation.
-2. Shadow mapping.
-3. Skybox.
-4. Normal mapping.
-5. Post-processing.
+1. Add a light-space camera/matrix for the directional light.
+2. Create a depth-only shadow image, view, sampler, and framebuffer-equivalent
+   dynamic rendering setup.
+3. Add a shadow depth pass before the main lit pass.
+4. Sample the shadow map in the Blinn-Phong fragment shader.
+5. Expose shadow enable, bias, filter radius, and debug visualization in ImGui.
+6. Add PCF after the hard-shadow path is correct.
+
+Supporting work before or during this milestone:
+- Add lightweight logging/error reporting only where it makes Vulkan resource
+  creation and pass setup easier to diagnose.
+- Extract small ImGui helper structure only if `Application` debug UI becomes
+  hard to read.
+
+Deferred candidates:
+- Model loading with material preservation.
+- Skybox.
+- Normal mapping.
+- Post-processing.
+- GPU timing markers.
+- Debug draw utilities.
 
 ## 8. Milestone M6: Tooling And Workflow
 
@@ -239,17 +277,21 @@ Potential checks:
 
 The next concrete sequence is:
 
-1. Run the current branch and validate M1-S1 depth behavior.
-2. If depth has issues, fix depth before starting texture work.
-3. If depth passes, mark M1-S1 accepted in this roadmap.
-4. Implement M1-S2 texture loading/upload/sampling.
-5. Add minimal material IDs for M1-S3.
-6. Add normals and Blinn-Phong lighting for M1-S4.
-7. Run M1-S5 stability checks.
+1. Finish the current small material GPU resource extraction:
+   `MaterialGpuStore` owns GPU-side material resources and descriptor writes;
+   `Renderer` keeps frame/pipeline/draw responsibilities.
+2. Add minimal debug support only where needed:
+   lightweight logging/error reporting for Vulkan setup, and small ImGui
+   organization if the debug UI becomes too noisy.
+3. Start directional shadow mapping with a hard-shadow path first.
+4. Add ImGui controls for shadow enable, bias, and debug texture visualization.
+5. Add PCF after the hard-shadow path is visually correct.
+6. Revisit larger material/render architecture only after shadow work exposes
+   concrete pressure.
 
 Recommended next commit after this roadmap:
-- `test` or `fix`: depth validation fixes if runtime testing exposes issues.
-- Otherwise `feat`: texture upload and albedo sampling.
+- `refactor`: extract material GPU resources from renderer.
+- Then `feat`: add directional shadow map.
 
 ## 10. Long-Term Direction
 
@@ -258,6 +300,8 @@ The long-term direction is a small Vulkan engine with:
 - Explicit resource ownership.
 - Minimal but useful material and texture systems.
 - ECS-based scene representation.
+- Debug UI that helps inspect real rendering state.
+- Rendering quality features that justify each architecture step.
 - A renderer architecture that grows from actual feature pressure.
 
 The important constraint is sequencing: visible renderer behavior first,
