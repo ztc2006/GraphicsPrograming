@@ -52,6 +52,7 @@ public:
                         glm::vec3 const &cameraPosition,
                         LightingSettings const &lighting);
   void recreateForSwapChain(SwapChain const &swapChain);
+  void beginMainPass();
 
 private:
   struct FrameContext {
@@ -82,7 +83,22 @@ private:
     vk::ImageLayout layout = vk::ImageLayout::eUndefined;
   };
 
+  struct ShadowResources {
+    vk::raii::Image image = nullptr;
+    vk::raii::DeviceMemory memory = nullptr;
+    vk::raii::ImageView imageView = nullptr;
+    vk::raii::Sampler sampler = nullptr;
+    vk::ImageLayout layout = vk::ImageLayout::eUndefined;
+  };
+
+  enum class ActivePass {
+    eNone,
+    eShadow,
+    eMain,
+  };
+
   static constexpr std::uint32_t kFramesInFlight = 1;
+  static constexpr std::uint32_t kShadowMapSize = 2048;
 
   static std::vector<char> readBinaryFile(char const *path);
 
@@ -101,9 +117,6 @@ private:
   vk::raii::Pipeline
   createGraphicsPipeline(SwapChain const &swapChain,
                          vk::raii::PipelineLayout const &pipelineLayout) const;
-
-  void beginCommandBuffer(vk::raii::CommandBuffer const &commandBuffer,
-                          FrameContext const &frame, std::uint32_t imageIndex);
 
   void endCommandBuffer(vk::raii::CommandBuffer const &commandBuffer,
                         std::uint32_t imageIndex);
@@ -130,8 +143,26 @@ private:
   void createFrameDescriptorPool();
   void allocateAndWriteFrameDescriptorSets();
 
+  ShadowResources createShadowResources() const;
+  vk::raii::Pipeline
+  createShadowPipeline(vk::raii::PipelineLayout const &pipelineLayout) const;
+  void beginShadowPass(vk::raii::CommandBuffer const &commandBuffer,
+                       FrameContext const &frame);
+  void beginMainPass(vk::raii::CommandBuffer const &commandBuffer,
+                     FrameContext const &frame, std::uint32_t imageIndex);
+  void transitionShadowImage(vk::raii::CommandBuffer const &commandBuffer,
+                             vk::ImageLayout newLayout,
+                             vk::PipelineStageFlags2 srcStage,
+                             vk::AccessFlags2 srcAccess,
+                             vk::PipelineStageFlags2 dstStage,
+                             vk::AccessFlags2 dstAccess);
+
 private:
   DepthResources depthResources_{};
+
+  ShadowResources shadowResources_{};
+  vk::raii::Pipeline shadowPipeline_ = nullptr;
+  ActivePass activePass_ = ActivePass::eNone;
 
   Device const &device_;
   MaterialGpuStore materialGpuStore_;

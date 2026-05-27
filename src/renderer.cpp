@@ -3,6 +3,7 @@
 #include "renderer.hpp"
 
 #include <array>
+#include <cmath>
 #include <cstring>
 #include <fstream>
 #include <limits>
@@ -23,7 +24,27 @@ struct FrameUniformBufferObject {
   glm::vec4 lightColor{1.0f, 0.98f, 0.92f, 1.0f};
   glm::vec4 ambientColor{0.08f, 0.08f, 0.1f, 1.0f};
   glm::vec4 lightingParams{1.0f, 0.35f, 32.0f, 0.0f};
+  glm::mat4 lightViewProj{1.0f};
 };
+
+glm::mat4 computeLightViewProj(glm::vec3 direction) {
+  if (glm::length(direction) <= 0.0001f) {
+    direction = {0.0f, 1.0f, 0.0f};
+  }
+
+  glm::vec3 const lightDir = glm::normalize(direction);
+  glm::vec3 const target{0.0f};
+  glm::vec3 const eye = target + lightDir * 6.0f;
+  glm::vec3 up{0.0f, 1.0f, 0.0f};
+  if (std::abs(glm::dot(lightDir, up)) > 0.95f) {
+    up = {0.0f, 0.0f, 1.0f};
+  }
+
+  glm::mat4 view = glm::lookAt(eye, target, up);
+  glm::mat4 proj = glm::ortho(-3.0f, 3.0f, -3.0f, 3.0f, 0.1f, 12.0f);
+  proj[1][1] *= -1.0f;
+  return proj * view;
+}
 } // namespace
 
 Renderer::Renderer(Device const &device)
@@ -62,6 +83,8 @@ void Renderer::recreateForSwapChain(SwapChain const &swapChain) {
 
   vk::raii::Pipeline newGraphicsPipeline =
       createGraphicsPipeline(swapChain, newPipelineLayout);
+  vk::raii::Pipeline newShadowPipeline =
+      createShadowPipeline(newPipelineLayout);
 
   std::vector<vk::raii::Semaphore> newRenderFinishedSemaphores;
   newRenderFinishedSemaphores.reserve(swapChain.images().size());
@@ -80,6 +103,7 @@ void Renderer::recreateForSwapChain(SwapChain const &swapChain) {
   using std::swap;
   swap(pipelineLayout_, newPipelineLayout);
   swap(graphicsPipeline_, newGraphicsPipeline);
+  swap(shadowPipeline_, newShadowPipeline);
   swap(renderFinishedSemaphores_, newRenderFinishedSemaphores);
   swap(swapChainImageLayouts_, newSwapChainImageLayouts);
   swap(imagesInFlight_, newImagesInFlight);
@@ -87,11 +111,13 @@ void Renderer::recreateForSwapChain(SwapChain const &swapChain) {
   swap(depthResources_, newDepthResource);
   currentFrame_ = 0;
   activeFrame_.reset();
+  activePass_ = ActivePass::eNone;
 }
 
 void Renderer::createPersistentResources() {
   createCommandPool();
   createFrameResources();
+  shadowResources_ = createShadowResources();
   createFrameDescriptorSetLayout();
   createFrameDescriptorPool();
   allocateAndWriteFrameDescriptorSets();
@@ -217,6 +243,81 @@ Renderer::createDepthResources(SwapChain const &swapChain) const {
   return resources;
 }
 
+Renderer::ShadowResources Renderer::createShadowResources() const {
+  vk::ImageCreateInfo imageCreateInfo{
+      .imageType = vk::ImageType::e2D,
+      .format = kDepthFormat,
+      .extent =
+          {
+              .width = kShadowMapSize,
+              .height = kShadowMapSize,
+              .depth = 1,
+          },
+      .mipLevels = 1,
+      .arrayLayers = 1,
+      .samples = vk::SampleCountFlagBits::e1,
+      .tiling = vk::ImageTiling::eOptimal,
+      .usage = vk::ImageUsageFlagBits::eDepthStencilAttachment |
+               vk::ImageUsageFlagBits::eSampled,
+      .sharingMode = vk::SharingMode::eExclusive,
+      .initialLayout = vk::ImageLayout::eUndefined,
+  };
+
+  vk::raii::Image image(device_.logicalDevice(), imageCreateInfo);
+  auto memoryRequirements = image.getMemoryRequirements();
+
+  vk::MemoryAllocateInfo allocateInfo{
+      .allocationSize = memoryRequirements.size,
+      .memoryTypeIndex =
+          device_.findMemoryType(memoryRequirements.memoryTypeBits,
+                                 vk::MemoryPropertyFlagBits::eDeviceLocal),
+  };
+
+  vk::raii::DeviceMemory memory(device_.logicalDevice(), allocateInfo);
+  image.bindMemory(*memory, 0);
+
+  vk::ImageViewCreateInfo imageViewCreateInfo{
+      .image = *image,
+      .viewType = vk::ImageViewType::e2D,
+      .format = kDepthFormat,
+      .subresourceRange =
+          {
+              .aspectMask = vk::ImageAspectFlagBits::eDepth,
+              .baseMipLevel = 0,
+              .levelCount = 1,
+              .baseArrayLayer = 0,
+              .layerCount = 1,
+          },
+  };
+
+  vk::SamplerCreateInfo samplerCreateInfo{
+      .magFilter = vk::Filter::eLinear,
+      .minFilter = vk::Filter::eLinear,
+      .mipmapMode = vk::SamplerMipmapMode::eNearest,
+      .addressModeU = vk::SamplerAddressMode::eClampToBorder,
+      .addressModeV = vk::SamplerAddressMode::eClampToBorder,
+      .addressModeW = vk::SamplerAddressMode::eClampToBorder,
+      .mipLodBias = 0.0f,
+      .anisotropyEnable = false,
+      .compareEnable = true,
+      .compareOp = vk::CompareOp::eLessOrEqual,
+      .minLod = 0.0f,
+      .maxLod = 0.0f,
+      .borderColor = vk::BorderColor::eFloatOpaqueWhite,
+      .unnormalizedCoordinates = false,
+  };
+
+  ShadowResources resources{};
+  resources.image = std::move(image);
+  resources.memory = std::move(memory);
+  resources.imageView =
+      vk::raii::ImageView(device_.logicalDevice(), imageViewCreateInfo);
+  resources.sampler =
+      vk::raii::Sampler(device_.logicalDevice(), samplerCreateInfo);
+  resources.layout = vk::ImageLayout::eUndefined;
+  return resources;
+}
+
 void Renderer::setMeshes(std::vector<Mesh> const &meshes) {
   if (activeFrame_.has_value()) {
     throw std::runtime_error(
@@ -272,32 +373,46 @@ void Renderer::setRasterizerDebugSettings(RasterizerDebugSettings settings) {
 }
 
 void Renderer::createFrameDescriptorSetLayout() {
-  vk::DescriptorSetLayoutBinding binding{
-      .binding = 0,
-      .descriptorType = vk::DescriptorType::eUniformBuffer,
-      .descriptorCount = 1,
-      .stageFlags =
-          vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment,
+  std::array bindings = {
+      vk::DescriptorSetLayoutBinding{
+          .binding = 0,
+          .descriptorType = vk::DescriptorType::eUniformBuffer,
+          .descriptorCount = 1,
+          .stageFlags = vk::ShaderStageFlagBits::eVertex |
+                        vk::ShaderStageFlagBits::eFragment,
+      },
+      vk::DescriptorSetLayoutBinding{
+          .binding = 1,
+          .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+          .descriptorCount = 1,
+          .stageFlags = vk::ShaderStageFlagBits::eFragment,
+      },
   };
 
   vk::DescriptorSetLayoutCreateInfo createInfo{
-      .bindingCount = 1,
-      .pBindings = &binding,
+      .bindingCount = static_cast<std::uint32_t>(bindings.size()),
+      .pBindings = bindings.data(),
   };
   frameDescriptorSetLayout_ =
       vk::raii::DescriptorSetLayout(device_.logicalDevice(), createInfo);
 }
 
 void Renderer::createFrameDescriptorPool() {
-  vk::DescriptorPoolSize poolSize{
-      .type = vk::DescriptorType::eUniformBuffer,
-      .descriptorCount = kFramesInFlight,
+  std::array poolSizes = {
+      vk::DescriptorPoolSize{
+          .type = vk::DescriptorType::eUniformBuffer,
+          .descriptorCount = kFramesInFlight,
+      },
+      vk::DescriptorPoolSize{
+          .type = vk::DescriptorType::eCombinedImageSampler,
+          .descriptorCount = kFramesInFlight,
+      },
   };
 
   vk::DescriptorPoolCreateInfo createInfo{
       .maxSets = kFramesInFlight,
-      .poolSizeCount = 1,
-      .pPoolSizes = &poolSize,
+      .poolSizeCount = static_cast<std::uint32_t>(poolSizes.size()),
+      .pPoolSizes = poolSizes.data(),
   };
   frameDescriptorPool_ =
       vk::raii::DescriptorPool(device_.logicalDevice(), createInfo);
@@ -324,15 +439,30 @@ void Renderer::allocateAndWriteFrameDescriptorSets() {
         .range = sizeof(FrameUniformBufferObject),
     };
 
-    vk::WriteDescriptorSet write{
-        .dstSet = frames_[index].descriptorSet,
-        .dstBinding = 0,
-        .descriptorCount = 1,
-        .descriptorType = vk::DescriptorType::eUniformBuffer,
-        .pBufferInfo = &bufferInfo,
+    vk::DescriptorImageInfo shadowImageInfo{
+        .sampler = *shadowResources_.sampler,
+        .imageView = *shadowResources_.imageView,
+        .imageLayout = vk::ImageLayout::eDepthReadOnlyOptimal,
     };
 
-    device_.logicalDevice().updateDescriptorSets({write}, {});
+    std::array writes = {
+        vk::WriteDescriptorSet{
+            .dstSet = frames_[index].descriptorSet,
+            .dstBinding = 0,
+            .descriptorCount = 1,
+            .descriptorType = vk::DescriptorType::eUniformBuffer,
+            .pBufferInfo = &bufferInfo,
+        },
+        vk::WriteDescriptorSet{
+            .dstSet = frames_[index].descriptorSet,
+            .dstBinding = 1,
+            .descriptorCount = 1,
+            .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+            .pImageInfo = &shadowImageInfo,
+        },
+    };
+
+    device_.logicalDevice().updateDescriptorSets(writes, {});
   }
 }
 
@@ -387,13 +517,18 @@ Renderer::FrameResult Renderer::beginFrame(glm::mat4 const &viewProjMatrix,
 
   commandBuffer.reset();
   updateFrameUniformBuffer(frame, viewProjMatrix, cameraPosition, lighting);
-  beginCommandBuffer(commandBuffer, frame, imageIndex);
+
+  commandBuffer.begin(vk::CommandBufferBeginInfo{
+      .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
+  });
+  beginShadowPass(commandBuffer, frame);
 
   activeFrame_ = ActiveFrameState{
       .frameIndex = frameIndex,
       .imageIndex = imageIndex,
       .acquireResult = acquireResult,
   };
+  activePass_ = ActivePass::eShadow;
 
   return FrameResult::eSuccess;
 }
@@ -409,7 +544,6 @@ void Renderer::drawObject(MeshId meshId, MaterialId materialId,
   }
 
   MeshGpuResources const &meshResources = meshGpuResources_[meshId];
-  auto const &materialResource = materialGpuStore_.material(materialId);
 
   auto const &frameState = *activeFrame_;
   auto &commandBuffer = commandBuffers_[frameState.frameIndex];
@@ -420,14 +554,26 @@ void Renderer::drawObject(MeshId meshId, MaterialId materialId,
   commandBuffer.bindIndexBuffer(*meshResources.indexBuffer, 0,
                                 vk::IndexType::eUint32);
 
-  commandBuffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics,
-                                   *pipelineLayout_, 1,
-                                   {materialResource.descriptorSet}, {});
-
+  auto const &materialResource = materialGpuStore_.material(materialId);
   PushConstants pushConstants{
       .transform = modelMatrix,
       .materialTint = materialResource.tint,
   };
+
+  if (activePass_ == ActivePass::eShadow) {
+    commandBuffer.pushConstants<PushConstants>(
+        *pipelineLayout_, vk::ShaderStageFlagBits::eVertex, 0, pushConstants);
+    commandBuffer.drawIndexed(meshResources.indexCount, 1, 0, 0, 0);
+    return;
+  }
+
+  if (activePass_ != ActivePass::eMain) {
+    throw std::runtime_error("Renderer has no active draw pass.");
+  }
+
+  commandBuffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics,
+                                   *pipelineLayout_, 1,
+                                   {materialResource.descriptorSet}, {});
 
   commandBuffer.pushConstants<PushConstants>(
       *pipelineLayout_,
@@ -441,6 +587,10 @@ Renderer::FrameResult Renderer::endFrame() {
   if (!activeFrame_.has_value()) {
     throw std::runtime_error(
         "Cannot end a frame when no frame is in progress.");
+  }
+
+  if (activePass_ != ActivePass::eMain) {
+    throw std::runtime_error("Cannot end a frame before the main pass.");
   }
 
   ActiveFrameState const frameState = *activeFrame_;
@@ -486,6 +636,7 @@ Renderer::FrameResult Renderer::endFrame() {
     presentResult = device_.presentQueue().presentKHR(presentInfo);
   } catch (vk::OutOfDateKHRError const &) {
     activeFrame_.reset();
+    activePass_ = ActivePass::eNone;
     advanceFrame();
     return FrameResult::eSwapChainOutOfDate;
   }
@@ -496,6 +647,7 @@ Renderer::FrameResult Renderer::endFrame() {
   }
 
   activeFrame_.reset();
+  activePass_ = ActivePass::eNone;
 
   if (frameState.acquireResult == vk::Result::eSuboptimalKHR ||
       presentResult == vk::Result::eSuboptimalKHR) {
@@ -518,6 +670,8 @@ Renderer::FrameResult Renderer::drawFrame(MeshId meshId, MaterialId materialId,
     return beginResult;
   }
 
+  drawObject(meshId, materialId, modelMatrix);
+  beginMainPass();
   drawObject(meshId, materialId, modelMatrix);
   return endFrame();
 }
@@ -600,6 +754,10 @@ void Renderer::validateSwapChainState() const {
     throw std::runtime_error("Renderer graphics pipeline is not initialized.");
   }
 
+  if (shadowPipeline_ == nullptr) {
+    throw std::runtime_error("Renderer shadow pipeline is not initialized.");
+  }
+
   if (swapChain_->imageViews().size() != imageCount) {
     throw std::runtime_error(
         "Renderer swapchain image view count does not match image count.");
@@ -634,6 +792,12 @@ void Renderer::validateSwapChainState() const {
   if (depthResources_.image == nullptr || depthResources_.memory == nullptr ||
       depthResources_.imageView == nullptr) {
     throw std::runtime_error("Renderer depth resources are not initialized.");
+  }
+
+  if (shadowResources_.image == nullptr || shadowResources_.memory == nullptr ||
+      shadowResources_.imageView == nullptr ||
+      shadowResources_.sampler == nullptr) {
+    throw std::runtime_error("Renderer shadow resources are not initialized.");
   }
 
   for (auto const &meshResources : meshGpuResources_) {
@@ -776,6 +940,102 @@ vk::raii::Pipeline Renderer::createGraphicsPipeline(
                             pipelineCreateInfo);
 }
 
+vk::raii::Pipeline Renderer::createShadowPipeline(
+    vk::raii::PipelineLayout const &pipelineLayout) const {
+  auto vertCode = readBinaryFile("shaders/shadow.vert.spv");
+
+  vk::ShaderModuleCreateInfo vertexShaderCreateInfo{
+      .codeSize = vertCode.size(),
+      .pCode = reinterpret_cast<std::uint32_t const *>(vertCode.data()),
+  };
+
+  vk::raii::ShaderModule vertexShaderModule(device_.logicalDevice(),
+                                            vertexShaderCreateInfo);
+
+  vk::PipelineShaderStageCreateInfo shaderStage{
+      .stage = vk::ShaderStageFlagBits::eVertex,
+      .module = *vertexShaderModule,
+      .pName = "main",
+  };
+
+  auto bindingDescription = Vertex::bindingDescription();
+  auto attributeDescriptions = Vertex::attributeDescriptions();
+
+  vk::PipelineVertexInputStateCreateInfo vertexInputInfo{
+      .vertexBindingDescriptionCount = 1,
+      .pVertexBindingDescriptions = &bindingDescription,
+      .vertexAttributeDescriptionCount =
+          static_cast<std::uint32_t>(attributeDescriptions.size()),
+      .pVertexAttributeDescriptions = attributeDescriptions.data(),
+  };
+  vk::PipelineInputAssemblyStateCreateInfo inputAssembly{
+      .topology = vk::PrimitiveTopology::eTriangleList,
+      .primitiveRestartEnable = false,
+  };
+  vk::PipelineViewportStateCreateInfo viewportState{
+      .viewportCount = 1,
+      .scissorCount = 1,
+  };
+  vk::PipelineRasterizationStateCreateInfo rasterizer{
+      .depthClampEnable = false,
+      .rasterizerDiscardEnable = false,
+      .polygonMode = vk::PolygonMode::eFill,
+      .cullMode = vk::CullModeFlagBits::eNone,
+      .frontFace = vk::FrontFace::eCounterClockwise,
+      .depthBiasEnable = true,
+      .depthBiasConstantFactor = 1.25f,
+      .depthBiasSlopeFactor = 1.75f,
+      .lineWidth = 1.0f,
+  };
+  vk::PipelineMultisampleStateCreateInfo multisampling{
+      .rasterizationSamples = vk::SampleCountFlagBits::e1,
+      .sampleShadingEnable = false,
+  };
+  vk::PipelineColorBlendStateCreateInfo colorBlending{
+      .logicOpEnable = false,
+      .attachmentCount = 0,
+  };
+  vk::PipelineDepthStencilStateCreateInfo depthStencil{
+      .depthTestEnable = true,
+      .depthWriteEnable = true,
+      .depthCompareOp = vk::CompareOp::eLessOrEqual,
+      .depthBoundsTestEnable = false,
+      .stencilTestEnable = false,
+  };
+
+  std::array dynamicStates = {
+      vk::DynamicState::eViewport,
+      vk::DynamicState::eScissor,
+  };
+  vk::PipelineDynamicStateCreateInfo dynamicState{
+      .dynamicStateCount = static_cast<std::uint32_t>(dynamicStates.size()),
+      .pDynamicStates = dynamicStates.data(),
+  };
+
+  vk::PipelineRenderingCreateInfo pipelineRenderingCreateInfo{
+      .colorAttachmentCount = 0,
+      .depthAttachmentFormat = kDepthFormat,
+  };
+
+  vk::GraphicsPipelineCreateInfo pipelineCreateInfo{
+      .pNext = &pipelineRenderingCreateInfo,
+      .stageCount = 1,
+      .pStages = &shaderStage,
+      .pVertexInputState = &vertexInputInfo,
+      .pInputAssemblyState = &inputAssembly,
+      .pViewportState = &viewportState,
+      .pRasterizationState = &rasterizer,
+      .pMultisampleState = &multisampling,
+      .pDepthStencilState = &depthStencil,
+      .pColorBlendState = &colorBlending,
+      .pDynamicState = &dynamicState,
+      .layout = *pipelineLayout,
+  };
+
+  return vk::raii::Pipeline(device_.logicalDevice(), nullptr,
+                            pipelineCreateInfo);
+}
+
 void Renderer::createCommandBuffers() {
   vk::CommandBufferAllocateInfo allocateInfo{
       .commandPool = *commandPool_,
@@ -803,19 +1063,15 @@ void Renderer::updateFrameUniformBuffer(
   ubo.lightingParams =
       glm::vec4(lighting.diffuseStrength, lighting.specularStrength,
                 lighting.shininess, 0.0f);
+  ubo.lightViewProj = computeLightViewProj(lighting.direction);
 
   void *mapped = frame.uniformBufferMemory.mapMemory(0, sizeof(ubo));
   std::memcpy(mapped, &ubo, sizeof(ubo));
   frame.uniformBufferMemory.unmapMemory();
 }
 
-void Renderer::beginCommandBuffer(vk::raii::CommandBuffer const &commandBuffer,
-                                  FrameContext const &frame,
-                                  std::uint32_t imageIndex) {
-  commandBuffer.begin(vk::CommandBufferBeginInfo{
-      .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
-  });
-
+void Renderer::beginShadowPass(vk::raii::CommandBuffer const &commandBuffer,
+                               FrameContext const &frame) {
   vk::ClearValue depthClearValue{
       .depthStencil =
           vk::ClearDepthStencilValue{
@@ -823,6 +1079,83 @@ void Renderer::beginCommandBuffer(vk::raii::CommandBuffer const &commandBuffer,
               .stencil = 0,
           },
   };
+
+  transitionShadowImage(commandBuffer, vk::ImageLayout::eDepthAttachmentOptimal,
+                        vk::PipelineStageFlagBits2::eFragmentShader,
+                        vk::AccessFlagBits2::eShaderSampledRead,
+                        vk::PipelineStageFlagBits2::eEarlyFragmentTests |
+                            vk::PipelineStageFlagBits2::eLateFragmentTests,
+                        vk::AccessFlagBits2::eDepthStencilAttachmentRead |
+                            vk::AccessFlagBits2::eDepthStencilAttachmentWrite);
+
+  vk::RenderingAttachmentInfo depthAttachment{
+      .imageView = *shadowResources_.imageView,
+      .imageLayout = vk::ImageLayout::eDepthAttachmentOptimal,
+      .loadOp = vk::AttachmentLoadOp::eClear,
+      .storeOp = vk::AttachmentStoreOp::eStore,
+      .clearValue = depthClearValue,
+  };
+
+  vk::RenderingInfo renderingInfo{
+      .renderArea =
+          {
+              .offset = {0, 0},
+              .extent = {kShadowMapSize, kShadowMapSize},
+          },
+      .layerCount = 1,
+      .colorAttachmentCount = 0,
+      .pDepthAttachment = &depthAttachment,
+  };
+
+  commandBuffer.beginRendering(renderingInfo);
+
+  commandBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics,
+                             *shadowPipeline_);
+  commandBuffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics,
+                                   *pipelineLayout_, 0, {frame.descriptorSet},
+                                   {});
+
+  vk::Viewport viewport{
+      .x = 0.0f,
+      .y = 0.0f,
+      .width = static_cast<float>(kShadowMapSize),
+      .height = static_cast<float>(kShadowMapSize),
+      .minDepth = 0.0f,
+      .maxDepth = 1.0f,
+  };
+  vk::Rect2D scissor{
+      .offset = {0, 0},
+      .extent = {kShadowMapSize, kShadowMapSize},
+  };
+  commandBuffer.setViewport(0, {viewport});
+  commandBuffer.setScissor(0, {scissor});
+}
+
+void Renderer::beginMainPass() {
+  if (!activeFrame_.has_value()) {
+    throw std::runtime_error("Cannot begin main pass without an active frame.");
+  }
+
+  if (activePass_ != ActivePass::eShadow) {
+    throw std::runtime_error("Cannot begin main pass before shadow pass.");
+  }
+
+  ActiveFrameState const frameState = *activeFrame_;
+  beginMainPass(commandBuffers_[frameState.frameIndex],
+                frames_[frameState.frameIndex], frameState.imageIndex);
+  activePass_ = ActivePass::eMain;
+}
+
+void Renderer::beginMainPass(vk::raii::CommandBuffer const &commandBuffer,
+                             FrameContext const &frame,
+                             std::uint32_t imageIndex) {
+  commandBuffer.endRendering();
+
+  transitionShadowImage(commandBuffer, vk::ImageLayout::eDepthReadOnlyOptimal,
+                        vk::PipelineStageFlagBits2::eLateFragmentTests,
+                        vk::AccessFlagBits2::eDepthStencilAttachmentWrite,
+                        vk::PipelineStageFlagBits2::eFragmentShader,
+                        vk::AccessFlagBits2::eShaderSampledRead);
 
   transitionSwapChainImage(commandBuffer, imageIndex,
                            vk::ImageLayout::eColorAttachmentOptimal,
@@ -834,6 +1167,14 @@ void Renderer::beginCommandBuffer(vk::raii::CommandBuffer const &commandBuffer,
   vk::ClearValue clearValue{
       .color =
           vk::ClearColorValue(std::array<float, 4>{0.05f, 0.07f, 0.10f, 1.0f}),
+  };
+
+  vk::ClearValue depthClearValue{
+      .depthStencil =
+          vk::ClearDepthStencilValue{
+              .depth = 1.0f,
+              .stencil = 0,
+          },
   };
 
   transitionDepthImage(commandBuffer, vk::ImageLayout::eDepthAttachmentOptimal,
@@ -977,4 +1318,43 @@ void Renderer::transitionDepthImage(
 
   commanderBuffer.pipelineBarrier2(dependencyInfo);
   depthResources_.layout = newLayout;
+}
+
+void Renderer::transitionShadowImage(vk::raii::CommandBuffer const &commandBuffer,
+                                     vk::ImageLayout newLayout,
+                                     vk::PipelineStageFlags2 srcStage,
+                                     vk::AccessFlags2 srcAccess,
+                                     vk::PipelineStageFlags2 dstStage,
+                                     vk::AccessFlags2 dstAccess) {
+  if (shadowResources_.layout == vk::ImageLayout::eUndefined) {
+    srcStage = vk::PipelineStageFlagBits2::eNone;
+    srcAccess = {};
+  }
+
+  vk::ImageMemoryBarrier2 barrier{
+      .srcStageMask = srcStage,
+      .srcAccessMask = srcAccess,
+      .dstStageMask = dstStage,
+      .dstAccessMask = dstAccess,
+      .oldLayout = shadowResources_.layout,
+      .newLayout = newLayout,
+      .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+      .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+      .image = *shadowResources_.image,
+      .subresourceRange =
+          {
+              .aspectMask = vk::ImageAspectFlagBits::eDepth,
+              .baseMipLevel = 0,
+              .levelCount = 1,
+              .baseArrayLayer = 0,
+              .layerCount = 1,
+          },
+  };
+  vk::DependencyInfo dependencyInfo{
+      .imageMemoryBarrierCount = 1,
+      .pImageMemoryBarriers = &barrier,
+  };
+
+  commandBuffer.pipelineBarrier2(dependencyInfo);
+  shadowResources_.layout = newLayout;
 }

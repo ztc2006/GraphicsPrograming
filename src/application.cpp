@@ -160,6 +160,13 @@ void Application::mainLoop() {
                             object.transform.matrix());
     }
 
+    renderer_->beginMainPass();
+
+    for (SceneObject const &object : scene_.objects) {
+      renderer_->drawObject(object.meshId, object.materialId,
+                            object.transform.matrix());
+    }
+
     auto frameResult = renderer_->endFrame();
     if (frameResult != Renderer::FrameResult::eSuccess || framebufferResized_) {
       recreateSwapChain();
