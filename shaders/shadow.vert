@@ -8,6 +8,7 @@ layout(set = 0, binding = 0) uniform FrameUbo {
   vec4 ambientColor;
   vec4 lightingParams;
   mat4 lightViewProj;
+  vec4 shadowParams;
 } ubo;
 
 layout(push_constant) uniform PushConstants {

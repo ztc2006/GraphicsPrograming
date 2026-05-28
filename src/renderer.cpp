@@ -25,6 +25,7 @@ struct FrameUniformBufferObject {
   glm::vec4 ambientColor{0.08f, 0.08f, 0.1f, 1.0f};
   glm::vec4 lightingParams{1.0f, 0.35f, 32.0f, 0.0f};
   glm::mat4 lightViewProj{1.0f};
+  glm::vec4 shadowParams{0.0025f, 0.0007f, 0.0f, 0.0f};
 };
 
 glm::mat4 computeLightViewProj(glm::vec3 direction) {
@@ -1064,6 +1065,8 @@ void Renderer::updateFrameUniformBuffer(
       glm::vec4(lighting.diffuseStrength, lighting.specularStrength,
                 lighting.shininess, 0.0f);
   ubo.lightViewProj = computeLightViewProj(lighting.direction);
+  ubo.shadowParams = glm::vec4(lighting.shadowBiasSlope,
+                               lighting.shadowBiasConstant, 0.0f, 0.0f);
 
   void *mapped = frame.uniformBufferMemory.mapMemory(0, sizeof(ubo));
   std::memcpy(mapped, &ubo, sizeof(ubo));
@@ -1320,12 +1323,10 @@ void Renderer::transitionDepthImage(
   depthResources_.layout = newLayout;
 }
 
-void Renderer::transitionShadowImage(vk::raii::CommandBuffer const &commandBuffer,
-                                     vk::ImageLayout newLayout,
-                                     vk::PipelineStageFlags2 srcStage,
-                                     vk::AccessFlags2 srcAccess,
-                                     vk::PipelineStageFlags2 dstStage,
-                                     vk::AccessFlags2 dstAccess) {
+void Renderer::transitionShadowImage(
+    vk::raii::CommandBuffer const &commandBuffer, vk::ImageLayout newLayout,
+    vk::PipelineStageFlags2 srcStage, vk::AccessFlags2 srcAccess,
+    vk::PipelineStageFlags2 dstStage, vk::AccessFlags2 dstAccess) {
   if (shadowResources_.layout == vk::ImageLayout::eUndefined) {
     srcStage = vk::PipelineStageFlagBits2::eNone;
     srcAccess = {};

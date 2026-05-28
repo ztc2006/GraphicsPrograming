@@ -142,8 +142,8 @@ void Application::mainLoop() {
     input_.clearFrameDeltas();
     glm::mat4 viewProjMatrix = camera.viewProj(aspect);
 
-    auto beginResult = renderer_->beginFrame(viewProjMatrix, camera.position,
-                                             scene_.lighting);
+    auto beginResult =
+        renderer_->beginFrame(viewProjMatrix, camera.position, scene_.lighting);
     if (beginResult != Renderer::FrameResult::eSuccess) {
       recreateSwapChain();
       continue;
@@ -239,7 +239,8 @@ void Application::initImGui() {
 
   ImGui_ImplGlfw_InitForVulkan(window_, false);
 
-  VkFormat colorAttachmentFormat = static_cast<VkFormat>(swapChain_->imageFormat());
+  VkFormat colorAttachmentFormat =
+      static_cast<VkFormat>(swapChain_->imageFormat());
   VkPipelineRenderingCreateInfo pipelineRenderingCreateInfo{
       .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
       .colorAttachmentCount = 1,
@@ -264,8 +265,8 @@ void Application::initImGui() {
   ImGui_ImplVulkan_Init(&initInfo);
 
   renderer_->setUiDrawCallback([](vk::CommandBuffer commandBuffer) {
-    ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(),
-                                    static_cast<VkCommandBuffer>(commandBuffer));
+    ImGui_ImplVulkan_RenderDrawData(
+        ImGui::GetDrawData(), static_cast<VkCommandBuffer>(commandBuffer));
   });
 
   imguiInitialized_ = true;
@@ -300,8 +301,8 @@ void Application::drawImGui() {
     }
     ImGui::DragFloat("Near", &camera.nearPlane, 0.01f, 0.01f,
                      camera.farPlane - 0.01f);
-    ImGui::DragFloat("Far", &camera.farPlane, 0.1f,
-                     camera.nearPlane + 0.01f, 200.0f);
+    ImGui::DragFloat("Far", &camera.farPlane, 0.1f, camera.nearPlane + 0.01f,
+                     200.0f);
 
     float moveSpeed = orbitCameraController_.moveSpeed();
     if (ImGui::SliderFloat("Move Speed", &moveSpeed, 0.1f, 20.0f)) {
@@ -329,13 +330,18 @@ void Application::drawImGui() {
     ImGui::DragFloat3("Direction", &scene_.lighting.direction.x, 0.01f);
     ImGui::SliderFloat("Intensity", &scene_.lighting.intensity, 0.0f, 4.0f);
     ImGui::ColorEdit3("Color", &scene_.lighting.color.x);
-    ImGui::SliderFloat("Ambient", &scene_.lighting.ambientStrength, 0.0f,
-                       0.5f);
-    ImGui::SliderFloat("Diffuse", &scene_.lighting.diffuseStrength, 0.0f,
-                       2.0f);
+    ImGui::SliderFloat("Ambient", &scene_.lighting.ambientStrength, 0.0f, 0.5f);
+    ImGui::SliderFloat("Diffuse", &scene_.lighting.diffuseStrength, 0.0f, 2.0f);
     ImGui::SliderFloat("Specular", &scene_.lighting.specularStrength, 0.0f,
                        4.0f);
     ImGui::SliderFloat("Shininess", &scene_.lighting.shininess, 1.0f, 128.0f);
+
+    ImGui::Separator();
+    ImGui::TextUnformatted("Shadow");
+    ImGui::SliderFloat("Bias Slope", &scene_.lighting.shadowBiasSlope, 0.0f,
+                       0.02f, "%.5f");
+    ImGui::SliderFloat("Bias Constant", &scene_.lighting.shadowBiasConstant,
+                       0.0f, 0.005f, "%.5f");
   }
   ImGui::End();
 
@@ -356,8 +362,8 @@ void Application::drawImGui() {
       Material &material = scene_.materials[selectedMaterialIndex_];
       ImGui::Text("Texture: %s", material.albedoPath.c_str());
       if (ImGui::ColorEdit4("Tint", &material.tint.x)) {
-        renderer_->setMaterialTint(static_cast<MaterialId>(selectedMaterialIndex_),
-                                   material.tint);
+        renderer_->setMaterialTint(
+            static_cast<MaterialId>(selectedMaterialIndex_), material.tint);
       }
     }
   }

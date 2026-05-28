@@ -26,6 +26,8 @@ struct LightingSettings {
   float diffuseStrength = 1.0f;
   float specularStrength = 0.35f;
   float shininess = 32.0f;
+  float shadowBiasSlope = 0.0025f;
+  float shadowBiasConstant = 0.0007f;
 };
 
 struct Scene {

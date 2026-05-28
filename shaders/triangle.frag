@@ -15,6 +15,7 @@ layout(set = 0, binding = 0) uniform FrameUbo {
   vec4 ambientColor;
   vec4 lightingParams;
   mat4 lightViewProj;
+  vec4 shadowParams;
 } ubo;
 
 layout(set = 0, binding = 1) uniform sampler2DShadow shadowMap;
@@ -35,7 +36,8 @@ float shadowVisibility(vec4 lightClipPos, vec3 N, vec3 L) {
     return 1.0;
   }
 
-  float bias = max(0.0025 * (1.0 - max(dot(N, L), 0.0)), 0.0007);
+  float bias = max(ubo.shadowParams.x * (1.0 - max(dot(N, L), 0.0)),
+      ubo.shadowParams.y);
   vec2 texel = 1.0 / vec2(textureSize(shadowMap, 0));
 
   float visible = 0.0;
