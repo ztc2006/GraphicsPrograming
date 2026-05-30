@@ -47,25 +47,45 @@ vec2 parallaxOcclusionUv(vec2 uv, vec3 tangentViewDirection) {
   float viewAlignment = clamp(tangentViewDirection.z, 0.05, 1.0);
   float layerCount = mix(32.0, 8.0, viewAlignment);
   float layerDepth = 1.0 / layerCount;
-  vec2 uvStep =
-      pushConstants.surfaceParams.y * tangentViewDirection.xy /
-      viewAlignment / layerCount;
+  vec2 rayStep = pushConstants.surfaceParams.y * tangentViewDirection.xy /
+                 viewAlignment / layerCount;
 
+  vec2 previousUv = uv;
   vec2 currentUv = uv;
+  float previousLayerDepth = 0.0;
   float currentLayerDepth = 0.0;
   float currentDepth = 1.0 - texture(heightTexture, currentUv).r;
-  while (currentLayerDepth < currentDepth) {
-    currentUv -= uvStep;
-    currentDepth = 1.0 - texture(heightTexture, currentUv).r;
+
+  for (int layer = 0; layer < 32; ++layer) {
+    if (float(layer) >= layerCount || currentLayerDepth >= currentDepth) {
+      break;
+    }
+
+    previousUv = currentUv;
+    previousLayerDepth = currentLayerDepth;
+    currentUv -= rayStep;
     currentLayerDepth += layerDepth;
+    currentDepth = 1.0 - texture(heightTexture, currentUv).r;
   }
 
-  vec2 previousUv = currentUv + uvStep;
-  float afterDepth = currentDepth - currentLayerDepth;
-  float beforeDepth = (1.0 - texture(heightTexture, previousUv).r) -
-                      currentLayerDepth + layerDepth;
-  float weight = afterDepth / (afterDepth - beforeDepth);
-  return mix(currentUv, previousUv, clamp(weight, 0.0, 1.0));
+  vec2 lowUv = previousUv;
+  vec2 highUv = currentUv;
+  float lowLayerDepth = previousLayerDepth;
+  float highLayerDepth = currentLayerDepth;
+  for (int refine = 0; refine < 5; ++refine) {
+    vec2 midUv = (lowUv + highUv) * 0.5;
+    float midLayerDepth = (lowLayerDepth + highLayerDepth) * 0.5;
+    float midDepth = 1.0 - texture(heightTexture, midUv).r;
+    if (midLayerDepth < midDepth) {
+      lowUv = midUv;
+      lowLayerDepth = midLayerDepth;
+    } else {
+      highUv = midUv;
+      highLayerDepth = midLayerDepth;
+    }
+  }
+
+  return highUv;
 }
 
 vec3 normalFromHeight(vec2 uv) {

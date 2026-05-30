@@ -807,7 +807,7 @@ void Application::createScene() {
 
   std::array defaultAssets = {
       StaticModelAsset{
-          .path = "assets/models/sponza/sponza.obj",
+          .path = "assets/models/sponza_2/sponza.obj",
           .fallbackAlbedoPath = "texture/image.jpg",
           .camera = sponzaCamera,
       },
