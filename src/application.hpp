@@ -73,6 +73,7 @@ private:
   bool validationLayersEnabled_ = false;
   bool imguiInitialized_ = false;
   bool showAabbDebug_ = true;
+  bool animateScene_ = false;
   InputState input_{};
   Scene scene_{};
   OrbitCameraController orbitCameraController_{};

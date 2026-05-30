@@ -8,6 +8,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <limits>
 #include <map>
 #include <optional>
@@ -310,6 +311,92 @@ struct PrimitiveRef {
   MaterialId materialId = 0;
 };
 
+std::string lowercase(std::string value) {
+  for (char &c : value) {
+    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  }
+  return value;
+}
+
+int hexDigit(char c) {
+  if (c >= '0' && c <= '9') {
+    return c - '0';
+  }
+  c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  if (c >= 'a' && c <= 'f') {
+    return 10 + (c - 'a');
+  }
+  return -1;
+}
+
+std::string percentDecode(std::string_view encoded) {
+  std::string decoded;
+  decoded.reserve(encoded.size());
+  for (std::size_t index = 0; index < encoded.size(); ++index) {
+    char const c = encoded[index];
+    if (c != '%') {
+      decoded.push_back(c);
+      continue;
+    }
+    if (index + 2 >= encoded.size()) {
+      throw std::runtime_error("Invalid percent-encoded glTF URI.");
+    }
+    int const high = hexDigit(encoded[index + 1]);
+    int const low = hexDigit(encoded[index + 2]);
+    if (high < 0 || low < 0) {
+      throw std::runtime_error("Invalid percent-encoded glTF URI.");
+    }
+    decoded.push_back(static_cast<char>((high << 4) | low));
+    index += 2;
+  }
+  return decoded;
+}
+
+std::filesystem::path resolveCaseInsensitivePath(std::filesystem::path path) {
+  if (std::filesystem::exists(path)) {
+    return path;
+  }
+
+  std::filesystem::path const parent = path.parent_path();
+  if (parent.empty() || !std::filesystem::exists(parent)) {
+    return path;
+  }
+
+  std::string const wanted = lowercase(path.filename().string());
+  for (std::filesystem::directory_entry const &entry :
+       std::filesystem::directory_iterator(parent)) {
+    if (lowercase(entry.path().filename().string()) == wanted) {
+      return entry.path();
+    }
+  }
+  return path;
+}
+
+std::filesystem::path
+resolveGltfAssetPath(std::filesystem::path const &gltfPath,
+                     std::string const &uri) {
+  if (uri.starts_with("data:")) {
+    return {};
+  }
+
+  std::string relative = percentDecode(uri);
+  std::replace(relative.begin(), relative.end(), '\\', '/');
+  return resolveCaseInsensitivePath(gltfPath.parent_path() /
+                                    std::filesystem::path{relative});
+}
+
+MaterialId resolveMaterialId(int materialIndex, std::size_t materialCount,
+                             std::filesystem::path const &path) {
+  if (materialIndex < 0 ||
+      static_cast<std::size_t>(materialIndex) >= materialCount) {
+    std::cerr << "glTF primitive references out-of-range material index "
+              << materialIndex << " in " << path.string()
+              << ", falling back to material 0\n";
+    return 0;
+  }
+  return static_cast<MaterialId>(materialIndex);
+}
+
 std::string readTextFile(std::filesystem::path const &path) {
   std::ifstream file(path);
   if (!file) {
@@ -369,12 +456,19 @@ std::vector<std::byte> decodeBase64(std::string_view encoded) {
 std::vector<std::byte> loadBuffer(std::filesystem::path const &gltfPath,
                                   JsonValue const &buffer) {
   std::string const uri = buffer.at("uri").asString();
-  std::string_view const dataPrefix = "data:application/octet-stream;base64,";
+  std::string_view const dataPrefix = "data:";
   if (uri.starts_with(dataPrefix)) {
-    return decodeBase64(std::string_view(uri).substr(dataPrefix.size()));
+    std::string_view const base64Marker = ";base64,";
+    std::size_t const markerPos = uri.find(base64Marker);
+    if (markerPos == std::string::npos) {
+      throw std::runtime_error(
+          "Only base64-encoded glTF data URIs are supported.");
+    }
+    return decodeBase64(
+        std::string_view(uri).substr(markerPos + base64Marker.size()));
   }
 
-  std::filesystem::path bufferPath = gltfPath.parent_path() / uri;
+  std::filesystem::path bufferPath = resolveGltfAssetPath(gltfPath, uri);
   return readBinaryFile(bufferPath);
 }
 
@@ -624,8 +718,19 @@ std::vector<Material> parseMaterials(JsonValue const &root,
           if (imageIndex >= 0 &&
               static_cast<std::size_t>(imageIndex) < imageUris.size() &&
               !imageUris[imageIndex].empty()) {
-            material.albedoPath =
-                (path.parent_path() / imageUris[imageIndex]).string();
+            std::filesystem::path texturePath =
+                resolveGltfAssetPath(path, imageUris[imageIndex]);
+            if (texturePath.empty()) {
+              std::cerr << "glTF material uses embedded image data URI; "
+                           "falling back to "
+                        << fallbackAlbedoPath << '\n';
+            } else if (!std::filesystem::exists(texturePath)) {
+              std::cerr << "glTF material texture not found: "
+                        << imageUris[imageIndex] << ", falling back to "
+                        << fallbackAlbedoPath << '\n';
+            } else {
+              material.albedoPath = texturePath.string();
+            }
           }
         }
       }
@@ -818,8 +923,8 @@ void collectNodeObjects(JsonValue const &nodes, std::size_t nodeIndex,
 }
 } // namespace
 
-LoadedGltfScene loadStaticGltfScene(std::filesystem::path const &path,
-                                    std::string fallbackAlbedoPath) {
+LoadedScene loadStaticGltfScene(std::filesystem::path const &path,
+                                std::string fallbackAlbedoPath) {
   std::string const jsonText = readTextFile(path);
   JsonValue const root = JsonParser(jsonText).parse();
 
@@ -827,7 +932,7 @@ LoadedGltfScene loadStaticGltfScene(std::filesystem::path const &path,
   std::vector<BufferView> bufferViews = parseBufferViews(root);
   std::vector<Accessor> accessors = parseAccessors(root);
 
-  LoadedGltfScene result{};
+  LoadedScene result{};
   result.materials = parseMaterials(root, path, std::move(fallbackAlbedoPath));
   if (result.materials.empty()) {
     throw std::runtime_error("glTF import produced no materials.");
@@ -846,7 +951,8 @@ LoadedGltfScene loadStaticGltfScene(std::filesystem::path const &path,
       }
       MaterialId const materialId =
           primitive.find("material") != nullptr
-              ? static_cast<MaterialId>(primitive.at("material").asInt())
+              ? resolveMaterialId(primitive.at("material").asInt(),
+                                  result.materials.size(), path)
               : 0;
       MeshId const meshId = static_cast<MeshId>(result.meshes.size());
       result.meshes.push_back(

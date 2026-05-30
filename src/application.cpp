@@ -2,6 +2,7 @@
 
 #include "application.hpp"
 
+#include <cctype>
 #include <cstring>
 #include <filesystem>
 #include <iostream>
@@ -17,6 +18,7 @@
 
 #include "device.hpp"
 #include "gltf_loader.hpp"
+#include "obj_loader.hpp"
 #include "renderer.hpp"
 #include "swap_chain.hpp"
 
@@ -32,6 +34,43 @@ constexpr bool kEnableValidationLayers = false;
 #else
 constexpr bool kEnableValidationLayers = true;
 #endif
+
+struct StaticModelAsset {
+  std::filesystem::path path;
+  std::string fallbackAlbedoPath;
+  Camera camera;
+};
+
+std::string lowercase(std::string value) {
+  for (char &c : value) {
+    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  }
+  return value;
+}
+
+LoadedScene loadStaticModelScene(std::filesystem::path const &path,
+                                 std::string const &fallbackAlbedoPath) {
+  std::string const extension = lowercase(path.extension().string());
+  if (extension == ".obj") {
+    return loadStaticObjScene(path, fallbackAlbedoPath);
+  }
+  if (extension == ".gltf") {
+    return loadStaticGltfScene(path, fallbackAlbedoPath);
+  }
+  if (extension == ".glb") {
+    throw std::runtime_error(
+        "Binary glTF .glb files are not supported yet: " + path.string());
+  }
+  throw std::runtime_error("Unsupported static model asset extension: " +
+                           path.string());
+}
+
+void logLoadedScene(std::filesystem::path const &path,
+                    LoadedScene const &loaded) {
+  std::cerr << "Loaded static scene: " << path.string() << " ("
+            << loaded.meshes.size() << " meshes, " << loaded.materials.size()
+            << " materials, " << loaded.objects.size() << " objects)\n";
+}
 
 Aabb emptyBounds() {
   return {
@@ -372,7 +411,7 @@ void Application::drawImGui() {
     }
 
     ImGui::TextUnformatted("Right mouse: look");
-    ImGui::TextUnformatted("Right mouse + WASD: fly");
+    ImGui::TextUnformatted("Right mouse + WASD/Space/Ctrl: fly");
     ImGui::TextUnformatted("Wheel: speed");
   }
   ImGui::End();
@@ -700,7 +739,7 @@ void Application::createSurface() {
 }
 
 void Application::updateScene() {
-  if (scene_.objects.size() >= 2) {
+  if (animateScene_ && scene_.objects.size() >= 2) {
     auto const now = std::chrono::steady_clock::now();
     float const elapsedSeconds =
         std::chrono::duration<float>(now - animationStartTime_).count();
@@ -726,20 +765,72 @@ void Application::createScene() {
   scene_.materials.clear();
   scene_.objects.clear();
   scene_.cameras.clear();
+  animateScene_ = false;
 
-  std::filesystem::path const debugGltfPath{"assets/debug_scene.gltf"};
-  if (std::filesystem::exists(debugGltfPath)) {
-    LoadedGltfScene loaded =
-        loadStaticGltfScene(debugGltfPath, "texture/image.jpg");
+  auto finalizeLoadedScene = [this](LoadedScene loaded, Camera camera) {
     scene_.meshes = std::move(loaded.meshes);
     scene_.materials = std::move(loaded.materials);
     scene_.objects = std::move(loaded.objects);
-    scene_.cameras.push_back(Camera{});
+    scene_.cameras.push_back(camera);
     scene_.activeCameraIndex = 0;
     orbitCameraController_.attach(scene_.cameras[scene_.activeCameraIndex]);
     scene_.lighting = LightingSettings{};
+  };
+
+  Camera sponzaCamera{};
+  sponzaCamera.position = {0.0f, 1.4f, 6.0f};
+  sponzaCamera.target = {0.0f, 1.2f, 0.0f};
+  sponzaCamera.farPlane = 100.0f;
+
+  std::array defaultAssets = {
+      StaticModelAsset{
+          .path = "assets/models/sponza/sponza.obj",
+          .fallbackAlbedoPath = "texture/image.jpg",
+          .camera = sponzaCamera,
+      },
+  };
+
+  char const *requestedScenePath = std::getenv("FOOL_ENGINE_SCENE");
+  if (requestedScenePath != nullptr && std::strlen(requestedScenePath) > 0) {
+    StaticModelAsset requestedAsset{
+        .path = requestedScenePath,
+        .fallbackAlbedoPath = "texture/image.jpg",
+        .camera = sponzaCamera,
+    };
+    if (!std::filesystem::exists(requestedAsset.path)) {
+      throw std::runtime_error("Requested scene asset does not exist: " +
+                               requestedAsset.path.string());
+    }
+
+    LoadedScene loaded = loadStaticModelScene(requestedAsset.path,
+                                             requestedAsset.fallbackAlbedoPath);
+    logLoadedScene(requestedAsset.path, loaded);
+    finalizeLoadedScene(std::move(loaded), requestedAsset.camera);
     return;
   }
+
+  for (StaticModelAsset const &asset : defaultAssets) {
+    if (!std::filesystem::exists(asset.path)) {
+      continue;
+    }
+
+    LoadedScene loaded =
+        loadStaticModelScene(asset.path, asset.fallbackAlbedoPath);
+    logLoadedScene(asset.path, loaded);
+    finalizeLoadedScene(std::move(loaded), asset.camera);
+    return;
+  }
+
+  std::filesystem::path const debugGltfPath{"assets/debug_scene.gltf"};
+  if (std::filesystem::exists(debugGltfPath)) {
+    LoadedScene loaded =
+        loadStaticModelScene(debugGltfPath, "texture/image.jpg");
+    logLoadedScene(debugGltfPath, loaded);
+    finalizeLoadedScene(std::move(loaded), Camera{});
+    return;
+  }
+
+  animateScene_ = true;
 
   scene_.meshes.push_back(Mesh{
       .vertices =

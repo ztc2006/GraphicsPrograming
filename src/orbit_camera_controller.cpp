@@ -65,6 +65,15 @@ void OrbitCameraController::updateFromInput(InputState const &input,
     rightAmount -= 1.0f;
   }
 
+  float verticalAmount = 0.0f;
+  if (input.isKeyDown(GLFW_KEY_SPACE)) {
+    verticalAmount += 1.0f;
+  }
+  if (input.isKeyDown(GLFW_KEY_LEFT_CONTROL) ||
+      input.isKeyDown(GLFW_KEY_RIGHT_CONTROL)) {
+    verticalAmount -= 1.0f;
+  }
+
   float const cosPitch = std::cos(pitchRadians_);
   glm::vec3 const forward{
       std::sin(yawRadians_) * cosPitch,
@@ -73,6 +82,8 @@ void OrbitCameraController::updateFromInput(InputState const &input,
   };
   glm::vec3 const right =
       glm::normalize(glm::cross(forward, {0.0f, 1.0f, 0.0f}));
+  glm::vec3 const up{0.0f, 1.0f, 0.0f};
   position_ += forward * (forwardAmount * moveSpeed_ * deltaSeconds);
   position_ += right * (rightAmount * moveSpeed_ * deltaSeconds);
+  position_ += up * (verticalAmount * moveSpeed_ * deltaSeconds);
 }
