@@ -88,6 +88,7 @@ private:
     vk::raii::DeviceMemory memory = nullptr;
     vk::raii::ImageView imageView = nullptr;
     vk::raii::Sampler sampler = nullptr;
+    vk::raii::Sampler debugSampler = nullptr;
     vk::ImageLayout layout = vk::ImageLayout::eUndefined;
   };
 

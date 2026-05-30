@@ -2,6 +2,7 @@
 
 #include "renderer.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstring>
@@ -25,24 +26,30 @@ struct FrameUniformBufferObject {
   glm::vec4 ambientColor{0.08f, 0.08f, 0.1f, 1.0f};
   glm::vec4 lightingParams{1.0f, 0.35f, 32.0f, 0.0f};
   glm::mat4 lightViewProj{1.0f};
-  glm::vec4 shadowParams{0.0025f, 0.0007f, 0.0f, 0.0f};
+  glm::vec4 shadowParams{0.0025f, 0.0007f, 1.0f, 1.0f};
 };
 
-glm::mat4 computeLightViewProj(glm::vec3 direction) {
+glm::mat4 computeLightViewProj(glm::vec3 direction,
+                               LightingSettings const &lighting) {
   if (glm::length(direction) <= 0.0001f) {
     direction = {0.0f, 1.0f, 0.0f};
   }
 
   glm::vec3 const lightDir = glm::normalize(direction);
   glm::vec3 const target{0.0f};
-  glm::vec3 const eye = target + lightDir * 6.0f;
+  float const lightDistance = std::max(lighting.shadowLightDistance, 0.1f);
+  glm::vec3 const eye = target + lightDir * lightDistance;
   glm::vec3 up{0.0f, 1.0f, 0.0f};
   if (std::abs(glm::dot(lightDir, up)) > 0.95f) {
     up = {0.0f, 0.0f, 1.0f};
   }
 
   glm::mat4 view = glm::lookAt(eye, target, up);
-  glm::mat4 proj = glm::ortho(-3.0f, 3.0f, -3.0f, 3.0f, 0.1f, 12.0f);
+  float const extent = std::max(lighting.shadowOrthoExtent, 0.1f);
+  float const nearPlane = std::max(lighting.shadowNearPlane, 0.001f);
+  float const farPlane = std::max(lighting.shadowFarPlane, nearPlane + 0.001f);
+  glm::mat4 proj =
+      glm::ortho(-extent, extent, -extent, extent, nearPlane, farPlane);
   proj[1][1] *= -1.0f;
   return proj * view;
 }
@@ -308,6 +315,9 @@ Renderer::ShadowResources Renderer::createShadowResources() const {
       .unnormalizedCoordinates = false,
   };
 
+  vk::SamplerCreateInfo debugSamplerCreateInfo = samplerCreateInfo;
+  debugSamplerCreateInfo.compareEnable = false;
+
   ShadowResources resources{};
   resources.image = std::move(image);
   resources.memory = std::move(memory);
@@ -315,6 +325,8 @@ Renderer::ShadowResources Renderer::createShadowResources() const {
       vk::raii::ImageView(device_.logicalDevice(), imageViewCreateInfo);
   resources.sampler =
       vk::raii::Sampler(device_.logicalDevice(), samplerCreateInfo);
+  resources.debugSampler =
+      vk::raii::Sampler(device_.logicalDevice(), debugSamplerCreateInfo);
   resources.layout = vk::ImageLayout::eUndefined;
   return resources;
 }
@@ -388,6 +400,12 @@ void Renderer::createFrameDescriptorSetLayout() {
           .descriptorCount = 1,
           .stageFlags = vk::ShaderStageFlagBits::eFragment,
       },
+      vk::DescriptorSetLayoutBinding{
+          .binding = 2,
+          .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+          .descriptorCount = 1,
+          .stageFlags = vk::ShaderStageFlagBits::eFragment,
+      },
   };
 
   vk::DescriptorSetLayoutCreateInfo createInfo{
@@ -406,7 +424,7 @@ void Renderer::createFrameDescriptorPool() {
       },
       vk::DescriptorPoolSize{
           .type = vk::DescriptorType::eCombinedImageSampler,
-          .descriptorCount = kFramesInFlight,
+          .descriptorCount = kFramesInFlight * 2,
       },
   };
 
@@ -446,6 +464,12 @@ void Renderer::allocateAndWriteFrameDescriptorSets() {
         .imageLayout = vk::ImageLayout::eDepthReadOnlyOptimal,
     };
 
+    vk::DescriptorImageInfo shadowDebugImageInfo{
+        .sampler = *shadowResources_.debugSampler,
+        .imageView = *shadowResources_.imageView,
+        .imageLayout = vk::ImageLayout::eDepthReadOnlyOptimal,
+    };
+
     std::array writes = {
         vk::WriteDescriptorSet{
             .dstSet = frames_[index].descriptorSet,
@@ -460,6 +484,13 @@ void Renderer::allocateAndWriteFrameDescriptorSets() {
             .descriptorCount = 1,
             .descriptorType = vk::DescriptorType::eCombinedImageSampler,
             .pImageInfo = &shadowImageInfo,
+        },
+        vk::WriteDescriptorSet{
+            .dstSet = frames_[index].descriptorSet,
+            .dstBinding = 2,
+            .descriptorCount = 1,
+            .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+            .pImageInfo = &shadowDebugImageInfo,
         },
     };
 
@@ -797,7 +828,8 @@ void Renderer::validateSwapChainState() const {
 
   if (shadowResources_.image == nullptr || shadowResources_.memory == nullptr ||
       shadowResources_.imageView == nullptr ||
-      shadowResources_.sampler == nullptr) {
+      shadowResources_.sampler == nullptr ||
+      shadowResources_.debugSampler == nullptr) {
     throw std::runtime_error("Renderer shadow resources are not initialized.");
   }
 
@@ -1064,9 +1096,10 @@ void Renderer::updateFrameUniformBuffer(
   ubo.lightingParams =
       glm::vec4(lighting.diffuseStrength, lighting.specularStrength,
                 lighting.shininess, 0.0f);
-  ubo.lightViewProj = computeLightViewProj(lighting.direction);
-  ubo.shadowParams = glm::vec4(lighting.shadowBiasSlope,
-                               lighting.shadowBiasConstant, 0.0f, 0.0f);
+  ubo.lightViewProj = computeLightViewProj(lighting.direction, lighting);
+  ubo.shadowParams = glm::vec4(
+      lighting.shadowBiasSlope, lighting.shadowBiasConstant,
+      lighting.shadowPcfRadius, static_cast<float>(lighting.shadowDebugMode));
 
   void *mapped = frame.uniformBufferMemory.mapMemory(0, sizeof(ubo));
   std::memcpy(mapped, &ubo, sizeof(ubo));

@@ -338,10 +338,25 @@ void Application::drawImGui() {
 
     ImGui::Separator();
     ImGui::TextUnformatted("Shadow");
+    char const *shadowModes[] = {"Off", "Lit", "Visibility", "Depth Map"};
+    int shadowMode = scene_.lighting.shadowDebugMode;
+    if (ImGui::Combo("Mode", &shadowMode, shadowModes, 4)) {
+      scene_.lighting.shadowDebugMode = shadowMode;
+    }
     ImGui::SliderFloat("Bias Slope", &scene_.lighting.shadowBiasSlope, 0.0f,
                        0.02f, "%.5f");
     ImGui::SliderFloat("Bias Constant", &scene_.lighting.shadowBiasConstant,
                        0.0f, 0.005f, "%.5f");
+    ImGui::SliderFloat("PCF Radius", &scene_.lighting.shadowPcfRadius, 0.0f,
+                       4.0f, "%.2f");
+    ImGui::DragFloat("Light Distance", &scene_.lighting.shadowLightDistance,
+                     0.05f, 0.1f, 50.0f, "%.2f");
+    ImGui::DragFloat("Ortho Extent", &scene_.lighting.shadowOrthoExtent, 0.05f,
+                     0.1f, 50.0f, "%.2f");
+    ImGui::DragFloat("Shadow Near", &scene_.lighting.shadowNearPlane, 0.01f,
+                     0.001f, scene_.lighting.shadowFarPlane - 0.001f, "%.3f");
+    ImGui::DragFloat("Shadow Far", &scene_.lighting.shadowFarPlane, 0.05f,
+                     scene_.lighting.shadowNearPlane + 0.001f, 100.0f, "%.2f");
   }
   ImGui::End();
 

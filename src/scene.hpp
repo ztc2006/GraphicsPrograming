@@ -28,6 +28,12 @@ struct LightingSettings {
   float shininess = 32.0f;
   float shadowBiasSlope = 0.0025f;
   float shadowBiasConstant = 0.0007f;
+  float shadowPcfRadius = 1.0f;
+  int shadowDebugMode = 1;
+  float shadowOrthoExtent = 3.0f;
+  float shadowNearPlane = 0.1f;
+  float shadowFarPlane = 12.0f;
+  float shadowLightDistance = 6.0f;
 };
 
 struct Scene {
