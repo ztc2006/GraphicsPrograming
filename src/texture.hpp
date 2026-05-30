@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <string>
 
@@ -18,8 +19,13 @@ public:
   explicit TextureLoader(Device const &device) : device_(device) {}
 
   TextureResources createFromFile(std::string const &path) const;
+  TextureResources
+  createSolidColor(std::array<std::uint8_t, 4> const &color) const;
 
 private:
+  TextureResources createFromPixels(std::uint8_t const *pixels,
+                                    std::uint32_t width,
+                                    std::uint32_t height) const;
   void transitionImage(TextureResources &texture, vk::ImageLayout newLayout,
                        vk::PipelineStageFlags2 srcStageMask,
                        vk::AccessFlags2 srcAccessMask,

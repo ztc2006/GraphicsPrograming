@@ -682,6 +682,37 @@ std::vector<int> parseTextureSources(JsonValue const &root) {
   return sources;
 }
 
+std::string resolveGltfTexturePath(std::filesystem::path const &path,
+                                   std::vector<std::string> const &imageUris,
+                                   std::vector<int> const &textureSources,
+                                   int textureIndex, char const *textureKind) {
+  if (textureIndex < 0 ||
+      static_cast<std::size_t>(textureIndex) >= textureSources.size()) {
+    return {};
+  }
+
+  int const imageIndex = textureSources[textureIndex];
+  if (imageIndex < 0 ||
+      static_cast<std::size_t>(imageIndex) >= imageUris.size() ||
+      imageUris[imageIndex].empty()) {
+    return {};
+  }
+
+  std::filesystem::path texturePath =
+      resolveGltfAssetPath(path, imageUris[imageIndex]);
+  if (texturePath.empty()) {
+    std::cerr << "glTF " << textureKind
+              << " texture uses embedded image data URI; ignoring it\n";
+    return {};
+  }
+  if (!std::filesystem::exists(texturePath)) {
+    std::cerr << "glTF " << textureKind
+              << " texture not found: " << imageUris[imageIndex] << '\n';
+    return {};
+  }
+  return texturePath.string();
+}
+
 std::vector<Material> parseMaterials(JsonValue const &root,
                                      std::filesystem::path const &path,
                                      std::string fallbackAlbedoPath) {
@@ -711,28 +742,23 @@ std::vector<Material> parseMaterials(JsonValue const &root,
       JsonValue const *baseColorTexture = pbr->find("baseColorTexture");
       if (baseColorTexture != nullptr &&
           baseColorTexture->find("index") != nullptr) {
-        int const textureIndex = baseColorTexture->at("index").asInt(-1);
-        if (textureIndex >= 0 &&
-            static_cast<std::size_t>(textureIndex) < textureSources.size()) {
-          int const imageIndex = textureSources[textureIndex];
-          if (imageIndex >= 0 &&
-              static_cast<std::size_t>(imageIndex) < imageUris.size() &&
-              !imageUris[imageIndex].empty()) {
-            std::filesystem::path texturePath =
-                resolveGltfAssetPath(path, imageUris[imageIndex]);
-            if (texturePath.empty()) {
-              std::cerr << "glTF material uses embedded image data URI; "
-                           "falling back to "
-                        << fallbackAlbedoPath << '\n';
-            } else if (!std::filesystem::exists(texturePath)) {
-              std::cerr << "glTF material texture not found: "
-                        << imageUris[imageIndex] << ", falling back to "
-                        << fallbackAlbedoPath << '\n';
-            } else {
-              material.albedoPath = texturePath.string();
-            }
-          }
+        std::string const texturePath = resolveGltfTexturePath(
+            path, imageUris, textureSources,
+            baseColorTexture->at("index").asInt(-1), "base color");
+        if (!texturePath.empty()) {
+          material.albedoPath = texturePath;
         }
+      }
+    }
+
+    JsonValue const *normalTexture = jsonMaterial.find("normalTexture");
+    if (normalTexture != nullptr && normalTexture->find("index") != nullptr) {
+      material.normalPath = resolveGltfTexturePath(
+          path, imageUris, textureSources,
+          normalTexture->at("index").asInt(-1), "normal");
+      if (normalTexture->find("scale") != nullptr) {
+        material.normalScale =
+            static_cast<float>(normalTexture->at("scale").asNumber(1.0));
       }
     }
     materials.push_back(std::move(material));
@@ -806,6 +832,7 @@ Mesh loadPrimitive(JsonValue const &primitive,
     }
   }
 
+  generateMeshTangents(mesh);
   return mesh;
 }
 

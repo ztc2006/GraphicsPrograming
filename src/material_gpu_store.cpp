@@ -1,23 +1,42 @@
 #include "material_gpu_store.hpp"
 
+#include <array>
 #include <stdexcept>
 #include <utility>
 
 MaterialGpuStore::MaterialGpuStore(Device const &device) : device_(device) {
-  vk::DescriptorSetLayoutBinding binding{
-      .binding = 0,
-      .descriptorType = vk::DescriptorType::eCombinedImageSampler,
-      .descriptorCount = 1,
-      .stageFlags = vk::ShaderStageFlagBits::eFragment,
+  std::array bindings = {
+      vk::DescriptorSetLayoutBinding{
+          .binding = 0,
+          .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+          .descriptorCount = 1,
+          .stageFlags = vk::ShaderStageFlagBits::eFragment,
+      },
+      vk::DescriptorSetLayoutBinding{
+          .binding = 1,
+          .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+          .descriptorCount = 1,
+          .stageFlags = vk::ShaderStageFlagBits::eFragment,
+      },
+      vk::DescriptorSetLayoutBinding{
+          .binding = 2,
+          .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+          .descriptorCount = 1,
+          .stageFlags = vk::ShaderStageFlagBits::eFragment,
+      },
   };
 
   vk::DescriptorSetLayoutCreateInfo createInfo{
-      .bindingCount = 1,
-      .pBindings = &binding,
+      .bindingCount = static_cast<std::uint32_t>(bindings.size()),
+      .pBindings = bindings.data(),
   };
 
   materialDescriptorSetLayout_ =
       vk::raii::DescriptorSetLayout(device_.logicalDevice(), createInfo);
+
+  TextureLoader textureLoader(device_);
+  flatNormalTexture_ = textureLoader.createSolidColor({128, 128, 255, 255});
+  flatHeightTexture_ = textureLoader.createSolidColor({0, 0, 0, 255});
 }
 
 void MaterialGpuStore::setMaterials(std::vector<Material> const &materials) {
@@ -52,7 +71,19 @@ MaterialGpuStore::createMaterialResources(
 
     MaterialGpuResources resources{};
     resources.albedoTexture = textureLoader.createFromFile(material.albedoPath);
+    if (!material.normalPath.empty()) {
+      resources.normalTexture = textureLoader.createFromFile(material.normalPath);
+    }
+    if (!material.heightPath.empty()) {
+      resources.heightTexture = textureLoader.createFromFile(material.heightPath);
+    }
     resources.tint = material.tint;
+    resources.surfaceParams = {
+        material.normalScale,
+        material.parallaxScale,
+        material.normalPath.empty() ? 0.0f : 1.0f,
+        material.heightPath.empty() ? 0.0f : 1.0f,
+    };
     newMaterials.push_back(std::move(resources));
   }
 
@@ -68,11 +99,23 @@ void MaterialGpuStore::setMaterialTint(MaterialId materialId,
   materialGpuResources_[materialId].tint = tint;
 }
 
+void MaterialGpuStore::setMaterialSurfaceParams(MaterialId materialId,
+                                                float normalScale,
+                                                float parallaxScale) {
+  if (materialId >= materialGpuResources_.size()) {
+    throw std::runtime_error("Material GPU store material id is out of range.");
+  }
+
+  glm::vec4 &params = materialGpuResources_[materialId].surfaceParams;
+  params.x = normalScale;
+  params.y = parallaxScale;
+}
+
 vk::raii::DescriptorPool MaterialGpuStore::createMaterialDescriptorPool(
     std::uint32_t materialCount) const {
   vk::DescriptorPoolSize poolSize{
       .type = vk::DescriptorType::eCombinedImageSampler,
-      .descriptorCount = materialCount,
+      .descriptorCount = materialCount * 3,
   };
 
   vk::DescriptorPoolCreateInfo createInfo{
@@ -109,20 +152,54 @@ void MaterialGpuStore::writeMaterialDescriptorSets() {
     auto &material = materialGpuResources_[index];
     material.descriptorSet = descriptorSets[index];
 
-    vk::DescriptorImageInfo imageInfo{
-        .sampler = *material.albedoTexture.sampler,
-        .imageView = *material.albedoTexture.imageView,
-        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+    TextureResources const &normalTexture =
+        material.normalTexture.has_value() ? *material.normalTexture
+                                           : flatNormalTexture_;
+    TextureResources const &heightTexture =
+        material.heightTexture.has_value() ? *material.heightTexture
+                                           : flatHeightTexture_;
+    std::array imageInfos = {
+        vk::DescriptorImageInfo{
+            .sampler = *material.albedoTexture.sampler,
+            .imageView = *material.albedoTexture.imageView,
+            .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+        },
+        vk::DescriptorImageInfo{
+            .sampler = *normalTexture.sampler,
+            .imageView = *normalTexture.imageView,
+            .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+        },
+        vk::DescriptorImageInfo{
+            .sampler = *heightTexture.sampler,
+            .imageView = *heightTexture.imageView,
+            .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+        },
     };
 
-    vk::WriteDescriptorSet write{
-        .dstSet = material.descriptorSet,
-        .dstBinding = 0,
-        .descriptorCount = 1,
-        .descriptorType = vk::DescriptorType::eCombinedImageSampler,
-        .pImageInfo = &imageInfo,
+    std::array writes = {
+        vk::WriteDescriptorSet{
+            .dstSet = material.descriptorSet,
+            .dstBinding = 0,
+            .descriptorCount = 1,
+            .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+            .pImageInfo = &imageInfos[0],
+        },
+        vk::WriteDescriptorSet{
+            .dstSet = material.descriptorSet,
+            .dstBinding = 1,
+            .descriptorCount = 1,
+            .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+            .pImageInfo = &imageInfos[1],
+        },
+        vk::WriteDescriptorSet{
+            .dstSet = material.descriptorSet,
+            .dstBinding = 2,
+            .descriptorCount = 1,
+            .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+            .pImageInfo = &imageInfos[2],
+        },
     };
 
-    device_.logicalDevice().updateDescriptorSets({write}, {});
+    device_.logicalDevice().updateDescriptorSets(writes, {});
   }
 }

@@ -65,30 +65,43 @@ std::filesystem::path resolveCaseInsensitivePath(std::filesystem::path path) {
   return path;
 }
 
-std::string materialTexturePath(std::filesystem::path const &objPath,
-                                tinyobj::material_t const &material,
-                                std::string const &fallbackAlbedoPath) {
-  if (material.diffuse_texname.empty()) {
-    return fallbackAlbedoPath;
+std::string optionalMaterialTexturePath(std::filesystem::path const &objPath,
+                                        tinyobj::material_t const &material,
+                                        std::string const &textureName,
+                                        char const *textureKind) {
+  if (textureName.empty()) {
+    return {};
   }
 
   std::filesystem::path texturePath =
       resolveCaseInsensitivePath(objPath.parent_path() /
-                                 normalizeAssetPath(material.diffuse_texname));
+                                 normalizeAssetPath(textureName));
   if (!std::filesystem::exists(texturePath)) {
     if (!material.name.empty()) {
       std::cerr << "OBJ material '" << material.name
-                << "' missing diffuse texture '"
-                << material.diffuse_texname << "', falling back to "
-                << fallbackAlbedoPath << '\n';
+                << "' missing " << textureKind << " texture '" << textureName
+                << "'\n";
     } else {
-      std::cerr << "OBJ material missing diffuse texture '"
-                << material.diffuse_texname << "', falling back to "
-                << fallbackAlbedoPath << '\n';
+      std::cerr << "OBJ material missing " << textureKind << " texture '"
+                << textureName << "'\n";
     }
-    return fallbackAlbedoPath;
+    return {};
   }
   return texturePath.string();
+}
+
+std::string materialAlbedoPath(std::filesystem::path const &objPath,
+                               tinyobj::material_t const &material,
+                               std::string const &fallbackAlbedoPath) {
+  std::string path = optionalMaterialTexturePath(
+      objPath, material, material.diffuse_texname, "diffuse");
+  if (!path.empty()) {
+    return path;
+  }
+  if (!material.diffuse_texname.empty()) {
+    std::cerr << "Falling back to " << fallbackAlbedoPath << '\n';
+  }
+  return fallbackAlbedoPath;
 }
 
 std::vector<Material>
@@ -108,8 +121,12 @@ loadMaterials(std::filesystem::path const &objPath,
 
   for (tinyobj::material_t const &objMaterial : objMaterials) {
     materials.push_back(Material{
-        .albedoPath =
-            materialTexturePath(objPath, objMaterial, fallbackAlbedoPath),
+        .albedoPath = materialAlbedoPath(objPath, objMaterial,
+                                         fallbackAlbedoPath),
+        .normalPath = optionalMaterialTexturePath(
+            objPath, objMaterial, objMaterial.normal_texname, "normal"),
+        .heightPath = optionalMaterialTexturePath(
+            objPath, objMaterial, objMaterial.bump_texname, "height"),
         .tint =
             {
                 objMaterial.diffuse[0],
@@ -323,6 +340,7 @@ LoadedScene loadStaticObjScene(std::filesystem::path const &path,
         continue;
       }
       MeshId const meshId = static_cast<MeshId>(result.meshes.size());
+      generateMeshTangents(builder.mesh);
       result.meshes.push_back(std::move(builder.mesh));
       SceneObject object{};
       object.meshId = meshId;

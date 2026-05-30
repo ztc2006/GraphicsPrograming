@@ -80,6 +80,8 @@ private:
   std::chrono::steady_clock::time_point animationStartTime_ =
       std::chrono::steady_clock::now();
   std::size_t selectedMaterialIndex_ = 0;
+  float frameTimeMs_ = 0.0f;
+  float framesPerSecond_ = 0.0f;
   std::chrono::steady_clock::time_point lastFrameTime_ =
       std::chrono::steady_clock::now();
 };

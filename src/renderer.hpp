@@ -32,6 +32,8 @@ public:
   void setMeshes(std::vector<Mesh> const &meshes);
   void setMaterials(std::vector<Material> const &materials);
   void setMaterialTint(MaterialId materialId, glm::vec4 const &tint);
+  void setMaterialSurfaceParams(MaterialId materialId, float normalScale,
+                                float parallaxScale);
   void setUiDrawCallback(std::function<void(vk::CommandBuffer)> callback);
   RasterizerDebugSettings rasterizerDebugSettings() const {
     return rasterizerDebugSettings_;

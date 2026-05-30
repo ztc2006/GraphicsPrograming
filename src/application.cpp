@@ -202,6 +202,8 @@ void Application::mainLoop() {
     float const deltaSeconds =
         std::chrono::duration<float>(now - lastFrameTime_).count();
     lastFrameTime_ = now;
+    frameTimeMs_ = deltaSeconds * 1000.0f;
+    framesPerSecond_ = deltaSeconds > 0.0f ? 1.0f / deltaSeconds : 0.0f;
 
     glfwPollEvents();
     beginImGuiFrame();
@@ -466,10 +468,28 @@ void Application::drawImGui() {
       selectedMaterialIndex_ = static_cast<std::size_t>(selectedMaterial);
 
       Material &material = scene_.materials[selectedMaterialIndex_];
-      ImGui::Text("Texture: %s", material.albedoPath.c_str());
+      ImGui::Text("Albedo: %s", material.albedoPath.c_str());
+      ImGui::Text("Normal: %s",
+                  material.normalPath.empty() ? "flat default"
+                                              : material.normalPath.c_str());
+      ImGui::Text("Height: %s",
+                  material.heightPath.empty() ? "flat default"
+                                              : material.heightPath.c_str());
       if (ImGui::ColorEdit4("Tint", &material.tint.x)) {
         renderer_->setMaterialTint(
             static_cast<MaterialId>(selectedMaterialIndex_), material.tint);
+      }
+      bool surfaceChanged = false;
+      surfaceChanged |=
+          ImGui::SliderFloat("Normal Strength", &material.normalScale, 0.0f,
+                             2.0f, "%.2f");
+      surfaceChanged |=
+          ImGui::SliderFloat("Parallax Scale", &material.parallaxScale, 0.0f,
+                             0.12f, "%.3f");
+      if (surfaceChanged) {
+        renderer_->setMaterialSurfaceParams(
+            static_cast<MaterialId>(selectedMaterialIndex_),
+            material.normalScale, material.parallaxScale);
       }
     }
   }
@@ -479,6 +499,9 @@ void Application::drawImGui() {
     Renderer::RasterizerDebugSettings settings =
         renderer_->rasterizerDebugSettings();
 
+    ImGui::Text("FPS: %.1f", framesPerSecond_);
+    ImGui::Text("Frame: %.2f ms", frameTimeMs_);
+    ImGui::Separator();
     ImGui::Checkbox("Show AABBs", &showAabbDebug_);
     ImGui::Text("Objects: %zu", scene_.objects.size());
     ImGui::Separator();

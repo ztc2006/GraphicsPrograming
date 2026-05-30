@@ -19,6 +19,7 @@ struct Vertex {
   glm::vec3 color;
   glm::vec3 normal;
   glm::vec2 uv;
+  glm::vec4 tangent{1.0f, 0.0f, 0.0f, 1.0f};
 
   static vk::VertexInputBindingDescription bindingDescription() {
     return vk::VertexInputBindingDescription{
@@ -28,7 +29,7 @@ struct Vertex {
     };
   }
 
-  static std::array<vk::VertexInputAttributeDescription, 4>
+  static std::array<vk::VertexInputAttributeDescription, 5>
   attributeDescriptions() {
     return {
         vk::VertexInputAttributeDescription{
@@ -55,6 +56,12 @@ struct Vertex {
             .format = vk::Format::eR32G32Sfloat,
             .offset = offsetof(Vertex, uv),
         },
+        vk::VertexInputAttributeDescription{
+            .location = 4,
+            .binding = 0,
+            .format = vk::Format::eR32G32B32A32Sfloat,
+            .offset = offsetof(Vertex, tangent),
+        },
     };
   }
 };
@@ -63,3 +70,5 @@ struct Mesh {
   std::vector<std::uint32_t> indices;
   Aabb localBounds{};
 };
+
+void generateMeshTangents(Mesh &mesh);

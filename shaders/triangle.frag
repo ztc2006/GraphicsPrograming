@@ -1,10 +1,13 @@
 #version 450
 
 layout(set = 1, binding = 0) uniform sampler2D albedoTexture;
+layout(set = 1, binding = 1) uniform sampler2D normalTexture;
+layout(set = 1, binding = 2) uniform sampler2D heightTexture;
 
 layout(push_constant) uniform PushConstants {
   mat4 transform;
   vec4 materialTint;
+  vec4 surfaceParams;
 }
 pushConstants;
 
@@ -28,7 +31,53 @@ layout(location = 1) in vec2 inUv;
 layout(location = 2) in vec3 inWorldPos;
 layout(location = 3) in vec3 inWorldNormal;
 layout(location = 4) in vec4 inLightClipPos;
+layout(location = 5) in vec4 inWorldTangent;
 layout(location = 0) out vec4 outFragColor;
+
+vec2 parallaxOcclusionUv(vec2 uv, vec3 tangentViewDirection) {
+  if (pushConstants.surfaceParams.w < 0.5 ||
+      pushConstants.surfaceParams.y <= 0.0001) {
+    return uv;
+  }
+
+  if (tangentViewDirection.z <= 0.05) {
+    return uv;
+  }
+
+  float viewAlignment = clamp(tangentViewDirection.z, 0.05, 1.0);
+  float layerCount = mix(32.0, 8.0, viewAlignment);
+  float layerDepth = 1.0 / layerCount;
+  vec2 uvStep =
+      pushConstants.surfaceParams.y * tangentViewDirection.xy /
+      viewAlignment / layerCount;
+
+  vec2 currentUv = uv;
+  float currentLayerDepth = 0.0;
+  float currentDepth = 1.0 - texture(heightTexture, currentUv).r;
+  while (currentLayerDepth < currentDepth) {
+    currentUv -= uvStep;
+    currentDepth = 1.0 - texture(heightTexture, currentUv).r;
+    currentLayerDepth += layerDepth;
+  }
+
+  vec2 previousUv = currentUv + uvStep;
+  float afterDepth = currentDepth - currentLayerDepth;
+  float beforeDepth = (1.0 - texture(heightTexture, previousUv).r) -
+                      currentLayerDepth + layerDepth;
+  float weight = afterDepth / (afterDepth - beforeDepth);
+  return mix(currentUv, previousUv, clamp(weight, 0.0, 1.0));
+}
+
+vec3 normalFromHeight(vec2 uv) {
+  vec2 texel = 1.0 / vec2(textureSize(heightTexture, 0));
+  float heightLeft = texture(heightTexture, uv - vec2(texel.x, 0.0)).r;
+  float heightRight = texture(heightTexture, uv + vec2(texel.x, 0.0)).r;
+  float heightDown = texture(heightTexture, uv - vec2(0.0, texel.y)).r;
+  float heightUp = texture(heightTexture, uv + vec2(0.0, texel.y)).r;
+  return normalize(vec3((heightLeft - heightRight) * pushConstants.surfaceParams.x,
+                        (heightDown - heightUp) * pushConstants.surfaceParams.x,
+                        1.0));
+}
 
 float shadowVisibility(vec4 lightClipPos, vec3 N, vec3 L) {
   vec3 proj = lightClipPos.xyz / lightClipPos.w;
@@ -65,15 +114,30 @@ float shadowVisibility(vec4 lightClipPos, vec3 N, vec3 L) {
 }
 
 void main() {
-  vec4 texel = texture(albedoTexture, inUv);
-  vec3 albedo = texel.rgb * inColor * pushConstants.materialTint.rgb;
-
   vec3 N = normalize(inWorldNormal);
   if (!gl_FrontFacing) {
     N = -N;
   }
+  vec3 T = normalize(inWorldTangent.xyz);
+  T = normalize(T - N * dot(N, T));
+  vec3 B = normalize(cross(N, T)) * inWorldTangent.w;
+  mat3 tangentToWorld = mat3(T, B, N);
+
   vec3 L = normalize(ubo.lightDirection.xyz);
   vec3 V = normalize(ubo.cameraPosition.xyz - inWorldPos);
+  vec3 tangentViewDirection = normalize(transpose(tangentToWorld) * V);
+  vec2 uv = parallaxOcclusionUv(inUv, tangentViewDirection);
+
+  vec4 texel = texture(albedoTexture, uv);
+  vec3 albedo = texel.rgb * inColor * pushConstants.materialTint.rgb;
+  if (pushConstants.surfaceParams.z > 0.5) {
+    vec3 tangentNormal = texture(normalTexture, uv).xyz * 2.0 - 1.0;
+    tangentNormal.xy *= pushConstants.surfaceParams.x;
+    N = normalize(tangentToWorld * normalize(tangentNormal));
+  } else if (pushConstants.surfaceParams.w > 0.5) {
+    N = normalize(tangentToWorld * normalFromHeight(uv));
+  }
+
   vec3 H = normalize(L + V);
 
   float nDotL = dot(N, L);

@@ -16,6 +16,7 @@ namespace {
 struct PushConstants {
   glm::mat4 transform{1.0f};
   glm::vec4 materialTint{1.0f};
+  glm::vec4 surfaceParams{1.0f, 0.04f, 0.0f, 0.0f};
 };
 
 struct FrameUniformBufferObject {
@@ -397,6 +398,13 @@ void Renderer::setMaterialTint(MaterialId materialId, glm::vec4 const &tint) {
   materialGpuStore_.setMaterialTint(materialId, tint);
 }
 
+void Renderer::setMaterialSurfaceParams(MaterialId materialId,
+                                        float normalScale,
+                                        float parallaxScale) {
+  materialGpuStore_.setMaterialSurfaceParams(materialId, normalScale,
+                                             parallaxScale);
+}
+
 void Renderer::setUiDrawCallback(
     std::function<void(vk::CommandBuffer)> callback) {
   uiDrawCallback_ = std::move(callback);
@@ -619,6 +627,7 @@ void Renderer::drawObject(MeshId meshId, MaterialId materialId,
   PushConstants pushConstants{
       .transform = modelMatrix,
       .materialTint = materialResource.tint,
+      .surfaceParams = materialResource.surfaceParams,
   };
 
   if (activePass_ == ActivePass::eShadow) {

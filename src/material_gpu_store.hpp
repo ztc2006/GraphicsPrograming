@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <vector>
 
 #include "device.hpp"
@@ -12,14 +13,19 @@ class MaterialGpuStore {
 public:
   struct MaterialGpuResources {
     TextureResources albedoTexture;
+    std::optional<TextureResources> normalTexture;
+    std::optional<TextureResources> heightTexture;
     vk::DescriptorSet descriptorSet = nullptr;
     glm::vec4 tint{1.0f};
+    glm::vec4 surfaceParams{1.0f, 0.04f, 0.0f, 0.0f};
   };
 
   explicit MaterialGpuStore(Device const &device);
 
   void setMaterials(std::vector<Material> const &materials);
   void setMaterialTint(MaterialId materialId, glm::vec4 const &tint);
+  void setMaterialSurfaceParams(MaterialId materialId, float normalScale,
+                                float parallaxScale);
 
   vk::DescriptorSetLayout descriptorSetLayout() const {
     return *materialDescriptorSetLayout_;
@@ -41,5 +47,7 @@ private:
   Device const &device_;
   vk::raii::DescriptorSetLayout materialDescriptorSetLayout_ = nullptr;
   vk::raii::DescriptorPool materialDescriptorPool_ = nullptr;
+  TextureResources flatNormalTexture_;
+  TextureResources flatHeightTexture_;
   std::vector<MaterialGpuResources> materialGpuResources_;
 };

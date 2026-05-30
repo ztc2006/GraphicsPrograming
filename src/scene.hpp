@@ -15,7 +15,11 @@ using MaterialId = std::uint32_t;
 
 struct Material {
   std::string albedoPath;
+  std::string normalPath;
+  std::string heightPath;
   glm::vec4 tint{1.0f};
+  float normalScale = 1.0f;
+  float parallaxScale = 0.04f;
 };
 
 struct LightingSettings {

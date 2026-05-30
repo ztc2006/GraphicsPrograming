@@ -24,6 +24,18 @@ TextureResources TextureLoader::createFromFile(std::string const &path) const {
     throw std::runtime_error("Texture has invalid dimensions: " + path);
   }
 
+  return createFromPixels(pixels.get(), static_cast<std::uint32_t>(width),
+                          static_cast<std::uint32_t>(height));
+}
+
+TextureResources TextureLoader::createSolidColor(
+    std::array<std::uint8_t, 4> const &color) const {
+  return createFromPixels(color.data(), 1, 1);
+}
+
+TextureResources
+TextureLoader::createFromPixels(std::uint8_t const *pixels, std::uint32_t width,
+                                std::uint32_t height) const {
   vk::DeviceSize imageSize = static_cast<vk::DeviceSize>(width) *
                              static_cast<vk::DeviceSize>(height) * 4;
 
@@ -33,14 +45,13 @@ TextureResources TextureLoader::createFromFile(std::string const &path) const {
                                vk::MemoryPropertyFlagBits::eHostCoherent);
 
   void *mapped = stagingMemory.mapMemory(0, imageSize);
-  std::memcpy(mapped, pixels.get(), static_cast<std::size_t>(imageSize));
+  std::memcpy(mapped, pixels, static_cast<std::size_t>(imageSize));
   stagingMemory.unmapMemory();
 
   vk::ImageCreateInfo imageCreateInfo{
       .imageType = vk::ImageType::e2D,
       .format = vk::Format::eR8G8B8A8Unorm,
-      .extent = {static_cast<std::uint32_t>(width),
-                 static_cast<std::uint32_t>(height), 1},
+      .extent = {width, height, 1},
       .mipLevels = 1,
       .arrayLayers = 1,
       .samples = vk::SampleCountFlagBits::e1,
@@ -74,8 +85,7 @@ TextureResources TextureLoader::createFromFile(std::string const &path) const {
                   vk::AccessFlagBits2::eTransferWrite);
 
   copyBufferToImage(*stagingBuffer, *resources.image,
-                    static_cast<std::uint32_t>(width),
-                    static_cast<std::uint32_t>(height));
+                    width, height);
 
   transitionImage(resources, vk::ImageLayout::eShaderReadOnlyOptimal,
                   vk::PipelineStageFlagBits2::eTransfer,
