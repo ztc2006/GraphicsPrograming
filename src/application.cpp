@@ -3,7 +3,9 @@
 #include "application.hpp"
 
 #include <cstring>
+#include <filesystem>
 #include <iostream>
+#include <limits>
 #include <ranges>
 #include <stdexcept>
 #include <string>
@@ -14,6 +16,7 @@
 #include <imgui_impl_vulkan.h>
 
 #include "device.hpp"
+#include "gltf_loader.hpp"
 #include "renderer.hpp"
 #include "swap_chain.hpp"
 
@@ -29,6 +32,49 @@ constexpr bool kEnableValidationLayers = false;
 #else
 constexpr bool kEnableValidationLayers = true;
 #endif
+
+Aabb emptyBounds() {
+  return {
+      .min = glm::vec3{std::numeric_limits<float>::max()},
+      .max = glm::vec3{std::numeric_limits<float>::lowest()},
+      .valid = false,
+  };
+}
+
+void includePoint(Aabb &bounds, glm::vec3 point) {
+  bounds.min = glm::min(bounds.min, point);
+  bounds.max = glm::max(bounds.max, point);
+  bounds.valid = true;
+}
+
+Aabb computeMeshBounds(Mesh const &mesh) {
+  Aabb bounds = emptyBounds();
+  for (Vertex const &vertex : mesh.vertices) {
+    includePoint(bounds, vertex.position);
+  }
+  return bounds;
+}
+
+Aabb transformBounds(Aabb const &localBounds, glm::mat4 const &matrix) {
+  if (!localBounds.valid) {
+    return {};
+  }
+
+  Aabb worldBounds = emptyBounds();
+  for (int x = 0; x < 2; ++x) {
+    for (int y = 0; y < 2; ++y) {
+      for (int z = 0; z < 2; ++z) {
+        glm::vec3 corner{
+            x == 0 ? localBounds.min.x : localBounds.max.x,
+            y == 0 ? localBounds.min.y : localBounds.max.y,
+            z == 0 ? localBounds.min.z : localBounds.max.z,
+        };
+        includePoint(worldBounds, glm::vec3(matrix * glm::vec4(corner, 1.0f)));
+      }
+    }
+  }
+  return worldBounds;
+}
 } // namespace
 
 Application::Application() = default;
@@ -165,6 +211,12 @@ void Application::mainLoop() {
     for (SceneObject const &object : scene_.objects) {
       renderer_->drawObject(object.meshId, object.materialId,
                             object.transform.matrix());
+    }
+
+    if (showAabbDebug_) {
+      for (SceneObject const &object : scene_.objects) {
+        renderer_->drawAabb(object.worldBounds, {0.1f, 0.95f, 0.65f, 0.95f});
+      }
     }
 
     auto frameResult = renderer_->endFrame();
@@ -387,6 +439,10 @@ void Application::drawImGui() {
   if (ImGui::Begin("Render Debug")) {
     Renderer::RasterizerDebugSettings settings =
         renderer_->rasterizerDebugSettings();
+
+    ImGui::Checkbox("Show AABBs", &showAabbDebug_);
+    ImGui::Text("Objects: %zu", scene_.objects.size());
+    ImGui::Separator();
 
     int cullMode = 0;
     if (settings.cullMode == vk::CullModeFlagBits::eBack) {
@@ -644,15 +700,25 @@ void Application::createSurface() {
 }
 
 void Application::updateScene() {
-  if (scene_.objects.size() < 3) {
-    throw std::runtime_error(
-        "Scene must contain at least 3 objects for animation.");
+  if (scene_.objects.size() >= 2) {
+    auto const now = std::chrono::steady_clock::now();
+    float const elapsedSeconds =
+        std::chrono::duration<float>(now - animationStartTime_).count();
+    scene_.objects[1].transform.rotation.z =
+        glm::radians(45.0f) * elapsedSeconds;
   }
 
-  auto const now = std::chrono::steady_clock::now();
-  float const elapsedSeconds =
-      std::chrono::duration<float>(now - animationStartTime_).count();
-  scene_.objects[1].transform.rotation.z = glm::radians(45.0f) * elapsedSeconds;
+  for (SceneObject &object : scene_.objects) {
+    if (object.meshId >= scene_.meshes.size()) {
+      continue;
+    }
+    Mesh &mesh = scene_.meshes[object.meshId];
+    if (!mesh.localBounds.valid) {
+      mesh.localBounds = computeMeshBounds(mesh);
+    }
+    object.worldBounds =
+        transformBounds(mesh.localBounds, object.transform.matrix());
+  }
 }
 
 void Application::createScene() {
@@ -660,7 +726,20 @@ void Application::createScene() {
   scene_.materials.clear();
   scene_.objects.clear();
   scene_.cameras.clear();
-  scene_.materials.clear();
+
+  std::filesystem::path const debugGltfPath{"assets/debug_scene.gltf"};
+  if (std::filesystem::exists(debugGltfPath)) {
+    LoadedGltfScene loaded =
+        loadStaticGltfScene(debugGltfPath, "texture/image.jpg");
+    scene_.meshes = std::move(loaded.meshes);
+    scene_.materials = std::move(loaded.materials);
+    scene_.objects = std::move(loaded.objects);
+    scene_.cameras.push_back(Camera{});
+    scene_.activeCameraIndex = 0;
+    orbitCameraController_.attach(scene_.cameras[scene_.activeCameraIndex]);
+    scene_.lighting = LightingSettings{};
+    return;
+  }
 
   scene_.meshes.push_back(Mesh{
       .vertices =

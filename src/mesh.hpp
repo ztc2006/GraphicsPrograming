@@ -8,6 +8,12 @@
 #include "glm_include.hpp"
 #include "vulkan_include.hpp"
 
+struct Aabb {
+  glm::vec3 min{0.0f};
+  glm::vec3 max{0.0f};
+  bool valid = false;
+};
+
 struct Vertex {
   glm::vec3 position;
   glm::vec3 color;
@@ -55,4 +61,5 @@ struct Vertex {
 struct Mesh {
   std::vector<Vertex> vertices;
   std::vector<std::uint32_t> indices;
+  Aabb localBounds{};
 };

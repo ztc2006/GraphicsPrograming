@@ -72,6 +72,7 @@ private:
   std::vector<char const *> requiredDeviceExtensions_;
   bool validationLayersEnabled_ = false;
   bool imguiInitialized_ = false;
+  bool showAabbDebug_ = true;
   InputState input_{};
   Scene scene_{};
   OrbitCameraController orbitCameraController_{};

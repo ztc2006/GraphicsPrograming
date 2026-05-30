@@ -53,6 +53,31 @@ glm::mat4 computeLightViewProj(glm::vec3 direction,
   proj[1][1] *= -1.0f;
   return proj * view;
 }
+
+Mesh makeUnitAabbLineMesh() {
+  std::array<glm::vec3, 8> const positions = {
+      glm::vec3{-0.5f, -0.5f, -0.5f}, glm::vec3{0.5f, -0.5f, -0.5f},
+      glm::vec3{0.5f, 0.5f, -0.5f},   glm::vec3{-0.5f, 0.5f, -0.5f},
+      glm::vec3{-0.5f, -0.5f, 0.5f},  glm::vec3{0.5f, -0.5f, 0.5f},
+      glm::vec3{0.5f, 0.5f, 0.5f},    glm::vec3{-0.5f, 0.5f, 0.5f},
+  };
+
+  Mesh mesh{};
+  mesh.vertices.reserve(positions.size());
+  for (glm::vec3 const &position : positions) {
+    mesh.vertices.push_back(Vertex{
+        .position = position,
+        .color = {1.0f, 1.0f, 1.0f},
+        .normal = {0.0f, 0.0f, 1.0f},
+        .uv = {0.0f, 0.0f},
+    });
+  }
+
+  mesh.indices = {
+      0, 1, 1, 2, 2, 3, 3, 0, 4, 5, 5, 6, 6, 7, 7, 4, 0, 4, 1, 5, 2, 6, 3, 7,
+  };
+  return mesh;
+}
 } // namespace
 
 Renderer::Renderer(Device const &device)
@@ -91,6 +116,8 @@ void Renderer::recreateForSwapChain(SwapChain const &swapChain) {
 
   vk::raii::Pipeline newGraphicsPipeline =
       createGraphicsPipeline(swapChain, newPipelineLayout);
+  vk::raii::Pipeline newDebugLinePipeline =
+      createDebugLinePipeline(swapChain, newPipelineLayout);
   vk::raii::Pipeline newShadowPipeline =
       createShadowPipeline(newPipelineLayout);
 
@@ -111,6 +138,7 @@ void Renderer::recreateForSwapChain(SwapChain const &swapChain) {
   using std::swap;
   swap(pipelineLayout_, newPipelineLayout);
   swap(graphicsPipeline_, newGraphicsPipeline);
+  swap(debugLinePipeline_, newDebugLinePipeline);
   swap(shadowPipeline_, newShadowPipeline);
   swap(renderFinishedSemaphores_, newRenderFinishedSemaphores);
   swap(swapChainImageLayouts_, newSwapChainImageLayouts);
@@ -125,6 +153,7 @@ void Renderer::recreateForSwapChain(SwapChain const &swapChain) {
 void Renderer::createPersistentResources() {
   createCommandPool();
   createFrameResources();
+  debugAabbLineResources_ = createGeometryResources(makeUnitAabbLineMesh());
   shadowResources_ = createShadowResources();
   createFrameDescriptorSetLayout();
   createFrameDescriptorPool();
@@ -615,6 +644,49 @@ void Renderer::drawObject(MeshId meshId, MaterialId materialId,
   commandBuffer.drawIndexed(meshResources.indexCount, 1, 0, 0, 0);
 }
 
+void Renderer::drawAabb(Aabb const &bounds, glm::vec4 const &color) {
+  if (!bounds.valid) {
+    return;
+  }
+
+  if (!activeFrame_.has_value()) {
+    throw std::runtime_error("Cannot draw AABB without an active frame.");
+  }
+
+  if (activePass_ != ActivePass::eMain) {
+    throw std::runtime_error("AABB debug draw is only valid in the main pass.");
+  }
+
+  auto const &frameState = *activeFrame_;
+  auto &frame = frames_[frameState.frameIndex];
+  auto &commandBuffer = commandBuffers_[frameState.frameIndex];
+
+  glm::vec3 const size = bounds.max - bounds.min;
+  glm::vec3 const center = (bounds.min + bounds.max) * 0.5f;
+  glm::mat4 transform =
+      glm::scale(glm::translate(glm::mat4{1.0f}, center), size);
+  PushConstants pushConstants{
+      .transform = transform,
+      .materialTint = color,
+  };
+
+  vk::Buffer vertexBuffer = *debugAabbLineResources_.vertexBuffer;
+  vk::DeviceSize vertexOffset = 0;
+  commandBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics,
+                             *debugLinePipeline_);
+  commandBuffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics,
+                                   *pipelineLayout_, 0, {frame.descriptorSet},
+                                   {});
+  commandBuffer.bindVertexBuffers(0, {vertexBuffer}, {vertexOffset});
+  commandBuffer.bindIndexBuffer(*debugAabbLineResources_.indexBuffer, 0,
+                                vk::IndexType::eUint32);
+  commandBuffer.pushConstants<PushConstants>(
+      *pipelineLayout_,
+      vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0,
+      pushConstants);
+  commandBuffer.drawIndexed(debugAabbLineResources_.indexCount, 1, 0, 0, 0);
+}
+
 Renderer::FrameResult Renderer::endFrame() {
   if (!activeFrame_.has_value()) {
     throw std::runtime_error(
@@ -790,6 +862,11 @@ void Renderer::validateSwapChainState() const {
     throw std::runtime_error("Renderer shadow pipeline is not initialized.");
   }
 
+  if (debugLinePipeline_ == nullptr) {
+    throw std::runtime_error(
+        "Renderer debug line pipeline is not initialized.");
+  }
+
   if (swapChain_->imageViews().size() != imageCount) {
     throw std::runtime_error(
         "Renderer swapchain image view count does not match image count.");
@@ -842,6 +919,15 @@ void Renderer::validateSwapChainState() const {
       throw std::runtime_error(
           "Renderer mesh GPU resources are not initialized.");
     }
+  }
+
+  if (debugAabbLineResources_.vertexBuffer == nullptr ||
+      debugAabbLineResources_.vertexBufferMemory == nullptr ||
+      debugAabbLineResources_.indexBuffer == nullptr ||
+      debugAabbLineResources_.indexBufferMemory == nullptr ||
+      debugAabbLineResources_.indexCount == 0) {
+    throw std::runtime_error(
+        "Renderer debug AABB resources are not initialized.");
   }
 }
 
@@ -933,6 +1019,132 @@ vk::raii::Pipeline Renderer::createGraphicsPipeline(
   vk::PipelineDepthStencilStateCreateInfo depthStencil{
       .depthTestEnable = true,
       .depthWriteEnable = true,
+      .depthCompareOp = vk::CompareOp::eLess,
+      .depthBoundsTestEnable = false,
+      .stencilTestEnable = false,
+  };
+
+  std::array dynamicStates = {
+      vk::DynamicState::eViewport,
+      vk::DynamicState::eScissor,
+  };
+  vk::PipelineDynamicStateCreateInfo dynamicState{
+      .dynamicStateCount = static_cast<std::uint32_t>(dynamicStates.size()),
+      .pDynamicStates = dynamicStates.data(),
+  };
+
+  vk::Format colorAttachmentFormat = swapChain.imageFormat();
+  vk::PipelineRenderingCreateInfo pipelineRenderingCreateInfo{
+      .colorAttachmentCount = 1,
+      .pColorAttachmentFormats = &colorAttachmentFormat,
+      .depthAttachmentFormat = kDepthFormat,
+  };
+
+  vk::GraphicsPipelineCreateInfo pipelineCreateInfo{
+      .pNext = &pipelineRenderingCreateInfo,
+      .stageCount = static_cast<std::uint32_t>(shaderStages.size()),
+      .pStages = shaderStages.data(),
+      .pVertexInputState = &vertexInputInfo,
+      .pInputAssemblyState = &inputAssembly,
+      .pViewportState = &viewportState,
+      .pRasterizationState = &rasterizer,
+      .pMultisampleState = &multisampling,
+      .pDepthStencilState = &depthStencil,
+      .pColorBlendState = &colorBlending,
+      .pDynamicState = &dynamicState,
+      .layout = *pipelineLayout,
+  };
+
+  return vk::raii::Pipeline(device_.logicalDevice(), nullptr,
+                            pipelineCreateInfo);
+}
+
+vk::raii::Pipeline Renderer::createDebugLinePipeline(
+    SwapChain const &swapChain,
+    vk::raii::PipelineLayout const &pipelineLayout) const {
+  auto vertCode = readBinaryFile("shaders/debug_line.vert.spv");
+  auto fragCode = readBinaryFile("shaders/debug_line.frag.spv");
+
+  vk::ShaderModuleCreateInfo vertexShaderCreateInfo{
+      .codeSize = vertCode.size(),
+      .pCode = reinterpret_cast<std::uint32_t const *>(vertCode.data()),
+  };
+  vk::ShaderModuleCreateInfo fragmentShaderCreateInfo{
+      .codeSize = fragCode.size(),
+      .pCode = reinterpret_cast<std::uint32_t const *>(fragCode.data()),
+  };
+
+  vk::raii::ShaderModule vertexShaderModule(device_.logicalDevice(),
+                                            vertexShaderCreateInfo);
+  vk::raii::ShaderModule fragmentShaderModule(device_.logicalDevice(),
+                                              fragmentShaderCreateInfo);
+
+  std::array shaderStages = {
+      vk::PipelineShaderStageCreateInfo{
+          .stage = vk::ShaderStageFlagBits::eVertex,
+          .module = *vertexShaderModule,
+          .pName = "main",
+      },
+      vk::PipelineShaderStageCreateInfo{
+          .stage = vk::ShaderStageFlagBits::eFragment,
+          .module = *fragmentShaderModule,
+          .pName = "main",
+      },
+  };
+
+  auto bindingDescription = Vertex::bindingDescription();
+  auto attributeDescriptions = Vertex::attributeDescriptions();
+
+  vk::PipelineVertexInputStateCreateInfo vertexInputInfo{
+      .vertexBindingDescriptionCount = 1,
+      .pVertexBindingDescriptions = &bindingDescription,
+      .vertexAttributeDescriptionCount =
+          static_cast<std::uint32_t>(attributeDescriptions.size()),
+      .pVertexAttributeDescriptions = attributeDescriptions.data(),
+  };
+  vk::PipelineInputAssemblyStateCreateInfo inputAssembly{
+      .topology = vk::PrimitiveTopology::eLineList,
+      .primitiveRestartEnable = false,
+  };
+  vk::PipelineViewportStateCreateInfo viewportState{
+      .viewportCount = 1,
+      .scissorCount = 1,
+  };
+  vk::PipelineRasterizationStateCreateInfo rasterizer{
+      .depthClampEnable = false,
+      .rasterizerDiscardEnable = false,
+      .polygonMode = vk::PolygonMode::eFill,
+      .cullMode = vk::CullModeFlagBits::eNone,
+      .frontFace = vk::FrontFace::eCounterClockwise,
+      .depthBiasEnable = false,
+      .lineWidth = 1.0f,
+  };
+  vk::PipelineMultisampleStateCreateInfo multisampling{
+      .rasterizationSamples = vk::SampleCountFlagBits::e1,
+      .sampleShadingEnable = false,
+  };
+
+  vk::PipelineColorBlendAttachmentState colorBlendAttachment{
+      .blendEnable = true,
+      .srcColorBlendFactor = vk::BlendFactor::eSrcAlpha,
+      .dstColorBlendFactor = vk::BlendFactor::eOneMinusSrcAlpha,
+      .colorBlendOp = vk::BlendOp::eAdd,
+      .srcAlphaBlendFactor = vk::BlendFactor::eOne,
+      .dstAlphaBlendFactor = vk::BlendFactor::eOneMinusSrcAlpha,
+      .alphaBlendOp = vk::BlendOp::eAdd,
+      .colorWriteMask =
+          vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
+          vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA,
+  };
+  vk::PipelineColorBlendStateCreateInfo colorBlending{
+      .logicOpEnable = false,
+      .attachmentCount = 1,
+      .pAttachments = &colorBlendAttachment,
+  };
+
+  vk::PipelineDepthStencilStateCreateInfo depthStencil{
+      .depthTestEnable = false,
+      .depthWriteEnable = false,
       .depthCompareOp = vk::CompareOp::eLess,
       .depthBoundsTestEnable = false,
       .stencilTestEnable = false,

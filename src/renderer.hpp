@@ -43,6 +43,7 @@ public:
                          LightingSettings const &lighting);
   void drawObject(MeshId meshId, MaterialId materialId,
                   glm::mat4 const &modelMatrix);
+  void drawAabb(Aabb const &bounds, glm::vec4 const &color);
 
   FrameResult endFrame();
 
@@ -118,6 +119,9 @@ private:
   vk::raii::Pipeline
   createGraphicsPipeline(SwapChain const &swapChain,
                          vk::raii::PipelineLayout const &pipelineLayout) const;
+  vk::raii::Pipeline
+  createDebugLinePipeline(SwapChain const &swapChain,
+                          vk::raii::PipelineLayout const &pipelineLayout) const;
 
   void endCommandBuffer(vk::raii::CommandBuffer const &commandBuffer,
                         std::uint32_t imageIndex);
@@ -163,6 +167,7 @@ private:
 
   ShadowResources shadowResources_{};
   vk::raii::Pipeline shadowPipeline_ = nullptr;
+  MeshGpuResources debugAabbLineResources_{};
   ActivePass activePass_ = ActivePass::eNone;
 
   Device const &device_;
@@ -180,6 +185,7 @@ private:
 
   vk::raii::PipelineLayout pipelineLayout_ = nullptr;
   vk::raii::Pipeline graphicsPipeline_ = nullptr;
+  vk::raii::Pipeline debugLinePipeline_ = nullptr;
   std::vector<vk::raii::Semaphore> renderFinishedSemaphores_;
   std::vector<vk::ImageLayout> swapChainImageLayouts_;
   std::vector<vk::Fence> imagesInFlight_;
