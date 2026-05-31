@@ -26,12 +26,15 @@ public:
   void setMaterialTint(MaterialId materialId, glm::vec4 const &tint);
   void setMaterialSurfaceParams(MaterialId materialId, float normalScale,
                                 float parallaxScale);
+  void setSurfaceDebugEnabled(bool normalMapsEnabled, bool parallaxEnabled);
 
   vk::DescriptorSetLayout descriptorSetLayout() const {
     return *materialDescriptorSetLayout_;
   }
 
   bool empty() const { return materialGpuResources_.empty(); }
+  bool normalMapsEnabled() const { return normalMapsEnabled_; }
+  bool parallaxEnabled() const { return parallaxEnabled_; }
 
   MaterialGpuResources const &material(MaterialId materialId) const;
 
@@ -49,5 +52,7 @@ private:
   vk::raii::DescriptorPool materialDescriptorPool_ = nullptr;
   TextureResources flatNormalTexture_;
   TextureResources flatHeightTexture_;
+  bool normalMapsEnabled_ = true;
+  bool parallaxEnabled_ = true;
   std::vector<MaterialGpuResources> materialGpuResources_;
 };

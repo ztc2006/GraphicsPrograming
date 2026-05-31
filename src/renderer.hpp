@@ -34,6 +34,7 @@ public:
   void setMaterialTint(MaterialId materialId, glm::vec4 const &tint);
   void setMaterialSurfaceParams(MaterialId materialId, float normalScale,
                                 float parallaxScale);
+  void setSurfaceDebugEnabled(bool normalMapsEnabled, bool parallaxEnabled);
   void setUiDrawCallback(std::function<void(vk::CommandBuffer)> callback);
   RasterizerDebugSettings rasterizerDebugSettings() const {
     return rasterizerDebugSettings_;
@@ -42,7 +43,8 @@ public:
 
   FrameResult beginFrame(glm::mat4 const &viewProjMatrix,
                          glm::vec3 const &cameraPosition,
-                         LightingSettings const &lighting);
+                         LightingSettings const &lighting,
+                         bool shadowPassEnabled);
   void drawObject(MeshId meshId, MaterialId materialId,
                   glm::mat4 const &modelMatrix);
   void drawAabb(Aabb const &bounds, glm::vec4 const &color);
@@ -156,7 +158,8 @@ private:
   void beginShadowPass(vk::raii::CommandBuffer const &commandBuffer,
                        FrameContext const &frame);
   void beginMainPass(vk::raii::CommandBuffer const &commandBuffer,
-                     FrameContext const &frame, std::uint32_t imageIndex);
+                     FrameContext const &frame, std::uint32_t imageIndex,
+                     bool shadowPassEnabled);
   void transitionShadowImage(vk::raii::CommandBuffer const &commandBuffer,
                              vk::ImageLayout newLayout,
                              vk::PipelineStageFlags2 srcStage,

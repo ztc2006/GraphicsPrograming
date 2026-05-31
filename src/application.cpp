@@ -2,6 +2,7 @@
 
 #include "application.hpp"
 
+#include <array>
 #include <cctype>
 #include <cstring>
 #include <filesystem>
@@ -41,6 +42,20 @@ struct StaticModelAsset {
   Camera camera;
 };
 
+struct RenderQueueItem {
+  std::size_t objectIndex = 0;
+  MeshId meshId = 0;
+  MaterialId materialId = 0;
+  glm::mat4 modelMatrix{1.0f};
+  Aabb worldBounds{};
+  bool castsShadow = true;
+  bool opaque = true;
+};
+
+struct Frustum {
+  std::array<glm::vec4, 6> planes{};
+};
+
 std::string lowercase(std::string value) {
   for (char &c : value) {
     c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
@@ -70,6 +85,100 @@ void logLoadedScene(std::filesystem::path const &path,
   std::cerr << "Loaded static scene: " << path.string() << " ("
             << loaded.meshes.size() << " meshes, " << loaded.materials.size()
             << " materials, " << loaded.objects.size() << " objects)\n";
+}
+
+std::vector<RenderQueueItem> buildRenderQueue(Scene const &scene) {
+  std::vector<RenderQueueItem> items;
+  items.reserve(scene.objects.size());
+
+  for (std::size_t objectIndex = 0; objectIndex < scene.objects.size();
+       ++objectIndex) {
+    SceneObject const &object = scene.objects[objectIndex];
+    if (object.meshId >= scene.meshes.size()) {
+      throw std::runtime_error("Scene object mesh id is out of range.");
+    }
+    if (object.materialId >= scene.materials.size()) {
+      throw std::runtime_error("Scene object material id is out of range.");
+    }
+
+    items.push_back({
+        .objectIndex = objectIndex,
+        .meshId = object.meshId,
+        .materialId = object.materialId,
+        .modelMatrix = object.transform.matrix(),
+        .worldBounds = object.worldBounds,
+        .castsShadow = true,
+        .opaque = true,
+    });
+  }
+
+  return items;
+}
+
+glm::vec4 matrixRow(glm::mat4 const &matrix, int row) {
+  return {matrix[0][row], matrix[1][row], matrix[2][row], matrix[3][row]};
+}
+
+glm::vec4 normalizePlane(glm::vec4 plane) {
+  float const length = glm::length(glm::vec3{plane});
+  if (length <= 0.0f) {
+    return plane;
+  }
+  return plane / length;
+}
+
+Frustum extractFrustum(glm::mat4 const &viewProjMatrix) {
+  glm::vec4 const row0 = matrixRow(viewProjMatrix, 0);
+  glm::vec4 const row1 = matrixRow(viewProjMatrix, 1);
+  glm::vec4 const row2 = matrixRow(viewProjMatrix, 2);
+  glm::vec4 const row3 = matrixRow(viewProjMatrix, 3);
+
+  return Frustum{{
+      normalizePlane(row3 + row0),
+      normalizePlane(row3 - row0),
+      normalizePlane(row3 + row1),
+      normalizePlane(row3 - row1),
+      normalizePlane(row2),
+      normalizePlane(row3 - row2),
+  }};
+}
+
+bool intersectsFrustum(Frustum const &frustum, Aabb const &bounds) {
+  if (!bounds.valid) {
+    return true;
+  }
+
+  for (glm::vec4 const &plane : frustum.planes) {
+    glm::vec3 const positiveVertex{
+        plane.x >= 0.0f ? bounds.max.x : bounds.min.x,
+        plane.y >= 0.0f ? bounds.max.y : bounds.min.y,
+        plane.z >= 0.0f ? bounds.max.z : bounds.min.z,
+    };
+
+    if (glm::dot(glm::vec3{plane}, positiveVertex) + plane.w < 0.0f) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+std::vector<RenderQueueItem>
+filterRenderQueueByFrustum(std::vector<RenderQueueItem> const &items,
+                           Frustum const &frustum, std::size_t &culledItems) {
+  std::vector<RenderQueueItem> visibleItems;
+  visibleItems.reserve(items.size());
+  culledItems = 0;
+
+  for (RenderQueueItem const &item : items) {
+    if (intersectsFrustum(frustum, item.worldBounds)) {
+      visibleItems.push_back(item);
+    } else {
+      ++culledItems;
+    }
+  }
+
+  return visibleItems;
 }
 
 Aabb emptyBounds() {
@@ -228,35 +337,64 @@ void Application::mainLoop() {
     orbitCameraController_.update(camera);
     input_.clearFrameDeltas();
     glm::mat4 viewProjMatrix = camera.viewProj(aspect);
+    renderer_->setSurfaceDebugEnabled(normalMapDebugEnabled_,
+                                      parallaxDebugEnabled_);
+    std::vector<RenderQueueItem> renderQueue = buildRenderQueue(scene_);
+    std::vector<RenderQueueItem> visibleRenderQueue = renderQueue;
+    renderQueueItems_ = renderQueue.size();
+    culledRenderQueueItems_ = 0;
+    if (frustumCullingEnabled_) {
+      Frustum const cameraFrustum = extractFrustum(viewProjMatrix);
+      visibleRenderQueue = filterRenderQueueByFrustum(
+          renderQueue, cameraFrustum, culledRenderQueueItems_);
+    }
+    visibleRenderQueueItems_ = visibleRenderQueue.size();
+    frameDrawCalls_ = 0;
+    shadowDrawCalls_ = 0;
+    mainDrawCalls_ = 0;
+    debugDrawCalls_ = 0;
+
+    LightingSettings frameLighting = scene_.lighting;
+    bool const shadowPassEnabled = shadowDebugEnabled_;
+    if (!shadowPassEnabled) {
+      frameLighting.shadowDebugMode = 0;
+    }
 
     auto beginResult =
-        renderer_->beginFrame(viewProjMatrix, camera.position, scene_.lighting);
+        renderer_->beginFrame(viewProjMatrix, camera.position, frameLighting,
+                              shadowPassEnabled);
     if (beginResult != Renderer::FrameResult::eSuccess) {
       recreateSwapChain();
       continue;
     }
 
-    for (SceneObject const &object : scene_.objects) {
-      if (object.meshId >= scene_.meshes.size()) {
-        throw std::runtime_error("Scene object mesh id is out of range.");
+    if (shadowPassEnabled) {
+      for (RenderQueueItem const &item : renderQueue) {
+        if (!item.castsShadow) {
+          continue;
+        }
+        renderer_->drawObject(item.meshId, item.materialId, item.modelMatrix);
+        ++frameDrawCalls_;
+        ++shadowDrawCalls_;
       }
-      if (object.materialId >= scene_.materials.size()) {
-        throw std::runtime_error("Scene object material id is out of range.");
-      }
-      renderer_->drawObject(object.meshId, object.materialId,
-                            object.transform.matrix());
+
+      renderer_->beginMainPass();
     }
 
-    renderer_->beginMainPass();
-
-    for (SceneObject const &object : scene_.objects) {
-      renderer_->drawObject(object.meshId, object.materialId,
-                            object.transform.matrix());
+    for (RenderQueueItem const &item : visibleRenderQueue) {
+      if (!item.opaque) {
+        continue;
+      }
+      renderer_->drawObject(item.meshId, item.materialId, item.modelMatrix);
+      ++frameDrawCalls_;
+      ++mainDrawCalls_;
     }
 
     if (showAabbDebug_) {
-      for (SceneObject const &object : scene_.objects) {
-        renderer_->drawAabb(object.worldBounds, {0.1f, 0.95f, 0.65f, 0.95f});
+      for (RenderQueueItem const &item : visibleRenderQueue) {
+        renderer_->drawAabb(item.worldBounds, {0.1f, 0.95f, 0.65f, 0.95f});
+        ++frameDrawCalls_;
+        ++debugDrawCalls_;
       }
     }
 
@@ -502,8 +640,21 @@ void Application::drawImGui() {
     ImGui::Text("FPS: %.1f", framesPerSecond_);
     ImGui::Text("Frame: %.2f ms", frameTimeMs_);
     ImGui::Separator();
+    ImGui::Checkbox("Shadows", &shadowDebugEnabled_);
+    ImGui::Checkbox("Normal/Bump Mapping", &normalMapDebugEnabled_);
+    ImGui::Checkbox("Parallax Mapping", &parallaxDebugEnabled_);
+    ImGui::Checkbox("Frustum Culling", &frustumCullingEnabled_);
     ImGui::Checkbox("Show AABBs", &showAabbDebug_);
     ImGui::Text("Objects: %zu", scene_.objects.size());
+    ImGui::Text("Render Queue: %zu", renderQueueItems_);
+    ImGui::Text("Visible: %zu", visibleRenderQueueItems_);
+    ImGui::Text("Culled: %zu", culledRenderQueueItems_);
+    ImGui::Text("Meshes: %zu", scene_.meshes.size());
+    ImGui::Text("Materials: %zu", scene_.materials.size());
+    ImGui::Text("Draw Calls: %zu", frameDrawCalls_);
+    ImGui::Text("Shadow Draws: %zu", shadowDrawCalls_);
+    ImGui::Text("Main Draws: %zu", mainDrawCalls_);
+    ImGui::Text("Debug Draws: %zu", debugDrawCalls_);
     ImGui::Separator();
 
     int cullMode = 0;

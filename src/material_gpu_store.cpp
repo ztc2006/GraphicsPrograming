@@ -111,6 +111,12 @@ void MaterialGpuStore::setMaterialSurfaceParams(MaterialId materialId,
   params.y = parallaxScale;
 }
 
+void MaterialGpuStore::setSurfaceDebugEnabled(bool normalMapsEnabled,
+                                              bool parallaxEnabled) {
+  normalMapsEnabled_ = normalMapsEnabled;
+  parallaxEnabled_ = parallaxEnabled;
+}
+
 vk::raii::DescriptorPool MaterialGpuStore::createMaterialDescriptorPool(
     std::uint32_t materialCount) const {
   vk::DescriptorPoolSize poolSize{

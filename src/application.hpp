@@ -73,7 +73,18 @@ private:
   bool validationLayersEnabled_ = false;
   bool imguiInitialized_ = false;
   bool showAabbDebug_ = true;
+  bool shadowDebugEnabled_ = true;
+  bool normalMapDebugEnabled_ = true;
+  bool parallaxDebugEnabled_ = true;
+  bool frustumCullingEnabled_ = false;
   bool animateScene_ = false;
+  std::size_t renderQueueItems_ = 0;
+  std::size_t visibleRenderQueueItems_ = 0;
+  std::size_t culledRenderQueueItems_ = 0;
+  std::size_t frameDrawCalls_ = 0;
+  std::size_t shadowDrawCalls_ = 0;
+  std::size_t mainDrawCalls_ = 0;
+  std::size_t debugDrawCalls_ = 0;
   InputState input_{};
   Scene scene_{};
   OrbitCameraController orbitCameraController_{};

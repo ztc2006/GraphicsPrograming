@@ -34,6 +34,18 @@ layout(location = 4) in vec4 inLightClipPos;
 layout(location = 5) in vec4 inWorldTangent;
 layout(location = 0) out vec4 outFragColor;
 
+bool uvInsideUnitSquare(vec2 uv) {
+  return uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0;
+}
+
+vec3 safeNormalize(vec3 value, vec3 fallback) {
+  float lengthSquared = dot(value, value);
+  if (lengthSquared <= 0.000001) {
+    return fallback;
+  }
+  return value * inversesqrt(lengthSquared);
+}
+
 vec2 parallaxOcclusionUv(vec2 uv, vec3 tangentViewDirection) {
   if (pushConstants.surfaceParams.w < 0.5 ||
       pushConstants.surfaceParams.y <= 0.0001) {
@@ -50,8 +62,9 @@ vec2 parallaxOcclusionUv(vec2 uv, vec3 tangentViewDirection) {
   vec2 rayStep = pushConstants.surfaceParams.y * tangentViewDirection.xy /
                  viewAlignment / layerCount;
 
-  vec2 previousUv = uv;
-  vec2 currentUv = uv;
+  vec2 tileOffset = floor(uv);
+  vec2 previousUv = fract(uv);
+  vec2 currentUv = previousUv;
   float previousLayerDepth = 0.0;
   float currentLayerDepth = 0.0;
   float currentDepth = 1.0 - texture(heightTexture, currentUv).r;
@@ -64,6 +77,9 @@ vec2 parallaxOcclusionUv(vec2 uv, vec3 tangentViewDirection) {
     previousUv = currentUv;
     previousLayerDepth = currentLayerDepth;
     currentUv -= rayStep;
+    if (!uvInsideUnitSquare(currentUv)) {
+      return tileOffset + previousUv;
+    }
     currentLayerDepth += layerDepth;
     currentDepth = 1.0 - texture(heightTexture, currentUv).r;
   }
@@ -74,6 +90,9 @@ vec2 parallaxOcclusionUv(vec2 uv, vec3 tangentViewDirection) {
   float highLayerDepth = currentLayerDepth;
   for (int refine = 0; refine < 5; ++refine) {
     vec2 midUv = (lowUv + highUv) * 0.5;
+    if (!uvInsideUnitSquare(midUv)) {
+      return tileOffset + lowUv;
+    }
     float midLayerDepth = (lowLayerDepth + highLayerDepth) * 0.5;
     float midDepth = 1.0 - texture(heightTexture, midUv).r;
     if (midLayerDepth < midDepth) {
@@ -85,7 +104,7 @@ vec2 parallaxOcclusionUv(vec2 uv, vec3 tangentViewDirection) {
     }
   }
 
-  return highUv;
+  return tileOffset + highUv;
 }
 
 vec3 normalFromHeight(vec2 uv) {
@@ -134,13 +153,19 @@ float shadowVisibility(vec4 lightClipPos, vec3 N, vec3 L) {
 }
 
 void main() {
-  vec3 N = normalize(inWorldNormal);
+  vec3 N = safeNormalize(inWorldNormal, vec3(0.0, 0.0, 1.0));
   if (!gl_FrontFacing) {
     N = -N;
   }
-  vec3 T = normalize(inWorldTangent.xyz);
-  T = normalize(T - N * dot(N, T));
-  vec3 B = normalize(cross(N, T)) * inWorldTangent.w;
+  vec3 T = safeNormalize(inWorldTangent.xyz, vec3(1.0, 0.0, 0.0));
+  T = safeNormalize(T - N * dot(N, T), vec3(1.0, 0.0, 0.0));
+  vec3 B = cross(N, T);
+  if (dot(B, B) <= 0.000001) {
+    B = vec3(0.0, 1.0, 0.0);
+  } else {
+    B = normalize(B);
+  }
+  B *= inWorldTangent.w;
   mat3 tangentToWorld = mat3(T, B, N);
 
   vec3 L = normalize(ubo.lightDirection.xyz);

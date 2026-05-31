@@ -405,6 +405,11 @@ void Renderer::setMaterialSurfaceParams(MaterialId materialId,
                                              parallaxScale);
 }
 
+void Renderer::setSurfaceDebugEnabled(bool normalMapsEnabled,
+                                      bool parallaxEnabled) {
+  materialGpuStore_.setSurfaceDebugEnabled(normalMapsEnabled, parallaxEnabled);
+}
+
 void Renderer::setUiDrawCallback(
     std::function<void(vk::CommandBuffer)> callback) {
   uiDrawCallback_ = std::move(callback);
@@ -537,7 +542,8 @@ void Renderer::allocateAndWriteFrameDescriptorSets() {
 
 Renderer::FrameResult Renderer::beginFrame(glm::mat4 const &viewProjMatrix,
                                            glm::vec3 const &cameraPosition,
-                                           LightingSettings const &lighting) {
+                                           LightingSettings const &lighting,
+                                           bool shadowPassEnabled) {
   validateSwapChainState();
 
   if (activeFrame_.has_value()) {
@@ -590,14 +596,19 @@ Renderer::FrameResult Renderer::beginFrame(glm::mat4 const &viewProjMatrix,
   commandBuffer.begin(vk::CommandBufferBeginInfo{
       .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
   });
-  beginShadowPass(commandBuffer, frame);
 
   activeFrame_ = ActiveFrameState{
       .frameIndex = frameIndex,
       .imageIndex = imageIndex,
       .acquireResult = acquireResult,
   };
-  activePass_ = ActivePass::eShadow;
+  if (shadowPassEnabled) {
+    beginShadowPass(commandBuffer, frame);
+    activePass_ = ActivePass::eShadow;
+  } else {
+    beginMainPass(commandBuffer, frame, imageIndex, false);
+    activePass_ = ActivePass::eMain;
+  }
 
   return FrameResult::eSuccess;
 }
@@ -629,6 +640,12 @@ void Renderer::drawObject(MeshId meshId, MaterialId materialId,
       .materialTint = materialResource.tint,
       .surfaceParams = materialResource.surfaceParams,
   };
+  if (!materialGpuStore_.normalMapsEnabled()) {
+    pushConstants.surfaceParams.z = 0.0f;
+  }
+  if (!materialGpuStore_.parallaxEnabled()) {
+    pushConstants.surfaceParams.w = 0.0f;
+  }
 
   if (activePass_ == ActivePass::eShadow) {
     commandBuffer.pushConstants<PushConstants>(
@@ -778,7 +795,7 @@ Renderer::FrameResult Renderer::drawFrame(MeshId meshId, MaterialId materialId,
                                           glm::vec3 const &cameraPosition,
                                           LightingSettings const &lighting) {
   FrameResult beginResult =
-      beginFrame(viewProjMatrix, cameraPosition, lighting);
+      beginFrame(viewProjMatrix, cameraPosition, lighting, true);
   if (beginResult != FrameResult::eSuccess) {
     return beginResult;
   }
@@ -1399,20 +1416,23 @@ void Renderer::beginMainPass() {
 
   ActiveFrameState const frameState = *activeFrame_;
   beginMainPass(commandBuffers_[frameState.frameIndex],
-                frames_[frameState.frameIndex], frameState.imageIndex);
+                frames_[frameState.frameIndex], frameState.imageIndex, true);
   activePass_ = ActivePass::eMain;
 }
 
 void Renderer::beginMainPass(vk::raii::CommandBuffer const &commandBuffer,
                              FrameContext const &frame,
-                             std::uint32_t imageIndex) {
-  commandBuffer.endRendering();
+                             std::uint32_t imageIndex,
+                             bool shadowPassEnabled) {
+  if (shadowPassEnabled) {
+    commandBuffer.endRendering();
 
-  transitionShadowImage(commandBuffer, vk::ImageLayout::eDepthReadOnlyOptimal,
-                        vk::PipelineStageFlagBits2::eLateFragmentTests,
-                        vk::AccessFlagBits2::eDepthStencilAttachmentWrite,
-                        vk::PipelineStageFlagBits2::eFragmentShader,
-                        vk::AccessFlagBits2::eShaderSampledRead);
+    transitionShadowImage(commandBuffer, vk::ImageLayout::eDepthReadOnlyOptimal,
+                          vk::PipelineStageFlagBits2::eLateFragmentTests,
+                          vk::AccessFlagBits2::eDepthStencilAttachmentWrite,
+                          vk::PipelineStageFlagBits2::eFragmentShader,
+                          vk::AccessFlagBits2::eShaderSampledRead);
+  }
 
   transitionSwapChainImage(commandBuffer, imageIndex,
                            vk::ImageLayout::eColorAttachmentOptimal,
