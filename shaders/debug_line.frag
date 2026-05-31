@@ -4,6 +4,7 @@ layout(push_constant) uniform PushConstants {
   mat4 transform;
   vec4 materialTint;
   vec4 surfaceParams;
+  vec4 alphaParams;
 } pushConstants;
 
 layout(location = 0) out vec4 outFragColor;

@@ -4,6 +4,8 @@
 #include <memory>
 #include <vector>
 
+#include <imgui.h>
+
 #include "input_state.hpp"
 #include "orbit_camera_controller.hpp"
 #include "scene.hpp"
@@ -36,6 +38,9 @@ private:
   void beginImGuiFrame();
   void drawImGui();
   void cleanupImGui();
+  void clearMaterialPreviewTextures();
+  ImTextureID materialAlbedoPreviewTexture(MaterialId materialId);
+  ImTextureID materialAlphaPreviewTexture(MaterialId materialId);
 
   std::vector<char const *> getRequiredInstanceExtensions();
 
@@ -81,6 +86,9 @@ private:
   std::size_t renderQueueItems_ = 0;
   std::size_t visibleRenderQueueItems_ = 0;
   std::size_t culledRenderQueueItems_ = 0;
+  std::size_t visibleOpaqueItems_ = 0;
+  std::size_t visibleMaskItems_ = 0;
+  std::size_t visibleTransparentItems_ = 0;
   std::size_t frameDrawCalls_ = 0;
   std::size_t shadowDrawCalls_ = 0;
   std::size_t mainDrawCalls_ = 0;
@@ -91,6 +99,8 @@ private:
   std::chrono::steady_clock::time_point animationStartTime_ =
       std::chrono::steady_clock::now();
   std::size_t selectedMaterialIndex_ = 0;
+  std::vector<ImTextureID> materialAlbedoPreviewTextures_;
+  std::vector<ImTextureID> materialAlphaPreviewTextures_;
   float frameTimeMs_ = 0.0f;
   float framesPerSecond_ = 0.0f;
   std::chrono::steady_clock::time_point lastFrameTime_ =

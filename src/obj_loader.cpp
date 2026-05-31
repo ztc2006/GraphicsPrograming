@@ -9,11 +9,16 @@
 #include <iostream>
 #include <limits>
 #include <map>
+#include <memory>
 #include <stdexcept>
+#include <utility>
 
+#include <stb_image.h>
 #include <tiny_obj_loader.h>
 
 namespace {
+constexpr int kAlphaMaskThreshold = 250;
+
 struct MeshBuilder {
   Mesh mesh;
   MaterialId materialId = 0;
@@ -104,6 +109,29 @@ std::string materialAlbedoPath(std::filesystem::path const &objPath,
   return fallbackAlbedoPath;
 }
 
+bool hasTransparentPixels(std::filesystem::path const &path,
+                          int alphaThreshold) {
+  int width = 0;
+  int height = 0;
+  int channels = 0;
+  std::unique_ptr<stbi_uc, decltype(&stbi_image_free)> pixels(
+      stbi_load(path.string().c_str(), &width, &height, &channels,
+                STBI_rgb_alpha),
+      stbi_image_free);
+  if (!pixels || width <= 0 || height <= 0) {
+    return false;
+  }
+
+  std::size_t const pixelCount =
+      static_cast<std::size_t>(width) * static_cast<std::size_t>(height);
+  for (std::size_t index = 0; index < pixelCount; ++index) {
+    if (pixels.get()[index * 4 + 3] < alphaThreshold) {
+      return true;
+    }
+  }
+  return false;
+}
+
 std::vector<Material>
 loadMaterials(std::filesystem::path const &objPath,
               std::vector<tinyobj::material_t> const &objMaterials,
@@ -120,13 +148,15 @@ loadMaterials(std::filesystem::path const &objPath,
   }
 
   for (tinyobj::material_t const &objMaterial : objMaterials) {
-    materials.push_back(Material{
+    Material material{
         .albedoPath = materialAlbedoPath(objPath, objMaterial,
                                          fallbackAlbedoPath),
         .normalPath = optionalMaterialTexturePath(
             objPath, objMaterial, objMaterial.normal_texname, "normal"),
         .heightPath = optionalMaterialTexturePath(
             objPath, objMaterial, objMaterial.bump_texname, "height"),
+        .alphaPath = optionalMaterialTexturePath(
+            objPath, objMaterial, objMaterial.alpha_texname, "alpha mask"),
         .tint =
             {
                 objMaterial.diffuse[0],
@@ -134,7 +164,19 @@ loadMaterials(std::filesystem::path const &objPath,
                 objMaterial.diffuse[2],
                 objMaterial.dissolve,
             },
-    });
+    };
+
+    bool const hasMaskTexture = !material.alphaPath.empty();
+    bool const diffuseHasAlpha =
+        hasTransparentPixels(material.albedoPath, kAlphaMaskThreshold);
+    if (hasMaskTexture || diffuseHasAlpha) {
+      material.alphaMode = AlphaMode::Mask;
+      material.alphaCutoff = 0.5f;
+    } else if (objMaterial.dissolve < 0.999f) {
+      material.alphaMode = AlphaMode::Blend;
+    }
+
+    materials.push_back(std::move(material));
   }
   return materials;
 }

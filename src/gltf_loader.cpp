@@ -751,6 +751,25 @@ std::vector<Material> parseMaterials(JsonValue const &root,
       }
     }
 
+    JsonValue const *alphaMode = jsonMaterial.find("alphaMode");
+    if (alphaMode != nullptr) {
+      std::string const mode = alphaMode->asString("OPAQUE");
+      if (mode == "MASK") {
+        material.alphaMode = AlphaMode::Mask;
+      } else if (mode == "BLEND") {
+        material.alphaMode = AlphaMode::Blend;
+      } else {
+        material.alphaMode = AlphaMode::Opaque;
+      }
+    }
+    if (material.alphaMode == AlphaMode::Mask) {
+      JsonValue const *alphaCutoff = jsonMaterial.find("alphaCutoff");
+      if (alphaCutoff != nullptr) {
+        material.alphaCutoff =
+            static_cast<float>(alphaCutoff->asNumber(material.alphaCutoff));
+      }
+    }
+
     JsonValue const *normalTexture = jsonMaterial.find("normalTexture");
     if (normalTexture != nullptr && normalTexture->find("index") != nullptr) {
       material.normalPath = resolveGltfTexturePath(

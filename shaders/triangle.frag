@@ -3,11 +3,13 @@
 layout(set = 1, binding = 0) uniform sampler2D albedoTexture;
 layout(set = 1, binding = 1) uniform sampler2D normalTexture;
 layout(set = 1, binding = 2) uniform sampler2D heightTexture;
+layout(set = 1, binding = 3) uniform sampler2D alphaMaskTexture;
 
 layout(push_constant) uniform PushConstants {
   mat4 transform;
   vec4 materialTint;
   vec4 surfaceParams;
+  vec4 alphaParams;
 }
 pushConstants;
 
@@ -44,6 +46,11 @@ vec3 safeNormalize(vec3 value, vec3 fallback) {
     return fallback;
   }
   return value * inversesqrt(lengthSquared);
+}
+
+float alphaMaskValue(vec4 alphaTexel) {
+  return max(max(alphaTexel.r, alphaTexel.g),
+             max(alphaTexel.b, alphaTexel.a));
 }
 
 vec2 parallaxOcclusionUv(vec2 uv, vec3 tangentViewDirection) {
@@ -174,6 +181,17 @@ void main() {
   vec2 uv = parallaxOcclusionUv(inUv, tangentViewDirection);
 
   vec4 texel = texture(albedoTexture, uv);
+  vec4 alphaTexel = texture(alphaMaskTexture, uv);
+  float alpha =
+      texel.a * alphaMaskValue(alphaTexel) * pushConstants.materialTint.a;
+  int alphaMode = int(round(pushConstants.alphaParams.x));
+  if (alphaMode == 1 && alpha < pushConstants.alphaParams.y) {
+    discard;
+  }
+  if (alphaMode == 0) {
+    alpha = 1.0;
+  }
+
   vec3 albedo = texel.rgb * inColor * pushConstants.materialTint.rgb;
   if (pushConstants.surfaceParams.z > 0.5) {
     vec3 tangentNormal = texture(normalTexture, uv).xyz * 2.0 - 1.0;
@@ -197,8 +215,7 @@ void main() {
       shadowMode == 0 ? 1.0 : shadowVisibility(inLightClipPos, N, L);
 
   if (shadowMode == 2) {
-    outFragColor =
-        vec4(vec3(visibility), texel.a * pushConstants.materialTint.a);
+    outFragColor = vec4(vec3(visibility), alpha);
     return;
   }
 
@@ -219,5 +236,5 @@ void main() {
              visibility * (albedo * ubo.lightColor.rgb * diffuse +
                            ubo.lightColor.rgb * specular);
 
-  outFragColor = vec4(lit, texel.a * pushConstants.materialTint.a);
+  outFragColor = vec4(lit, alpha);
 }

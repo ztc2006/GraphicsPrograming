@@ -17,6 +17,7 @@ struct PushConstants {
   glm::mat4 transform{1.0f};
   glm::vec4 materialTint{1.0f};
   glm::vec4 surfaceParams{1.0f, 0.04f, 0.0f, 0.0f};
+  glm::vec4 alphaParams{0.0f, 0.5f, 0.0f, 0.0f};
 };
 
 struct FrameUniformBufferObject {
@@ -117,6 +118,8 @@ void Renderer::recreateForSwapChain(SwapChain const &swapChain) {
 
   vk::raii::Pipeline newGraphicsPipeline =
       createGraphicsPipeline(swapChain, newPipelineLayout);
+  vk::raii::Pipeline newTransparentPipeline =
+      createTransparentPipeline(swapChain, newPipelineLayout);
   vk::raii::Pipeline newDebugLinePipeline =
       createDebugLinePipeline(swapChain, newPipelineLayout);
   vk::raii::Pipeline newShadowPipeline =
@@ -139,6 +142,7 @@ void Renderer::recreateForSwapChain(SwapChain const &swapChain) {
   using std::swap;
   swap(pipelineLayout_, newPipelineLayout);
   swap(graphicsPipeline_, newGraphicsPipeline);
+  swap(transparentPipeline_, newTransparentPipeline);
   swap(debugLinePipeline_, newDebugLinePipeline);
   swap(shadowPipeline_, newShadowPipeline);
   swap(renderFinishedSemaphores_, newRenderFinishedSemaphores);
@@ -405,9 +409,26 @@ void Renderer::setMaterialSurfaceParams(MaterialId materialId,
                                              parallaxScale);
 }
 
+void Renderer::setMaterialAlphaParams(MaterialId materialId,
+                                      AlphaMode alphaMode,
+                                      float alphaCutoff) {
+  materialGpuStore_.setMaterialAlphaParams(materialId, alphaMode,
+                                           alphaCutoff);
+}
+
 void Renderer::setSurfaceDebugEnabled(bool normalMapsEnabled,
                                       bool parallaxEnabled) {
   materialGpuStore_.setSurfaceDebugEnabled(normalMapsEnabled, parallaxEnabled);
+}
+
+TextureResources const &
+Renderer::materialAlbedoTexture(MaterialId materialId) const {
+  return materialGpuStore_.material(materialId).albedoTexture;
+}
+
+TextureResources const *Renderer::materialAlphaTexture(MaterialId materialId) const {
+  auto const &material = materialGpuStore_.material(materialId);
+  return material.alphaTexture.has_value() ? &*material.alphaTexture : nullptr;
 }
 
 void Renderer::setUiDrawCallback(
@@ -639,6 +660,7 @@ void Renderer::drawObject(MeshId meshId, MaterialId materialId,
       .transform = modelMatrix,
       .materialTint = materialResource.tint,
       .surfaceParams = materialResource.surfaceParams,
+      .alphaParams = materialResource.alphaParams,
   };
   if (!materialGpuStore_.normalMapsEnabled()) {
     pushConstants.surfaceParams.z = 0.0f;
@@ -648,8 +670,17 @@ void Renderer::drawObject(MeshId meshId, MaterialId materialId,
   }
 
   if (activePass_ == ActivePass::eShadow) {
+    if (materialResource.alphaMode == AlphaMode::Blend) {
+      throw std::runtime_error(
+          "Transparent materials are not supported in the shadow pass.");
+    }
+    commandBuffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics,
+                                     *pipelineLayout_, 1,
+                                     {materialResource.descriptorSet}, {});
     commandBuffer.pushConstants<PushConstants>(
-        *pipelineLayout_, vk::ShaderStageFlagBits::eVertex, 0, pushConstants);
+        *pipelineLayout_,
+        vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment,
+        0, pushConstants);
     commandBuffer.drawIndexed(meshResources.indexCount, 1, 0, 0, 0);
     return;
   }
@@ -658,6 +689,10 @@ void Renderer::drawObject(MeshId meshId, MaterialId materialId,
     throw std::runtime_error("Renderer has no active draw pass.");
   }
 
+  vk::raii::Pipeline const &pipeline =
+      materialResource.alphaMode == AlphaMode::Blend ? transparentPipeline_
+                                                     : graphicsPipeline_;
+  commandBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics, *pipeline);
   commandBuffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics,
                                    *pipelineLayout_, 1,
                                    {materialResource.descriptorSet}, {});
@@ -884,6 +919,11 @@ void Renderer::validateSwapChainState() const {
     throw std::runtime_error("Renderer graphics pipeline is not initialized.");
   }
 
+  if (transparentPipeline_ == nullptr) {
+    throw std::runtime_error(
+        "Renderer transparent pipeline is not initialized.");
+  }
+
   if (shadowPipeline_ == nullptr) {
     throw std::runtime_error("Renderer shadow pipeline is not initialized.");
   }
@@ -1085,6 +1125,132 @@ vk::raii::Pipeline Renderer::createGraphicsPipeline(
                             pipelineCreateInfo);
 }
 
+vk::raii::Pipeline Renderer::createTransparentPipeline(
+    SwapChain const &swapChain,
+    vk::raii::PipelineLayout const &pipelineLayout) const {
+  auto vertCode = readBinaryFile("shaders/triangle.vert.spv");
+  auto fragCode = readBinaryFile("shaders/triangle.frag.spv");
+
+  vk::ShaderModuleCreateInfo vertexShaderCreateInfo{
+      .codeSize = vertCode.size(),
+      .pCode = reinterpret_cast<std::uint32_t const *>(vertCode.data()),
+  };
+  vk::ShaderModuleCreateInfo fragmentShaderCreateInfo{
+      .codeSize = fragCode.size(),
+      .pCode = reinterpret_cast<std::uint32_t const *>(fragCode.data()),
+  };
+
+  vk::raii::ShaderModule vertexShaderModule(device_.logicalDevice(),
+                                            vertexShaderCreateInfo);
+  vk::raii::ShaderModule fragmentShaderModule(device_.logicalDevice(),
+                                              fragmentShaderCreateInfo);
+
+  std::array shaderStages = {
+      vk::PipelineShaderStageCreateInfo{
+          .stage = vk::ShaderStageFlagBits::eVertex,
+          .module = *vertexShaderModule,
+          .pName = "main",
+      },
+      vk::PipelineShaderStageCreateInfo{
+          .stage = vk::ShaderStageFlagBits::eFragment,
+          .module = *fragmentShaderModule,
+          .pName = "main",
+      },
+  };
+
+  auto bindingDescription = Vertex::bindingDescription();
+  auto attributeDescriptions = Vertex::attributeDescriptions();
+
+  vk::PipelineVertexInputStateCreateInfo vertexInputInfo{
+      .vertexBindingDescriptionCount = 1,
+      .pVertexBindingDescriptions = &bindingDescription,
+      .vertexAttributeDescriptionCount =
+          static_cast<std::uint32_t>(attributeDescriptions.size()),
+      .pVertexAttributeDescriptions = attributeDescriptions.data(),
+  };
+  vk::PipelineInputAssemblyStateCreateInfo inputAssembly{
+      .topology = vk::PrimitiveTopology::eTriangleList,
+      .primitiveRestartEnable = false,
+  };
+  vk::PipelineViewportStateCreateInfo viewportState{
+      .viewportCount = 1,
+      .scissorCount = 1,
+  };
+  vk::PipelineRasterizationStateCreateInfo rasterizer{
+      .depthClampEnable = false,
+      .rasterizerDiscardEnable = false,
+      .polygonMode = vk::PolygonMode::eFill,
+      .cullMode = rasterizerDebugSettings_.cullMode,
+      .frontFace = rasterizerDebugSettings_.frontFace,
+      .depthBiasEnable = false,
+      .lineWidth = 1.0f,
+  };
+  vk::PipelineMultisampleStateCreateInfo multisampling{
+      .rasterizationSamples = vk::SampleCountFlagBits::e1,
+      .sampleShadingEnable = false,
+  };
+
+  vk::PipelineColorBlendAttachmentState colorBlendAttachment{
+      .blendEnable = true,
+      .srcColorBlendFactor = vk::BlendFactor::eSrcAlpha,
+      .dstColorBlendFactor = vk::BlendFactor::eOneMinusSrcAlpha,
+      .colorBlendOp = vk::BlendOp::eAdd,
+      .srcAlphaBlendFactor = vk::BlendFactor::eOne,
+      .dstAlphaBlendFactor = vk::BlendFactor::eOneMinusSrcAlpha,
+      .alphaBlendOp = vk::BlendOp::eAdd,
+      .colorWriteMask =
+          vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
+          vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA,
+  };
+  vk::PipelineColorBlendStateCreateInfo colorBlending{
+      .logicOpEnable = false,
+      .attachmentCount = 1,
+      .pAttachments = &colorBlendAttachment,
+  };
+
+  vk::PipelineDepthStencilStateCreateInfo depthStencil{
+      .depthTestEnable = true,
+      .depthWriteEnable = false,
+      .depthCompareOp = vk::CompareOp::eLess,
+      .depthBoundsTestEnable = false,
+      .stencilTestEnable = false,
+  };
+
+  std::array dynamicStates = {
+      vk::DynamicState::eViewport,
+      vk::DynamicState::eScissor,
+  };
+  vk::PipelineDynamicStateCreateInfo dynamicState{
+      .dynamicStateCount = static_cast<std::uint32_t>(dynamicStates.size()),
+      .pDynamicStates = dynamicStates.data(),
+  };
+
+  vk::Format colorAttachmentFormat = swapChain.imageFormat();
+  vk::PipelineRenderingCreateInfo pipelineRenderingCreateInfo{
+      .colorAttachmentCount = 1,
+      .pColorAttachmentFormats = &colorAttachmentFormat,
+      .depthAttachmentFormat = kDepthFormat,
+  };
+
+  vk::GraphicsPipelineCreateInfo pipelineCreateInfo{
+      .pNext = &pipelineRenderingCreateInfo,
+      .stageCount = static_cast<std::uint32_t>(shaderStages.size()),
+      .pStages = shaderStages.data(),
+      .pVertexInputState = &vertexInputInfo,
+      .pInputAssemblyState = &inputAssembly,
+      .pViewportState = &viewportState,
+      .pRasterizationState = &rasterizer,
+      .pMultisampleState = &multisampling,
+      .pDepthStencilState = &depthStencil,
+      .pColorBlendState = &colorBlending,
+      .pDynamicState = &dynamicState,
+      .layout = *pipelineLayout,
+  };
+
+  return vk::raii::Pipeline(device_.logicalDevice(), nullptr,
+                            pipelineCreateInfo);
+}
+
 vk::raii::Pipeline Renderer::createDebugLinePipeline(
     SwapChain const &swapChain,
     vk::raii::PipelineLayout const &pipelineLayout) const {
@@ -1214,19 +1380,33 @@ vk::raii::Pipeline Renderer::createDebugLinePipeline(
 vk::raii::Pipeline Renderer::createShadowPipeline(
     vk::raii::PipelineLayout const &pipelineLayout) const {
   auto vertCode = readBinaryFile("shaders/shadow.vert.spv");
+  auto fragCode = readBinaryFile("shaders/shadow.frag.spv");
 
   vk::ShaderModuleCreateInfo vertexShaderCreateInfo{
       .codeSize = vertCode.size(),
       .pCode = reinterpret_cast<std::uint32_t const *>(vertCode.data()),
   };
+  vk::ShaderModuleCreateInfo fragmentShaderCreateInfo{
+      .codeSize = fragCode.size(),
+      .pCode = reinterpret_cast<std::uint32_t const *>(fragCode.data()),
+  };
 
   vk::raii::ShaderModule vertexShaderModule(device_.logicalDevice(),
                                             vertexShaderCreateInfo);
+  vk::raii::ShaderModule fragmentShaderModule(device_.logicalDevice(),
+                                              fragmentShaderCreateInfo);
 
-  vk::PipelineShaderStageCreateInfo shaderStage{
-      .stage = vk::ShaderStageFlagBits::eVertex,
-      .module = *vertexShaderModule,
-      .pName = "main",
+  std::array shaderStages = {
+      vk::PipelineShaderStageCreateInfo{
+          .stage = vk::ShaderStageFlagBits::eVertex,
+          .module = *vertexShaderModule,
+          .pName = "main",
+      },
+      vk::PipelineShaderStageCreateInfo{
+          .stage = vk::ShaderStageFlagBits::eFragment,
+          .module = *fragmentShaderModule,
+          .pName = "main",
+      },
   };
 
   auto bindingDescription = Vertex::bindingDescription();
@@ -1290,8 +1470,8 @@ vk::raii::Pipeline Renderer::createShadowPipeline(
 
   vk::GraphicsPipelineCreateInfo pipelineCreateInfo{
       .pNext = &pipelineRenderingCreateInfo,
-      .stageCount = 1,
-      .pStages = &shaderStage,
+      .stageCount = static_cast<std::uint32_t>(shaderStages.size()),
+      .pStages = shaderStages.data(),
       .pVertexInputState = &vertexInputInfo,
       .pInputAssemblyState = &inputAssembly,
       .pViewportState = &viewportState,

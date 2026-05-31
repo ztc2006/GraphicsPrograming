@@ -2,6 +2,7 @@
 
 #include "application.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cctype>
 #include <cstring>
@@ -48,12 +49,24 @@ struct RenderQueueItem {
   MaterialId materialId = 0;
   glm::mat4 modelMatrix{1.0f};
   Aabb worldBounds{};
-  bool castsShadow = true;
-  bool opaque = true;
+  float sortDepthSq = 0.0f;
 };
 
 struct Frustum {
   std::array<glm::vec4, 6> planes{};
+};
+
+struct RenderQueueBuckets {
+  std::vector<RenderQueueItem> opaque;
+  std::vector<RenderQueueItem> mask;
+  std::vector<RenderQueueItem> transparent;
+};
+
+struct VisibleRenderQueueBuckets {
+  std::vector<RenderQueueItem> opaque;
+  std::vector<RenderQueueItem> mask;
+  std::vector<RenderQueueItem> transparent;
+  std::size_t culledCount = 0;
 };
 
 std::string lowercase(std::string value) {
@@ -87,9 +100,12 @@ void logLoadedScene(std::filesystem::path const &path,
             << " materials, " << loaded.objects.size() << " objects)\n";
 }
 
-std::vector<RenderQueueItem> buildRenderQueue(Scene const &scene) {
-  std::vector<RenderQueueItem> items;
-  items.reserve(scene.objects.size());
+RenderQueueBuckets buildRenderQueues(Scene const &scene,
+                                     glm::vec3 const &cameraPosition) {
+  RenderQueueBuckets buckets;
+  buckets.opaque.reserve(scene.objects.size());
+  buckets.mask.reserve(scene.objects.size());
+  buckets.transparent.reserve(scene.objects.size());
 
   for (std::size_t objectIndex = 0; objectIndex < scene.objects.size();
        ++objectIndex) {
@@ -101,18 +117,35 @@ std::vector<RenderQueueItem> buildRenderQueue(Scene const &scene) {
       throw std::runtime_error("Scene object material id is out of range.");
     }
 
-    items.push_back({
+    RenderQueueItem item{
         .objectIndex = objectIndex,
         .meshId = object.meshId,
         .materialId = object.materialId,
         .modelMatrix = object.transform.matrix(),
         .worldBounds = object.worldBounds,
-        .castsShadow = true,
-        .opaque = true,
-    });
+    };
+    if (item.worldBounds.valid) {
+      glm::vec3 const center = (item.worldBounds.min + item.worldBounds.max) *
+                               0.5f;
+      glm::vec3 const delta = center - cameraPosition;
+      item.sortDepthSq = glm::dot(delta, delta);
+    }
+
+    Material const &material = scene.materials[object.materialId];
+    switch (material.alphaMode) {
+    case AlphaMode::Opaque:
+      buckets.opaque.push_back(item);
+      break;
+    case AlphaMode::Mask:
+      buckets.mask.push_back(item);
+      break;
+    case AlphaMode::Blend:
+      buckets.transparent.push_back(item);
+      break;
+    }
   }
 
-  return items;
+  return buckets;
 }
 
 glm::vec4 matrixRow(glm::mat4 const &matrix, int row) {
@@ -179,6 +212,34 @@ filterRenderQueueByFrustum(std::vector<RenderQueueItem> const &items,
   }
 
   return visibleItems;
+}
+
+void sortTransparentQueue(std::vector<RenderQueueItem> &items) {
+  std::stable_sort(items.begin(), items.end(),
+                   [](RenderQueueItem const &lhs, RenderQueueItem const &rhs) {
+                     if (lhs.sortDepthSq != rhs.sortDepthSq) {
+                       return lhs.sortDepthSq > rhs.sortDepthSq;
+                     }
+                     return lhs.objectIndex < rhs.objectIndex;
+                   });
+}
+
+VisibleRenderQueueBuckets
+filterVisibleRenderQueues(RenderQueueBuckets const &queues,
+                          Frustum const &frustum) {
+  VisibleRenderQueueBuckets visible{};
+  visible.opaque =
+      filterRenderQueueByFrustum(queues.opaque, frustum, visible.culledCount);
+  std::size_t maskCulled = 0;
+  visible.mask =
+      filterRenderQueueByFrustum(queues.mask, frustum, maskCulled);
+  visible.culledCount += maskCulled;
+  std::size_t transparentCulled = 0;
+  visible.transparent = filterRenderQueueByFrustum(queues.transparent, frustum,
+                                                   transparentCulled);
+  visible.culledCount += transparentCulled;
+  sortTransparentQueue(visible.transparent);
+  return visible;
 }
 
 Aabb emptyBounds() {
@@ -339,16 +400,28 @@ void Application::mainLoop() {
     glm::mat4 viewProjMatrix = camera.viewProj(aspect);
     renderer_->setSurfaceDebugEnabled(normalMapDebugEnabled_,
                                       parallaxDebugEnabled_);
-    std::vector<RenderQueueItem> renderQueue = buildRenderQueue(scene_);
-    std::vector<RenderQueueItem> visibleRenderQueue = renderQueue;
-    renderQueueItems_ = renderQueue.size();
-    culledRenderQueueItems_ = 0;
+    RenderQueueBuckets renderQueues =
+        buildRenderQueues(scene_, camera.position);
+    VisibleRenderQueueBuckets visibleRenderQueues{
+        .opaque = renderQueues.opaque,
+        .mask = renderQueues.mask,
+        .transparent = renderQueues.transparent,
+    };
+    sortTransparentQueue(visibleRenderQueues.transparent);
     if (frustumCullingEnabled_) {
       Frustum const cameraFrustum = extractFrustum(viewProjMatrix);
-      visibleRenderQueue = filterRenderQueueByFrustum(
-          renderQueue, cameraFrustum, culledRenderQueueItems_);
+      visibleRenderQueues = filterVisibleRenderQueues(renderQueues,
+                                                      cameraFrustum);
     }
-    visibleRenderQueueItems_ = visibleRenderQueue.size();
+    renderQueueItems_ = renderQueues.opaque.size() + renderQueues.mask.size() +
+                        renderQueues.transparent.size();
+    visibleRenderQueueItems_ = visibleRenderQueues.opaque.size() +
+                               visibleRenderQueues.mask.size() +
+                               visibleRenderQueues.transparent.size();
+    culledRenderQueueItems_ = visibleRenderQueues.culledCount;
+    visibleOpaqueItems_ = visibleRenderQueues.opaque.size();
+    visibleMaskItems_ = visibleRenderQueues.mask.size();
+    visibleTransparentItems_ = visibleRenderQueues.transparent.size();
     frameDrawCalls_ = 0;
     shadowDrawCalls_ = 0;
     mainDrawCalls_ = 0;
@@ -369,10 +442,12 @@ void Application::mainLoop() {
     }
 
     if (shadowPassEnabled) {
-      for (RenderQueueItem const &item : renderQueue) {
-        if (!item.castsShadow) {
-          continue;
-        }
+      for (RenderQueueItem const &item : renderQueues.opaque) {
+        renderer_->drawObject(item.meshId, item.materialId, item.modelMatrix);
+        ++frameDrawCalls_;
+        ++shadowDrawCalls_;
+      }
+      for (RenderQueueItem const &item : renderQueues.mask) {
         renderer_->drawObject(item.meshId, item.materialId, item.modelMatrix);
         ++frameDrawCalls_;
         ++shadowDrawCalls_;
@@ -381,17 +456,34 @@ void Application::mainLoop() {
       renderer_->beginMainPass();
     }
 
-    for (RenderQueueItem const &item : visibleRenderQueue) {
-      if (!item.opaque) {
-        continue;
-      }
+    for (RenderQueueItem const &item : visibleRenderQueues.opaque) {
+      renderer_->drawObject(item.meshId, item.materialId, item.modelMatrix);
+      ++frameDrawCalls_;
+      ++mainDrawCalls_;
+    }
+    for (RenderQueueItem const &item : visibleRenderQueues.mask) {
+      renderer_->drawObject(item.meshId, item.materialId, item.modelMatrix);
+      ++frameDrawCalls_;
+      ++mainDrawCalls_;
+    }
+    for (RenderQueueItem const &item : visibleRenderQueues.transparent) {
       renderer_->drawObject(item.meshId, item.materialId, item.modelMatrix);
       ++frameDrawCalls_;
       ++mainDrawCalls_;
     }
 
     if (showAabbDebug_) {
-      for (RenderQueueItem const &item : visibleRenderQueue) {
+      for (RenderQueueItem const &item : visibleRenderQueues.opaque) {
+        renderer_->drawAabb(item.worldBounds, {0.1f, 0.95f, 0.65f, 0.95f});
+        ++frameDrawCalls_;
+        ++debugDrawCalls_;
+      }
+      for (RenderQueueItem const &item : visibleRenderQueues.mask) {
+        renderer_->drawAabb(item.worldBounds, {0.1f, 0.95f, 0.65f, 0.95f});
+        ++frameDrawCalls_;
+        ++debugDrawCalls_;
+      }
+      for (RenderQueueItem const &item : visibleRenderQueues.transparent) {
         renderer_->drawAabb(item.worldBounds, {0.1f, 0.95f, 0.65f, 0.95f});
         ++frameDrawCalls_;
         ++debugDrawCalls_;
@@ -613,6 +705,10 @@ void Application::drawImGui() {
       ImGui::Text("Height: %s",
                   material.heightPath.empty() ? "flat default"
                                               : material.heightPath.c_str());
+      ImGui::Text("Alpha: %s",
+                  material.alphaPath.empty() ? "alpha from base color"
+                                             : material.alphaPath.c_str());
+      ImGui::Text("Mode: %s", alphaModeLabel(material.alphaMode));
       if (ImGui::ColorEdit4("Tint", &material.tint.x)) {
         renderer_->setMaterialTint(
             static_cast<MaterialId>(selectedMaterialIndex_), material.tint);
@@ -628,6 +724,42 @@ void Application::drawImGui() {
         renderer_->setMaterialSurfaceParams(
             static_cast<MaterialId>(selectedMaterialIndex_),
             material.normalScale, material.parallaxScale);
+      }
+
+      int alphaMode = static_cast<int>(material.alphaMode);
+      char const *alphaModeLabels[] = {"Opaque", "Mask", "Blend"};
+      bool alphaChanged = false;
+      if (ImGui::Combo("Alpha Mode", &alphaMode, alphaModeLabels, 3)) {
+        material.alphaMode = static_cast<AlphaMode>(alphaMode);
+        alphaChanged = true;
+      }
+      alphaChanged |= ImGui::SliderFloat("Alpha Cutoff", &material.alphaCutoff,
+                                         0.0f, 1.0f, "%.2f");
+      if (alphaChanged) {
+        renderer_->setMaterialAlphaParams(
+            static_cast<MaterialId>(selectedMaterialIndex_), material.alphaMode,
+            material.alphaCutoff);
+      }
+
+      ImGui::Separator();
+      ImGui::TextUnformatted("Preview");
+      ImVec2 const previewSize{128.0f, 128.0f};
+      ImTextureID const albedoPreview =
+          materialAlbedoPreviewTexture(static_cast<MaterialId>(
+              selectedMaterialIndex_));
+      if (albedoPreview != 0) {
+        ImGui::TextUnformatted("Albedo");
+        ImGui::Image(albedoPreview, previewSize);
+      }
+
+      if (renderer_->materialAlphaTexture(
+              static_cast<MaterialId>(selectedMaterialIndex_)) != nullptr) {
+        ImTextureID const alphaPreview = materialAlphaPreviewTexture(
+            static_cast<MaterialId>(selectedMaterialIndex_));
+        if (alphaPreview != 0) {
+          ImGui::TextUnformatted("Alpha Mask");
+          ImGui::Image(alphaPreview, previewSize);
+        }
       }
     }
   }
@@ -649,6 +781,9 @@ void Application::drawImGui() {
     ImGui::Text("Render Queue: %zu", renderQueueItems_);
     ImGui::Text("Visible: %zu", visibleRenderQueueItems_);
     ImGui::Text("Culled: %zu", culledRenderQueueItems_);
+    ImGui::Text("Visible Opaque: %zu", visibleOpaqueItems_);
+    ImGui::Text("Visible Mask: %zu", visibleMaskItems_);
+    ImGui::Text("Visible Transparent: %zu", visibleTransparentItems_);
     ImGui::Text("Meshes: %zu", scene_.meshes.size());
     ImGui::Text("Materials: %zu", scene_.materials.size());
     ImGui::Text("Draw Calls: %zu", frameDrawCalls_);
@@ -699,11 +834,74 @@ void Application::cleanupImGui() {
     return;
   }
 
+  clearMaterialPreviewTextures();
   renderer_->setUiDrawCallback({});
   ImGui_ImplVulkan_Shutdown();
   ImGui_ImplGlfw_Shutdown();
   ImGui::DestroyContext();
   imguiInitialized_ = false;
+}
+
+void Application::clearMaterialPreviewTextures() {
+  for (ImTextureID textureId : materialAlbedoPreviewTextures_) {
+    if (textureId != 0) {
+      ImGui_ImplVulkan_RemoveTexture((VkDescriptorSet)textureId);
+    }
+  }
+  for (ImTextureID textureId : materialAlphaPreviewTextures_) {
+    if (textureId != 0) {
+      ImGui_ImplVulkan_RemoveTexture((VkDescriptorSet)textureId);
+    }
+  }
+  materialAlbedoPreviewTextures_.clear();
+  materialAlphaPreviewTextures_.clear();
+}
+
+ImTextureID Application::materialAlbedoPreviewTexture(MaterialId materialId) {
+  if (!imguiInitialized_ || renderer_ == nullptr ||
+      materialId >= scene_.materials.size()) {
+    return 0;
+  }
+
+  if (materialAlbedoPreviewTextures_.size() != scene_.materials.size()) {
+    clearMaterialPreviewTextures();
+    materialAlbedoPreviewTextures_.resize(scene_.materials.size(), 0);
+    materialAlphaPreviewTextures_.resize(scene_.materials.size(), 0);
+  }
+
+  ImTextureID &cached = materialAlbedoPreviewTextures_[materialId];
+  if (cached == 0) {
+    TextureResources const &texture =
+        renderer_->materialAlbedoTexture(materialId);
+    cached = (ImTextureID)ImGui_ImplVulkan_AddTexture(
+        *texture.imageView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+  }
+  return cached;
+}
+
+ImTextureID Application::materialAlphaPreviewTexture(MaterialId materialId) {
+  if (!imguiInitialized_ || renderer_ == nullptr ||
+      materialId >= scene_.materials.size()) {
+    return 0;
+  }
+
+  if (materialAlphaPreviewTextures_.size() != scene_.materials.size()) {
+    clearMaterialPreviewTextures();
+    materialAlbedoPreviewTextures_.resize(scene_.materials.size(), 0);
+    materialAlphaPreviewTextures_.resize(scene_.materials.size(), 0);
+  }
+
+  ImTextureID &cached = materialAlphaPreviewTextures_[materialId];
+  if (cached == 0) {
+    TextureResources const *texture =
+        renderer_->materialAlphaTexture(materialId);
+    if (texture == nullptr) {
+      return 0;
+    }
+    cached = (ImTextureID)ImGui_ImplVulkan_AddTexture(
+        *texture->imageView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+  }
+  return cached;
 }
 
 void Application::framebufferResizeCallback(GLFWwindow *window, int width,

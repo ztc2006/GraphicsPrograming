@@ -34,7 +34,11 @@ public:
   void setMaterialTint(MaterialId materialId, glm::vec4 const &tint);
   void setMaterialSurfaceParams(MaterialId materialId, float normalScale,
                                 float parallaxScale);
+  void setMaterialAlphaParams(MaterialId materialId, AlphaMode alphaMode,
+                              float alphaCutoff);
   void setSurfaceDebugEnabled(bool normalMapsEnabled, bool parallaxEnabled);
+  TextureResources const &materialAlbedoTexture(MaterialId materialId) const;
+  TextureResources const *materialAlphaTexture(MaterialId materialId) const;
   void setUiDrawCallback(std::function<void(vk::CommandBuffer)> callback);
   RasterizerDebugSettings rasterizerDebugSettings() const {
     return rasterizerDebugSettings_;
@@ -124,6 +128,9 @@ private:
   createGraphicsPipeline(SwapChain const &swapChain,
                          vk::raii::PipelineLayout const &pipelineLayout) const;
   vk::raii::Pipeline
+  createTransparentPipeline(SwapChain const &swapChain,
+                            vk::raii::PipelineLayout const &pipelineLayout) const;
+  vk::raii::Pipeline
   createDebugLinePipeline(SwapChain const &swapChain,
                           vk::raii::PipelineLayout const &pipelineLayout) const;
 
@@ -190,6 +197,7 @@ private:
 
   vk::raii::PipelineLayout pipelineLayout_ = nullptr;
   vk::raii::Pipeline graphicsPipeline_ = nullptr;
+  vk::raii::Pipeline transparentPipeline_ = nullptr;
   vk::raii::Pipeline debugLinePipeline_ = nullptr;
   std::vector<vk::raii::Semaphore> renderFinishedSemaphores_;
   std::vector<vk::ImageLayout> swapChainImageLayouts_;

@@ -24,6 +24,12 @@ MaterialGpuStore::MaterialGpuStore(Device const &device) : device_(device) {
           .descriptorCount = 1,
           .stageFlags = vk::ShaderStageFlagBits::eFragment,
       },
+      vk::DescriptorSetLayoutBinding{
+          .binding = 3,
+          .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+          .descriptorCount = 1,
+          .stageFlags = vk::ShaderStageFlagBits::eFragment,
+      },
   };
 
   vk::DescriptorSetLayoutCreateInfo createInfo{
@@ -37,6 +43,7 @@ MaterialGpuStore::MaterialGpuStore(Device const &device) : device_(device) {
   TextureLoader textureLoader(device_);
   flatNormalTexture_ = textureLoader.createSolidColor({128, 128, 255, 255});
   flatHeightTexture_ = textureLoader.createSolidColor({0, 0, 0, 255});
+  flatAlphaTexture_ = textureLoader.createSolidColor({255, 255, 255, 255});
 }
 
 void MaterialGpuStore::setMaterials(std::vector<Material> const &materials) {
@@ -77,12 +84,22 @@ MaterialGpuStore::createMaterialResources(
     if (!material.heightPath.empty()) {
       resources.heightTexture = textureLoader.createFromFile(material.heightPath);
     }
+    if (!material.alphaPath.empty()) {
+      resources.alphaTexture = textureLoader.createFromFile(material.alphaPath);
+    }
     resources.tint = material.tint;
     resources.surfaceParams = {
         material.normalScale,
         material.parallaxScale,
         material.normalPath.empty() ? 0.0f : 1.0f,
         material.heightPath.empty() ? 0.0f : 1.0f,
+    };
+    resources.alphaMode = material.alphaMode;
+    resources.alphaParams = {
+        static_cast<float>(material.alphaMode),
+        material.alphaCutoff,
+        0.0f,
+        0.0f,
     };
     newMaterials.push_back(std::move(resources));
   }
@@ -111,6 +128,19 @@ void MaterialGpuStore::setMaterialSurfaceParams(MaterialId materialId,
   params.y = parallaxScale;
 }
 
+void MaterialGpuStore::setMaterialAlphaParams(MaterialId materialId,
+                                              AlphaMode alphaMode,
+                                              float alphaCutoff) {
+  if (materialId >= materialGpuResources_.size()) {
+    throw std::runtime_error("Material GPU store material id is out of range.");
+  }
+
+  auto &material = materialGpuResources_[materialId];
+  material.alphaMode = alphaMode;
+  material.alphaParams.x = static_cast<float>(alphaMode);
+  material.alphaParams.y = alphaCutoff;
+}
+
 void MaterialGpuStore::setSurfaceDebugEnabled(bool normalMapsEnabled,
                                               bool parallaxEnabled) {
   normalMapsEnabled_ = normalMapsEnabled;
@@ -121,7 +151,7 @@ vk::raii::DescriptorPool MaterialGpuStore::createMaterialDescriptorPool(
     std::uint32_t materialCount) const {
   vk::DescriptorPoolSize poolSize{
       .type = vk::DescriptorType::eCombinedImageSampler,
-      .descriptorCount = materialCount * 3,
+      .descriptorCount = materialCount * 4,
   };
 
   vk::DescriptorPoolCreateInfo createInfo{
@@ -164,6 +194,9 @@ void MaterialGpuStore::writeMaterialDescriptorSets() {
     TextureResources const &heightTexture =
         material.heightTexture.has_value() ? *material.heightTexture
                                            : flatHeightTexture_;
+    TextureResources const &alphaTexture =
+        material.alphaTexture.has_value() ? *material.alphaTexture
+                                          : flatAlphaTexture_;
     std::array imageInfos = {
         vk::DescriptorImageInfo{
             .sampler = *material.albedoTexture.sampler,
@@ -178,6 +211,11 @@ void MaterialGpuStore::writeMaterialDescriptorSets() {
         vk::DescriptorImageInfo{
             .sampler = *heightTexture.sampler,
             .imageView = *heightTexture.imageView,
+            .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+        },
+        vk::DescriptorImageInfo{
+            .sampler = *alphaTexture.sampler,
+            .imageView = *alphaTexture.imageView,
             .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
         },
     };
@@ -203,6 +241,13 @@ void MaterialGpuStore::writeMaterialDescriptorSets() {
             .descriptorCount = 1,
             .descriptorType = vk::DescriptorType::eCombinedImageSampler,
             .pImageInfo = &imageInfos[2],
+        },
+        vk::WriteDescriptorSet{
+            .dstSet = material.descriptorSet,
+            .dstBinding = 3,
+            .descriptorCount = 1,
+            .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+            .pImageInfo = &imageInfos[3],
         },
     };
 

@@ -15,9 +15,12 @@ public:
     TextureResources albedoTexture;
     std::optional<TextureResources> normalTexture;
     std::optional<TextureResources> heightTexture;
+    std::optional<TextureResources> alphaTexture;
     vk::DescriptorSet descriptorSet = nullptr;
     glm::vec4 tint{1.0f};
     glm::vec4 surfaceParams{1.0f, 0.04f, 0.0f, 0.0f};
+    glm::vec4 alphaParams{0.0f, 0.5f, 0.0f, 0.0f};
+    AlphaMode alphaMode = AlphaMode::Opaque;
   };
 
   explicit MaterialGpuStore(Device const &device);
@@ -26,6 +29,8 @@ public:
   void setMaterialTint(MaterialId materialId, glm::vec4 const &tint);
   void setMaterialSurfaceParams(MaterialId materialId, float normalScale,
                                 float parallaxScale);
+  void setMaterialAlphaParams(MaterialId materialId, AlphaMode alphaMode,
+                              float alphaCutoff);
   void setSurfaceDebugEnabled(bool normalMapsEnabled, bool parallaxEnabled);
 
   vk::DescriptorSetLayout descriptorSetLayout() const {
@@ -52,6 +57,7 @@ private:
   vk::raii::DescriptorPool materialDescriptorPool_ = nullptr;
   TextureResources flatNormalTexture_;
   TextureResources flatHeightTexture_;
+  TextureResources flatAlphaTexture_;
   bool normalMapsEnabled_ = true;
   bool parallaxEnabled_ = true;
   std::vector<MaterialGpuResources> materialGpuResources_;

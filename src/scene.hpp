@@ -13,13 +13,34 @@
 using MeshId = std::uint32_t;
 using MaterialId = std::uint32_t;
 
+enum class AlphaMode : std::uint32_t {
+  Opaque = 0,
+  Mask = 1,
+  Blend = 2,
+};
+
+inline char const *alphaModeLabel(AlphaMode mode) {
+  switch (mode) {
+  case AlphaMode::Opaque:
+    return "Opaque";
+  case AlphaMode::Mask:
+    return "Mask";
+  case AlphaMode::Blend:
+    return "Blend";
+  }
+  return "Opaque";
+}
+
 struct Material {
   std::string albedoPath;
   std::string normalPath;
   std::string heightPath;
+  std::string alphaPath;
   glm::vec4 tint{1.0f};
   float normalScale = 1.0f;
   float parallaxScale = 0.04f;
+  AlphaMode alphaMode = AlphaMode::Opaque;
+  float alphaCutoff = 0.5f;
 };
 
 struct LightingSettings {
