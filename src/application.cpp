@@ -99,51 +99,53 @@ void logImportedScene(std::filesystem::path const &path,
             << " materials, " << loaded.objects.size() << " objects)\n";
 }
 
-RenderQueueBuckets buildRenderQueues(Scene const &scene,
+RenderQueueBuckets buildRenderQueues(SceneEcs const &sceneEcs,
                                      AssetLibrary const &assets,
                                      glm::vec3 const &cameraPosition) {
   RenderQueueBuckets buckets;
-  buckets.opaque.reserve(scene.objects.size());
-  buckets.mask.reserve(scene.objects.size());
-  buckets.transparent.reserve(scene.objects.size());
+  buckets.opaque.reserve(sceneEcs.sceneObjectCount());
+  buckets.mask.reserve(sceneEcs.sceneObjectCount());
+  buckets.transparent.reserve(sceneEcs.sceneObjectCount());
 
-  for (std::size_t objectIndex = 0; objectIndex < scene.objects.size();
-       ++objectIndex) {
-    SceneObject const &object = scene.objects[objectIndex];
-    if (object.meshId >= assets.meshes.size()) {
-      throw std::runtime_error("Scene object mesh id is out of range.");
-    }
-    if (object.materialId >= assets.materials.size()) {
-      throw std::runtime_error("Scene object material id is out of range.");
-    }
+  sceneEcs.forEachSceneObject(
+      [&](std::size_t objectIndex, Entity, TransformComponent const &transform,
+          RenderableComponent const &renderable,
+          BoundsComponent const &bounds) {
+        if (renderable.meshId >= assets.meshes.size()) {
+          throw std::runtime_error("ECS renderable mesh id is out of range.");
+        }
+        if (renderable.materialId >= assets.materials.size()) {
+          throw std::runtime_error(
+              "ECS renderable material id is out of range.");
+        }
 
-    RenderQueueItem item{
-        .objectIndex = objectIndex,
-        .meshId = object.meshId,
-        .materialId = object.materialId,
-        .modelMatrix = object.transform.matrix(),
-        .worldBounds = object.worldBounds,
-    };
-    if (item.worldBounds.valid) {
-      glm::vec3 const center = (item.worldBounds.min + item.worldBounds.max) *
-                               0.5f;
-      glm::vec3 const delta = center - cameraPosition;
-      item.sortDepthSq = glm::dot(delta, delta);
-    }
+        RenderQueueItem item{
+            .objectIndex = objectIndex,
+            .meshId = renderable.meshId,
+            .materialId = renderable.materialId,
+            .modelMatrix = transform.transform.matrix(),
+            .worldBounds = bounds.worldBounds,
+        };
+        if (item.worldBounds.valid) {
+          glm::vec3 const center =
+              (item.worldBounds.min + item.worldBounds.max) * 0.5f;
+          glm::vec3 const delta = center - cameraPosition;
+          item.sortDepthSq = glm::dot(delta, delta);
+        }
 
-    Material const &material = assets.materials[object.materialId];
-    switch (material.alphaMode) {
-    case AlphaMode::Opaque:
-      buckets.opaque.push_back(item);
-      break;
-    case AlphaMode::Mask:
-      buckets.mask.push_back(item);
-      break;
-    case AlphaMode::Blend:
-      buckets.transparent.push_back(item);
-      break;
-    }
-  }
+        Material const &material = assets.materials[renderable.materialId];
+        switch (material.alphaMode) {
+        case AlphaMode::Opaque:
+          buckets.opaque.push_back(item);
+          break;
+        case AlphaMode::Mask:
+          buckets.mask.push_back(item);
+          break;
+        case AlphaMode::Blend:
+          buckets.transparent.push_back(item);
+          break;
+        }
+      });
 
   return buckets;
 }
@@ -351,7 +353,7 @@ void Application::initVulkan() {
       std::make_unique<Device>(instance_, surface_, requiredDeviceExtensions_);
   swapChain_ = std::make_unique<SwapChain>(*device_, surface_, window_);
   renderer_ = std::make_unique<Renderer>(*device_);
-  if (scene_.objects.empty()) {
+  if (sceneEcs_.entityCount() == 0) {
     throw std::runtime_error("Scene has no objects.");
   }
   if (assets_.meshes.empty()) {
@@ -386,7 +388,7 @@ void Application::mainLoop() {
       throw std::runtime_error("Active camera index is out of range.");
     }
 
-    if (scene_.objects.empty()) {
+    if (sceneEcs_.entityCount() == 0) {
       throw std::runtime_error("Scene has no objects.");
     }
 
@@ -401,7 +403,7 @@ void Application::mainLoop() {
     renderer_->setSurfaceDebugEnabled(normalMapDebugEnabled_,
                                       parallaxDebugEnabled_);
     RenderQueueBuckets renderQueues =
-        buildRenderQueues(scene_, assets_, camera.position);
+        buildRenderQueues(sceneEcs_, assets_, camera.position);
     VisibleRenderQueueBuckets visibleRenderQueues{
         .opaque = renderQueues.opaque,
         .mask = renderQueues.mask,
@@ -779,7 +781,11 @@ void Application::drawImGui() {
     ImGui::Checkbox("Parallax Mapping", &parallaxDebugEnabled_);
     ImGui::Checkbox("Frustum Culling", &frustumCullingEnabled_);
     ImGui::Checkbox("Show AABBs", &showAabbDebug_);
-    ImGui::Text("Objects: %zu", scene_.objects.size());
+    ImGui::Text("Objects: %zu", sceneEcs_.entityCount());
+    ImGui::Text("ECS Entities: %zu", sceneEcs_.entityCount());
+    ImGui::Text("ECS Transforms: %zu", sceneEcs_.transformCount());
+    ImGui::Text("ECS Renderables: %zu", sceneEcs_.renderableCount());
+    ImGui::Text("ECS Bounds: %zu", sceneEcs_.boundsCount());
     ImGui::Text("Render Queue: %zu", renderQueueItems_);
     ImGui::Text("Visible: %zu", visibleRenderQueueItems_);
     ImGui::Text("Culled: %zu", culledRenderQueueItems_);
@@ -1113,38 +1119,38 @@ void Application::createSurface() {
 }
 
 void Application::updateScene() {
-  if (animateScene_ && scene_.objects.size() >= 2) {
-    auto const now = std::chrono::steady_clock::now();
-    float const elapsedSeconds =
-        std::chrono::duration<float>(now - animationStartTime_).count();
-    scene_.objects[1].transform.rotation.z =
-        glm::radians(45.0f) * elapsedSeconds;
-  }
+  auto const now = std::chrono::steady_clock::now();
+  float const elapsedSeconds =
+      std::chrono::duration<float>(now - animationStartTime_).count();
 
-  for (SceneObject &object : scene_.objects) {
-    if (object.meshId >= assets_.meshes.size()) {
-      continue;
+  sceneEcs_.forEachSceneObject(
+      [&](std::size_t objectIndex, Entity, TransformComponent &transform,
+          RenderableComponent const &renderable, BoundsComponent &bounds) {
+    if (animateScene_ && objectIndex == 1) {
+      transform.transform.rotation.z = glm::radians(45.0f) * elapsedSeconds;
     }
-    Mesh &mesh = assets_.meshes[object.meshId];
+    if (renderable.meshId >= assets_.meshes.size()) {
+      return;
+    }
+    Mesh &mesh = assets_.meshes[renderable.meshId];
     if (!mesh.localBounds.valid) {
       mesh.localBounds = computeMeshBounds(mesh);
     }
-    object.worldBounds =
-        transformBounds(mesh.localBounds, object.transform.matrix());
-  }
+    bounds.worldBounds =
+        transformBounds(mesh.localBounds, transform.transform.matrix());
+  });
 }
 
 void Application::createScene() {
   assets_.meshes.clear();
   assets_.materials.clear();
-  scene_.objects.clear();
   scene_.cameras.clear();
   animateScene_ = false;
 
   auto finalizeImportedScene = [this](ImportedScene loaded, Camera camera) {
     assets_.meshes = std::move(loaded.meshes);
     assets_.materials = std::move(loaded.materials);
-    scene_.objects = std::move(loaded.objects);
+    sceneEcs_.rebuildFromSceneObjects(loaded.objects);
     scene_.cameras.push_back(camera);
     scene_.activeCameraIndex = 0;
     orbitCameraController_.attach(scene_.cameras[scene_.activeCameraIndex]);
@@ -1266,12 +1272,14 @@ void Application::createScene() {
     return object;
   };
 
-  scene_.objects.push_back(makeObject(-0.25f, 0, 0));
-  scene_.objects.back().transform.translation.z = -0.35f;
-  scene_.objects.push_back(makeObject(0.0f, 1, 1));
-  scene_.objects.back().transform.translation.z = 0.15f;
-  scene_.objects.push_back(makeObject(0.25f, 0, 0));
-  scene_.objects.back().transform.translation.z = -0.15f;
+  std::vector<SceneObject> objects;
+  objects.push_back(makeObject(-0.25f, 0, 0));
+  objects.back().transform.translation.z = -0.35f;
+  objects.push_back(makeObject(0.0f, 1, 1));
+  objects.back().transform.translation.z = 0.15f;
+  objects.push_back(makeObject(0.25f, 0, 0));
+  objects.back().transform.translation.z = -0.15f;
+  sceneEcs_.rebuildFromSceneObjects(objects);
 
   scene_.cameras.push_back(Camera{});
   scene_.activeCameraIndex = 0;

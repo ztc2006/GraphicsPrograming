@@ -11,6 +11,7 @@
 #include "input_state.hpp"
 #include "orbit_camera_controller.hpp"
 #include "scene.hpp"
+#include "scene_ecs.hpp"
 #include "vulkan_include.hpp"
 
 class Device;
@@ -98,6 +99,7 @@ private:
   InputState input_{};
   AssetLibrary assets_{};
   Scene scene_{};
+  SceneEcs sceneEcs_{};
   OrbitCameraController orbitCameraController_{};
   std::chrono::steady_clock::time_point animationStartTime_ =
       std::chrono::steady_clock::now();

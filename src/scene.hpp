@@ -60,7 +60,6 @@ struct LightingSettings {
 };
 
 struct Scene {
-  std::vector<SceneObject> objects;
   std::vector<Camera> cameras;
   std::size_t activeCameraIndex = 0;
   LightingSettings lighting{};

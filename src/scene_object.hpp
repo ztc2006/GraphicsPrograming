@@ -4,6 +4,7 @@
 #include "mesh.hpp"
 #include "transform.hpp"
 
+// Scene instance that references shared AssetLibrary mesh/material data.
 struct SceneObject {
   Transform transform{};
   MeshId meshId = 0;
