@@ -303,8 +303,8 @@ Transform normalizedSceneTransform(Aabb const &bounds) {
 }
 } // namespace
 
-LoadedScene loadStaticObjScene(std::filesystem::path const &path,
-                               std::string fallbackAlbedoPath) {
+ImportedScene loadStaticObjScene(std::filesystem::path const &path,
+                                  std::string fallbackAlbedoPath) {
   tinyobj::attrib_t attrib;
   std::vector<tinyobj::shape_t> shapes;
   std::vector<tinyobj::material_t> objMaterials;
@@ -330,7 +330,7 @@ LoadedScene loadStaticObjScene(std::filesystem::path const &path,
                              path.string());
   }
 
-  LoadedScene result{};
+  ImportedScene result{};
   result.materials = loadMaterials(path, objMaterials, fallbackAlbedoPath);
 
   for (tinyobj::shape_t const &shape : shapes) {

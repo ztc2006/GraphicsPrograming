@@ -3,7 +3,9 @@
 #include <filesystem>
 #include <string>
 
-#include "loaded_scene.hpp"
+#include "imported_scene.hpp"
 
-LoadedScene loadStaticGltfScene(std::filesystem::path const &path,
-                                std::string fallbackAlbedoPath);
+ImportedScene loadStaticGltfScene(std::filesystem::path const &path,
+                                  std::string fallbackAlbedoPath);
+ImportedScene loadStaticGlbScene(std::filesystem::path const &path,
+                                 std::string fallbackAlbedoPath);

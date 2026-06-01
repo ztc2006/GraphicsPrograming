@@ -4,6 +4,7 @@
 
 #include <cstring>
 #include <memory>
+#include <span>
 #include <stb_image.h>
 #include <stdexcept>
 
@@ -22,6 +23,31 @@ TextureResources TextureLoader::createFromFile(std::string const &path) const {
   }
   if (width <= 0 || height <= 0) {
     throw std::runtime_error("Texture has invalid dimensions: " + path);
+  }
+
+  return createFromPixels(pixels.get(), static_cast<std::uint32_t>(width),
+                          static_cast<std::uint32_t>(height));
+}
+
+TextureResources TextureLoader::createFromEncodedBytes(
+    std::span<std::byte const> bytes, std::string const &label) const {
+  int width = 0;
+  int height = 0;
+  int channels = 0;
+
+  auto const *encoded =
+      reinterpret_cast<stbi_uc const *>(bytes.data());
+  std::unique_ptr<stbi_uc, decltype(&stbi_image_free)> pixels(
+      stbi_load_from_memory(encoded, static_cast<int>(bytes.size()), &width,
+                            &height, &channels, STBI_rgb_alpha),
+      stbi_image_free);
+
+  if (!pixels) {
+    throw std::runtime_error("Failed to load texture from memory: " + label +
+                             " (" + stbi_failure_reason() + ")");
+  }
+  if (width <= 0 || height <= 0) {
+    throw std::runtime_error("Memory texture has invalid dimensions: " + label);
   }
 
   return createFromPixels(pixels.get(), static_cast<std::uint32_t>(width),

@@ -3,7 +3,7 @@
 #include <filesystem>
 #include <string>
 
-#include "loaded_scene.hpp"
+#include "imported_scene.hpp"
 
-LoadedScene loadStaticObjScene(std::filesystem::path const &path,
-                               std::string fallbackAlbedoPath);
+ImportedScene loadStaticObjScene(std::filesystem::path const &path,
+                                 std::string fallbackAlbedoPath);

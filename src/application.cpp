@@ -76,8 +76,8 @@ std::string lowercase(std::string value) {
   return value;
 }
 
-LoadedScene loadStaticModelScene(std::filesystem::path const &path,
-                                 std::string const &fallbackAlbedoPath) {
+ImportedScene loadStaticModelScene(std::filesystem::path const &path,
+                                   std::string const &fallbackAlbedoPath) {
   std::string const extension = lowercase(path.extension().string());
   if (extension == ".obj") {
     return loadStaticObjScene(path, fallbackAlbedoPath);
@@ -86,21 +86,21 @@ LoadedScene loadStaticModelScene(std::filesystem::path const &path,
     return loadStaticGltfScene(path, fallbackAlbedoPath);
   }
   if (extension == ".glb") {
-    throw std::runtime_error(
-        "Binary glTF .glb files are not supported yet: " + path.string());
+    return loadStaticGlbScene(path, fallbackAlbedoPath);
   }
   throw std::runtime_error("Unsupported static model asset extension: " +
                            path.string());
 }
 
-void logLoadedScene(std::filesystem::path const &path,
-                    LoadedScene const &loaded) {
+void logImportedScene(std::filesystem::path const &path,
+                      ImportedScene const &loaded) {
   std::cerr << "Loaded static scene: " << path.string() << " ("
             << loaded.meshes.size() << " meshes, " << loaded.materials.size()
             << " materials, " << loaded.objects.size() << " objects)\n";
 }
 
 RenderQueueBuckets buildRenderQueues(Scene const &scene,
+                                     AssetLibrary const &assets,
                                      glm::vec3 const &cameraPosition) {
   RenderQueueBuckets buckets;
   buckets.opaque.reserve(scene.objects.size());
@@ -110,10 +110,10 @@ RenderQueueBuckets buildRenderQueues(Scene const &scene,
   for (std::size_t objectIndex = 0; objectIndex < scene.objects.size();
        ++objectIndex) {
     SceneObject const &object = scene.objects[objectIndex];
-    if (object.meshId >= scene.meshes.size()) {
+    if (object.meshId >= assets.meshes.size()) {
       throw std::runtime_error("Scene object mesh id is out of range.");
     }
-    if (object.materialId >= scene.materials.size()) {
+    if (object.materialId >= assets.materials.size()) {
       throw std::runtime_error("Scene object material id is out of range.");
     }
 
@@ -131,7 +131,7 @@ RenderQueueBuckets buildRenderQueues(Scene const &scene,
       item.sortDepthSq = glm::dot(delta, delta);
     }
 
-    Material const &material = scene.materials[object.materialId];
+    Material const &material = assets.materials[object.materialId];
     switch (material.alphaMode) {
     case AlphaMode::Opaque:
       buckets.opaque.push_back(item);
@@ -354,14 +354,14 @@ void Application::initVulkan() {
   if (scene_.objects.empty()) {
     throw std::runtime_error("Scene has no objects.");
   }
-  if (scene_.meshes.empty()) {
+  if (assets_.meshes.empty()) {
     throw std::runtime_error("Scene has no meshes.");
   }
-  renderer_->setMeshes(scene_.meshes);
-  if (scene_.materials.empty()) {
+  renderer_->setMeshes(assets_.meshes);
+  if (assets_.materials.empty()) {
     throw std::runtime_error("Scene has no materials.");
   }
-  renderer_->setMaterials(scene_.materials);
+  renderer_->setMaterials(assets_.materials);
   renderer_->recreateForSwapChain(*swapChain_);
   initImGui();
 }
@@ -401,7 +401,7 @@ void Application::mainLoop() {
     renderer_->setSurfaceDebugEnabled(normalMapDebugEnabled_,
                                       parallaxDebugEnabled_);
     RenderQueueBuckets renderQueues =
-        buildRenderQueues(scene_, camera.position);
+        buildRenderQueues(scene_, assets_, camera.position);
     VisibleRenderQueueBuckets visibleRenderQueues{
         .opaque = renderQueues.opaque,
         .mask = renderQueues.mask,
@@ -684,21 +684,23 @@ void Application::drawImGui() {
   ImGui::End();
 
   if (ImGui::Begin("Material")) {
-    if (scene_.materials.empty()) {
+    if (assets_.materials.empty()) {
       ImGui::TextUnformatted("No materials");
     } else {
-      if (selectedMaterialIndex_ >= scene_.materials.size()) {
+      if (selectedMaterialIndex_ >= assets_.materials.size()) {
         selectedMaterialIndex_ = 0;
       }
 
       int selectedMaterial = static_cast<int>(selectedMaterialIndex_);
       int const maxMaterialIndex =
-          static_cast<int>(scene_.materials.size() - 1);
+          static_cast<int>(assets_.materials.size() - 1);
       ImGui::SliderInt("Material", &selectedMaterial, 0, maxMaterialIndex);
       selectedMaterialIndex_ = static_cast<std::size_t>(selectedMaterial);
 
-      Material &material = scene_.materials[selectedMaterialIndex_];
-      ImGui::Text("Albedo: %s", material.albedoPath.c_str());
+      Material &material = assets_.materials[selectedMaterialIndex_];
+      ImGui::Text("Albedo: %s", material.albedoPath.empty()
+                                     ? "flat default"
+                                     : material.albedoPath.c_str());
       ImGui::Text("Normal: %s",
                   material.normalPath.empty() ? "flat default"
                                               : material.normalPath.c_str());
@@ -784,8 +786,8 @@ void Application::drawImGui() {
     ImGui::Text("Visible Opaque: %zu", visibleOpaqueItems_);
     ImGui::Text("Visible Mask: %zu", visibleMaskItems_);
     ImGui::Text("Visible Transparent: %zu", visibleTransparentItems_);
-    ImGui::Text("Meshes: %zu", scene_.meshes.size());
-    ImGui::Text("Materials: %zu", scene_.materials.size());
+    ImGui::Text("Meshes: %zu", assets_.meshes.size());
+    ImGui::Text("Materials: %zu", assets_.materials.size());
     ImGui::Text("Draw Calls: %zu", frameDrawCalls_);
     ImGui::Text("Shadow Draws: %zu", shadowDrawCalls_);
     ImGui::Text("Main Draws: %zu", mainDrawCalls_);
@@ -859,14 +861,14 @@ void Application::clearMaterialPreviewTextures() {
 
 ImTextureID Application::materialAlbedoPreviewTexture(MaterialId materialId) {
   if (!imguiInitialized_ || renderer_ == nullptr ||
-      materialId >= scene_.materials.size()) {
+      materialId >= assets_.materials.size()) {
     return 0;
   }
 
-  if (materialAlbedoPreviewTextures_.size() != scene_.materials.size()) {
+  if (materialAlbedoPreviewTextures_.size() != assets_.materials.size()) {
     clearMaterialPreviewTextures();
-    materialAlbedoPreviewTextures_.resize(scene_.materials.size(), 0);
-    materialAlphaPreviewTextures_.resize(scene_.materials.size(), 0);
+    materialAlbedoPreviewTextures_.resize(assets_.materials.size(), 0);
+    materialAlphaPreviewTextures_.resize(assets_.materials.size(), 0);
   }
 
   ImTextureID &cached = materialAlbedoPreviewTextures_[materialId];
@@ -881,14 +883,14 @@ ImTextureID Application::materialAlbedoPreviewTexture(MaterialId materialId) {
 
 ImTextureID Application::materialAlphaPreviewTexture(MaterialId materialId) {
   if (!imguiInitialized_ || renderer_ == nullptr ||
-      materialId >= scene_.materials.size()) {
+      materialId >= assets_.materials.size()) {
     return 0;
   }
 
-  if (materialAlphaPreviewTextures_.size() != scene_.materials.size()) {
+  if (materialAlphaPreviewTextures_.size() != assets_.materials.size()) {
     clearMaterialPreviewTextures();
-    materialAlbedoPreviewTextures_.resize(scene_.materials.size(), 0);
-    materialAlphaPreviewTextures_.resize(scene_.materials.size(), 0);
+    materialAlbedoPreviewTextures_.resize(assets_.materials.size(), 0);
+    materialAlphaPreviewTextures_.resize(assets_.materials.size(), 0);
   }
 
   ImTextureID &cached = materialAlphaPreviewTextures_[materialId];
@@ -1120,10 +1122,10 @@ void Application::updateScene() {
   }
 
   for (SceneObject &object : scene_.objects) {
-    if (object.meshId >= scene_.meshes.size()) {
+    if (object.meshId >= assets_.meshes.size()) {
       continue;
     }
-    Mesh &mesh = scene_.meshes[object.meshId];
+    Mesh &mesh = assets_.meshes[object.meshId];
     if (!mesh.localBounds.valid) {
       mesh.localBounds = computeMeshBounds(mesh);
     }
@@ -1133,15 +1135,15 @@ void Application::updateScene() {
 }
 
 void Application::createScene() {
-  scene_.meshes.clear();
-  scene_.materials.clear();
+  assets_.meshes.clear();
+  assets_.materials.clear();
   scene_.objects.clear();
   scene_.cameras.clear();
   animateScene_ = false;
 
-  auto finalizeLoadedScene = [this](LoadedScene loaded, Camera camera) {
-    scene_.meshes = std::move(loaded.meshes);
-    scene_.materials = std::move(loaded.materials);
+  auto finalizeImportedScene = [this](ImportedScene loaded, Camera camera) {
+    assets_.meshes = std::move(loaded.meshes);
+    assets_.materials = std::move(loaded.materials);
     scene_.objects = std::move(loaded.objects);
     scene_.cameras.push_back(camera);
     scene_.activeCameraIndex = 0;
@@ -1174,10 +1176,11 @@ void Application::createScene() {
                                requestedAsset.path.string());
     }
 
-    LoadedScene loaded = loadStaticModelScene(requestedAsset.path,
-                                             requestedAsset.fallbackAlbedoPath);
-    logLoadedScene(requestedAsset.path, loaded);
-    finalizeLoadedScene(std::move(loaded), requestedAsset.camera);
+    ImportedScene loaded =
+        loadStaticModelScene(requestedAsset.path,
+                             requestedAsset.fallbackAlbedoPath);
+    logImportedScene(requestedAsset.path, loaded);
+    finalizeImportedScene(std::move(loaded), requestedAsset.camera);
     return;
   }
 
@@ -1186,25 +1189,25 @@ void Application::createScene() {
       continue;
     }
 
-    LoadedScene loaded =
+    ImportedScene loaded =
         loadStaticModelScene(asset.path, asset.fallbackAlbedoPath);
-    logLoadedScene(asset.path, loaded);
-    finalizeLoadedScene(std::move(loaded), asset.camera);
+    logImportedScene(asset.path, loaded);
+    finalizeImportedScene(std::move(loaded), asset.camera);
     return;
   }
 
   std::filesystem::path const debugGltfPath{"assets/debug_scene.gltf"};
   if (std::filesystem::exists(debugGltfPath)) {
-    LoadedScene loaded =
+    ImportedScene loaded =
         loadStaticModelScene(debugGltfPath, "texture/image.jpg");
-    logLoadedScene(debugGltfPath, loaded);
-    finalizeLoadedScene(std::move(loaded), Camera{});
+    logImportedScene(debugGltfPath, loaded);
+    finalizeImportedScene(std::move(loaded), Camera{});
     return;
   }
 
   animateScene_ = true;
 
-  scene_.meshes.push_back(Mesh{
+  assets_.meshes.push_back(Mesh{
       .vertices =
           {
               {{-0.5f, -0.5f, 0.0f},
@@ -1227,7 +1230,7 @@ void Application::createScene() {
       .indices = {0, 1, 2, 2, 3, 0},
   });
 
-  scene_.meshes.push_back(Mesh{
+  assets_.meshes.push_back(Mesh{
       .vertices =
           {
               {{0.0f, -0.55f, 0.0f},
@@ -1246,11 +1249,11 @@ void Application::createScene() {
       .indices = {0, 1, 2},
   });
 
-  scene_.materials.push_back(Material{
+  assets_.materials.push_back(Material{
       .albedoPath = "texture/image.jpg",
       .tint = {1.0f, 0.85f, 0.85f, 1.0f},
   });
-  scene_.materials.push_back(Material{
+  assets_.materials.push_back(Material{
       .albedoPath = "texture/smile.png",
       .tint = {0.85f, 1.0f, 0.85f, 1.0f},
   });

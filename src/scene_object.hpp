@@ -1,11 +1,8 @@
 #pragma once
 
+#include "asset_ids.hpp"
 #include "mesh.hpp"
 #include "transform.hpp"
-#include <cstdint>
-
-using MeshId = std::uint32_t;
-using MaterialId = std::uint32_t;
 
 struct SceneObject {
   Transform transform{};

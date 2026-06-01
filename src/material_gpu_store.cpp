@@ -72,13 +72,22 @@ MaterialGpuStore::createMaterialResources(
   TextureLoader textureLoader(device_);
 
   for (Material const &material : materials) {
-    if (material.albedoPath.empty()) {
-      throw std::runtime_error("Material albedo path is empty.");
-    }
-
     MaterialGpuResources resources{};
-    resources.albedoTexture = textureLoader.createFromFile(material.albedoPath);
-    if (!material.normalPath.empty()) {
+    if (!material.albedoBytes.empty()) {
+      resources.albedoTexture =
+          textureLoader.createFromEncodedBytes(material.albedoBytes,
+                                               "material albedo");
+    } else {
+      resources.albedoTexture =
+          material.albedoPath.empty()
+              ? textureLoader.createSolidColor({255, 255, 255, 255})
+              : textureLoader.createFromFile(material.albedoPath);
+    }
+    if (!material.normalBytes.empty()) {
+      resources.normalTexture =
+          textureLoader.createFromEncodedBytes(material.normalBytes,
+                                               "material normal");
+    } else if (!material.normalPath.empty()) {
       resources.normalTexture = textureLoader.createFromFile(material.normalPath);
     }
     if (!material.heightPath.empty()) {
@@ -91,7 +100,8 @@ MaterialGpuStore::createMaterialResources(
     resources.surfaceParams = {
         material.normalScale,
         material.parallaxScale,
-        material.normalPath.empty() ? 0.0f : 1.0f,
+        material.normalPath.empty() && material.normalBytes.empty() ? 0.0f
+                                                                    : 1.0f,
         material.heightPath.empty() ? 0.0f : 1.0f,
     };
     resources.alphaMode = material.alphaMode;

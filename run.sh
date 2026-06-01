@@ -20,6 +20,10 @@ if [[ ! -x "$TARGET" ]]; then
   exit 1
 fi
 
+if [[ -n "${FOOL_ENGINE_SCENE:-}" && "$FOOL_ENGINE_SCENE" != /* ]]; then
+  export FOOL_ENGINE_SCENE="$PROJECT_ROOT/$FOOL_ENGINE_SCENE"
+fi
+
 if [[ "$ACTION" == "debug" ]]; then
   exec gdb "$TARGET"
 else

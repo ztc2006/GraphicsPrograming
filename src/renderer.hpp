@@ -6,6 +6,7 @@
 #include <optional>
 #include <vector>
 
+#include "asset_ids.hpp"
 #include "device.hpp"
 #include "material_gpu_store.hpp"
 #include "mesh.hpp"

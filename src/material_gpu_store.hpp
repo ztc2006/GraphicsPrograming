@@ -5,6 +5,7 @@
 #include <optional>
 #include <vector>
 
+#include "asset_ids.hpp"
 #include "device.hpp"
 #include "scene.hpp"
 #include "texture.hpp"

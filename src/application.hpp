@@ -6,6 +6,8 @@
 
 #include <imgui.h>
 
+#include "asset_ids.hpp"
+#include "asset_library.hpp"
 #include "input_state.hpp"
 #include "orbit_camera_controller.hpp"
 #include "scene.hpp"
@@ -94,6 +96,7 @@ private:
   std::size_t mainDrawCalls_ = 0;
   std::size_t debugDrawCalls_ = 0;
   InputState input_{};
+  AssetLibrary assets_{};
   Scene scene_{};
   OrbitCameraController orbitCameraController_{};
   std::chrono::steady_clock::time_point animationStartTime_ =

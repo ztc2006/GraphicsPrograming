@@ -7,11 +7,7 @@
 
 #include "camera.hpp"
 #include "glm_include.hpp"
-#include "mesh.hpp"
 #include "scene_object.hpp"
-
-using MeshId = std::uint32_t;
-using MaterialId = std::uint32_t;
 
 enum class AlphaMode : std::uint32_t {
   Opaque = 0,
@@ -33,7 +29,9 @@ inline char const *alphaModeLabel(AlphaMode mode) {
 
 struct Material {
   std::string albedoPath;
+  std::vector<std::byte> albedoBytes;
   std::string normalPath;
+  std::vector<std::byte> normalBytes;
   std::string heightPath;
   std::string alphaPath;
   glm::vec4 tint{1.0f};
@@ -62,8 +60,6 @@ struct LightingSettings {
 };
 
 struct Scene {
-  std::vector<Mesh> meshes;
-  std::vector<Material> materials;
   std::vector<SceneObject> objects;
   std::vector<Camera> cameras;
   std::size_t activeCameraIndex = 0;

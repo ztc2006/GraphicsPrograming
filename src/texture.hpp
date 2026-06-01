@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cstdint>
+#include <span>
 #include <string>
 
 #include "device.hpp"
@@ -19,6 +20,8 @@ public:
   explicit TextureLoader(Device const &device) : device_(device) {}
 
   TextureResources createFromFile(std::string const &path) const;
+  TextureResources createFromEncodedBytes(std::span<std::byte const> bytes,
+                                          std::string const &label) const;
   TextureResources
   createSolidColor(std::array<std::uint8_t, 4> const &color) const;
 

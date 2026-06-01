@@ -6,6 +6,8 @@
 #include <cctype>
 #include <charconv>
 #include <cstring>
+#include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -311,6 +313,18 @@ struct PrimitiveRef {
   MaterialId materialId = 0;
 };
 
+struct GlbChunks {
+  std::string json;
+  std::vector<std::byte> binary;
+};
+
+struct GltfImage {
+  std::string uri;
+  std::string name;
+  std::string mimeType;
+  std::optional<std::size_t> bufferView;
+};
+
 std::string lowercase(std::string value) {
   for (char &c : value) {
     c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
@@ -419,6 +433,83 @@ std::vector<std::byte> readBinaryFile(std::filesystem::path const &path) {
   return data;
 }
 
+std::uint32_t readLittleEndianU32(std::span<std::byte const> data,
+                                  std::size_t offset) {
+  if (offset + sizeof(std::uint32_t) > data.size()) {
+    throw std::runtime_error("Unexpected end of GLB file.");
+  }
+  std::uint32_t value = 0;
+  std::memcpy(&value, data.data() + offset, sizeof(value));
+  return value;
+}
+
+GlbChunks readGlbChunks(std::filesystem::path const &path) {
+  std::vector<std::byte> bytes = readBinaryFile(path);
+  std::span<std::byte const> data{bytes.data(), bytes.size()};
+  if (data.size() < 12) {
+    throw std::runtime_error("GLB file is too small: " + path.string());
+  }
+
+  constexpr std::uint32_t kGlbMagic = 0x46546c67;
+  constexpr std::uint32_t kGlbVersion = 2;
+  constexpr std::uint32_t kJsonChunkType = 0x4e4f534a;
+  constexpr std::uint32_t kBinaryChunkType = 0x004e4942;
+
+  std::uint32_t const magic = readLittleEndianU32(data, 0);
+  std::uint32_t const version = readLittleEndianU32(data, 4);
+  std::uint32_t const length = readLittleEndianU32(data, 8);
+  if (magic != kGlbMagic) {
+    throw std::runtime_error("Invalid GLB magic: " + path.string());
+  }
+  if (version != kGlbVersion) {
+    throw std::runtime_error("Only GLB version 2 is supported: " +
+                             path.string());
+  }
+  if (length != data.size()) {
+    throw std::runtime_error("GLB declared length does not match file size: " +
+                             path.string());
+  }
+
+  GlbChunks chunks{};
+  std::size_t offset = 12;
+  while (offset < data.size()) {
+    if (offset + 8 > data.size()) {
+      throw std::runtime_error("Truncated GLB chunk header: " + path.string());
+    }
+    std::uint32_t const chunkLength = readLittleEndianU32(data, offset);
+    std::uint32_t const chunkType = readLittleEndianU32(data, offset + 4);
+    offset += 8;
+    if (offset + chunkLength > data.size()) {
+      throw std::runtime_error("Truncated GLB chunk data: " + path.string());
+    }
+
+    if (chunkType == kJsonChunkType) {
+      if (!chunks.json.empty()) {
+        throw std::runtime_error("GLB contains more than one JSON chunk: " +
+                                 path.string());
+      }
+      chunks.json.assign(reinterpret_cast<char const *>(data.data() + offset),
+                         chunkLength);
+    } else if (chunkType == kBinaryChunkType) {
+      if (!chunks.binary.empty()) {
+        throw std::runtime_error("GLB contains more than one BIN chunk: " +
+                                 path.string());
+      }
+      chunks.binary.assign(data.begin() + static_cast<std::ptrdiff_t>(offset),
+                           data.begin() + static_cast<std::ptrdiff_t>(
+                                              offset + chunkLength));
+    }
+
+    offset += chunkLength;
+  }
+
+  if (chunks.json.empty()) {
+    throw std::runtime_error("GLB is missing the required JSON chunk: " +
+                             path.string());
+  }
+  return chunks;
+}
+
 std::vector<std::byte> decodeBase64(std::string_view encoded) {
   std::array<int, 256> table{};
   table.fill(-1);
@@ -454,8 +545,25 @@ std::vector<std::byte> decodeBase64(std::string_view encoded) {
 }
 
 std::vector<std::byte> loadBuffer(std::filesystem::path const &gltfPath,
-                                  JsonValue const &buffer) {
-  std::string const uri = buffer.at("uri").asString();
+                                  JsonValue const &buffer,
+                                  std::vector<std::byte> const *glbBinary) {
+  JsonValue const *uriValue = buffer.find("uri");
+  if (uriValue == nullptr) {
+    if (glbBinary == nullptr) {
+      throw std::runtime_error("glTF buffer is missing a URI: " +
+                               gltfPath.string());
+    }
+    std::size_t const byteLength =
+        static_cast<std::size_t>(buffer.at("byteLength").asInt());
+    if (byteLength > glbBinary->size()) {
+      throw std::runtime_error("GLB BIN chunk is smaller than buffer length: " +
+                               gltfPath.string());
+    }
+    return {glbBinary->begin(), glbBinary->begin() +
+                                    static_cast<std::ptrdiff_t>(byteLength)};
+  }
+
+  std::string const uri = uriValue->asString();
   std::string_view const dataPrefix = "data:";
   if (uri.starts_with(dataPrefix)) {
     std::string_view const base64Marker = ";base64,";
@@ -634,12 +742,13 @@ std::vector<Accessor> parseAccessors(JsonValue const &root) {
 }
 
 std::vector<std::vector<std::byte>>
-parseBuffers(std::filesystem::path const &path, JsonValue const &root) {
+parseBuffers(std::filesystem::path const &path, JsonValue const &root,
+             std::vector<std::byte> const *glbBinary) {
   std::vector<std::vector<std::byte>> buffers;
   JsonValue const &jsonBuffers = root.at("buffers");
   buffers.reserve(jsonBuffers.arrayValue.size());
   for (JsonValue const &buffer : jsonBuffers.arrayValue) {
-    buffers.push_back(loadBuffer(path, buffer));
+    buffers.push_back(loadBuffer(path, buffer, glbBinary));
   }
   return buffers;
 }
@@ -654,18 +763,30 @@ glm::vec4 parseVec4(JsonValue const *value, glm::vec4 fallback) {
           static_cast<float>(value->arrayValue[3].asNumber())};
 }
 
-std::vector<std::string> parseImageUris(JsonValue const &root) {
-  std::vector<std::string> uris;
-  JsonValue const *images = root.find("images");
-  if (images == nullptr) {
-    return uris;
+std::vector<GltfImage> parseImages(JsonValue const &root) {
+  std::vector<GltfImage> result;
+  JsonValue const *jsonImages = root.find("images");
+  if (jsonImages == nullptr) {
+    return result;
   }
-  uris.reserve(images->arrayValue.size());
-  for (JsonValue const &image : images->arrayValue) {
-    uris.push_back(image.find("uri") != nullptr ? image.at("uri").asString()
-                                                : std::string{});
+  result.reserve(jsonImages->arrayValue.size());
+  for (JsonValue const &image : jsonImages->arrayValue) {
+    result.push_back(GltfImage{
+        .uri = image.find("uri") != nullptr ? image.at("uri").asString()
+                                            : std::string{},
+        .name = image.find("name") != nullptr ? image.at("name").asString()
+                                              : std::string{},
+        .mimeType = image.find("mimeType") != nullptr
+                        ? image.at("mimeType").asString()
+                        : std::string{},
+        .bufferView = image.find("bufferView") != nullptr
+                          ? std::optional<std::size_t>{
+                                static_cast<std::size_t>(
+                                    image.at("bufferView").asInt())}
+                          : std::nullopt,
+    });
   }
-  return uris;
+  return result;
 }
 
 std::vector<int> parseTextureSources(JsonValue const &root) {
@@ -682,8 +803,84 @@ std::vector<int> parseTextureSources(JsonValue const &root) {
   return sources;
 }
 
+bool imageExtensionMatches(std::filesystem::path const &path,
+                           std::string const &mimeType) {
+  std::string const extension = lowercase(path.extension().string());
+  if (mimeType == "image/png") {
+    return extension == ".png";
+  }
+  if (mimeType == "image/jpeg") {
+    return extension == ".jpg" || extension == ".jpeg";
+  }
+  return extension == ".png" || extension == ".jpg" || extension == ".jpeg";
+}
+
+std::string findNamedGltfTexture(std::filesystem::path const &path,
+                                 GltfImage const &image,
+                                 int imageIndex) {
+  if (image.name.empty()) {
+    return {};
+  }
+
+  std::array const textureDirs = {
+      path.parent_path() / "textures",
+      path.parent_path().parent_path() / "textures",
+  };
+  std::string const wantedPrefix =
+      lowercase(image.name + "_" + std::to_string(imageIndex));
+  std::string const fallbackPrefix = lowercase(image.name + "_");
+
+  for (std::filesystem::path const &textureDir : textureDirs) {
+    if (!std::filesystem::exists(textureDir)) {
+      continue;
+    }
+
+    std::filesystem::path fallbackMatch;
+    for (std::filesystem::directory_entry const &entry :
+         std::filesystem::directory_iterator(textureDir)) {
+      if (!entry.is_regular_file() ||
+          !imageExtensionMatches(entry.path(), image.mimeType)) {
+        continue;
+      }
+
+      std::string const filename = lowercase(entry.path().filename().string());
+      if (filename.starts_with(wantedPrefix)) {
+        return entry.path().string();
+      }
+      if (fallbackMatch.empty() && filename.starts_with(fallbackPrefix)) {
+        fallbackMatch = entry.path();
+      }
+    }
+
+    if (!fallbackMatch.empty()) {
+      return fallbackMatch.string();
+    }
+  }
+  return {};
+}
+
+std::vector<std::byte>
+copyImageBufferView(GltfImage const &image,
+                    std::vector<BufferView> const &bufferViews,
+                    std::vector<std::vector<std::byte>> const &buffers) {
+  if (!image.bufferView.has_value()) {
+    return {};
+  }
+
+  BufferView const &view = bufferViews.at(*image.bufferView);
+  std::vector<std::byte> const &buffer = buffers.at(view.buffer);
+  if (view.byteOffset > buffer.size() ||
+      view.byteOffset + view.byteLength > buffer.size()) {
+    throw std::runtime_error("glTF image bufferView points outside buffer.");
+  }
+
+  return {buffer.begin() + static_cast<std::ptrdiff_t>(view.byteOffset),
+          buffer.begin() + static_cast<std::ptrdiff_t>(view.byteOffset +
+                                                       view.byteLength)};
+}
+
 std::string resolveGltfTexturePath(std::filesystem::path const &path,
-                                   std::vector<std::string> const &imageUris,
+                                   std::vector<GltfImage> const &images,
                                    std::vector<int> const &textureSources,
                                    int textureIndex, char const *textureKind) {
   if (textureIndex < 0 ||
@@ -693,13 +890,21 @@ std::string resolveGltfTexturePath(std::filesystem::path const &path,
 
   int const imageIndex = textureSources[textureIndex];
   if (imageIndex < 0 ||
-      static_cast<std::size_t>(imageIndex) >= imageUris.size() ||
-      imageUris[imageIndex].empty()) {
+      static_cast<std::size_t>(imageIndex) >= images.size()) {
+    return {};
+  }
+
+  GltfImage const &image = images[imageIndex];
+  if (image.uri.empty()) {
+    std::string const namedTexture = findNamedGltfTexture(path, image, imageIndex);
+    if (!namedTexture.empty()) {
+      return namedTexture;
+    }
     return {};
   }
 
   std::filesystem::path texturePath =
-      resolveGltfAssetPath(path, imageUris[imageIndex]);
+      resolveGltfAssetPath(path, image.uri);
   if (texturePath.empty()) {
     std::cerr << "glTF " << textureKind
               << " texture uses embedded image data URI; ignoring it\n";
@@ -707,23 +912,43 @@ std::string resolveGltfTexturePath(std::filesystem::path const &path,
   }
   if (!std::filesystem::exists(texturePath)) {
     std::cerr << "glTF " << textureKind
-              << " texture not found: " << imageUris[imageIndex] << '\n';
+              << " texture not found: " << image.uri << '\n';
     return {};
   }
   return texturePath.string();
 }
 
+std::vector<std::byte> resolveGltfTextureBytes(
+    std::vector<GltfImage> const &images, std::vector<int> const &textureSources,
+    std::vector<BufferView> const &bufferViews,
+    std::vector<std::vector<std::byte>> const &buffers, int textureIndex) {
+  if (textureIndex < 0 ||
+      static_cast<std::size_t>(textureIndex) >= textureSources.size()) {
+    return {};
+  }
+
+  int const imageIndex = textureSources[textureIndex];
+  if (imageIndex < 0 ||
+      static_cast<std::size_t>(imageIndex) >= images.size()) {
+    return {};
+  }
+
+  return copyImageBufferView(images[imageIndex], bufferViews, buffers);
+}
+
 std::vector<Material> parseMaterials(JsonValue const &root,
                                      std::filesystem::path const &path,
-                                     std::string fallbackAlbedoPath) {
-  std::vector<std::string> imageUris = parseImageUris(root);
+                                     std::string fallbackAlbedoPath,
+                                     std::vector<BufferView> const &bufferViews,
+                                     std::vector<std::vector<std::byte>> const
+                                         &buffers) {
+  std::vector<GltfImage> images = parseImages(root);
   std::vector<int> textureSources = parseTextureSources(root);
 
   std::vector<Material> materials;
   JsonValue const *jsonMaterials = root.find("materials");
   if (jsonMaterials == nullptr) {
     materials.push_back(Material{
-        .albedoPath = std::move(fallbackAlbedoPath),
         .tint = {1.0f, 1.0f, 1.0f, 1.0f},
     });
     return materials;
@@ -732,7 +957,6 @@ std::vector<Material> parseMaterials(JsonValue const &root,
   materials.reserve(jsonMaterials->arrayValue.size());
   for (JsonValue const &jsonMaterial : jsonMaterials->arrayValue) {
     Material material{
-        .albedoPath = fallbackAlbedoPath,
         .tint = {1.0f, 1.0f, 1.0f, 1.0f},
     };
 
@@ -743,10 +967,14 @@ std::vector<Material> parseMaterials(JsonValue const &root,
       if (baseColorTexture != nullptr &&
           baseColorTexture->find("index") != nullptr) {
         std::string const texturePath = resolveGltfTexturePath(
-            path, imageUris, textureSources,
+            path, images, textureSources,
             baseColorTexture->at("index").asInt(-1), "base color");
         if (!texturePath.empty()) {
           material.albedoPath = texturePath;
+        } else {
+          material.albedoBytes = resolveGltfTextureBytes(
+              images, textureSources, bufferViews, buffers,
+              baseColorTexture->at("index").asInt(-1));
         }
       }
     }
@@ -773,8 +1001,13 @@ std::vector<Material> parseMaterials(JsonValue const &root,
     JsonValue const *normalTexture = jsonMaterial.find("normalTexture");
     if (normalTexture != nullptr && normalTexture->find("index") != nullptr) {
       material.normalPath = resolveGltfTexturePath(
-          path, imageUris, textureSources,
+          path, images, textureSources,
           normalTexture->at("index").asInt(-1), "normal");
+      if (material.normalPath.empty()) {
+        material.normalBytes = resolveGltfTextureBytes(
+            images, textureSources, bufferViews, buffers,
+            normalTexture->at("index").asInt(-1));
+      }
       if (normalTexture->find("scale") != nullptr) {
         material.normalScale =
             static_cast<float>(normalTexture->at("scale").asNumber(1.0));
@@ -967,19 +1200,19 @@ void collectNodeObjects(JsonValue const &nodes, std::size_t nodeIndex,
     }
   }
 }
-} // namespace
 
-LoadedScene loadStaticGltfScene(std::filesystem::path const &path,
-                                std::string fallbackAlbedoPath) {
-  std::string const jsonText = readTextFile(path);
-  JsonValue const root = JsonParser(jsonText).parse();
-
-  std::vector<std::vector<std::byte>> buffers = parseBuffers(path, root);
+ImportedScene loadStaticSceneFromGltfRoot(
+    std::filesystem::path const &path, JsonValue const &root,
+    std::string fallbackAlbedoPath,
+    std::vector<std::byte> const *glbBinary) {
+  std::vector<std::vector<std::byte>> buffers =
+      parseBuffers(path, root, glbBinary);
   std::vector<BufferView> bufferViews = parseBufferViews(root);
   std::vector<Accessor> accessors = parseAccessors(root);
 
-  LoadedScene result{};
-  result.materials = parseMaterials(root, path, std::move(fallbackAlbedoPath));
+  ImportedScene result{};
+  result.materials = parseMaterials(root, path, std::move(fallbackAlbedoPath),
+                                    bufferViews, buffers);
   if (result.materials.empty()) {
     throw std::runtime_error("glTF import produced no materials.");
   }
@@ -1024,4 +1257,21 @@ LoadedScene loadStaticGltfScene(std::filesystem::path const &path,
     throw std::runtime_error("glTF import produced no drawable objects.");
   }
   return result;
+}
+} // namespace
+
+ImportedScene loadStaticGltfScene(std::filesystem::path const &path,
+                                   std::string fallbackAlbedoPath) {
+  std::string const jsonText = readTextFile(path);
+  JsonValue const root = JsonParser(jsonText).parse();
+  return loadStaticSceneFromGltfRoot(path, root, std::move(fallbackAlbedoPath),
+                                     nullptr);
+}
+
+ImportedScene loadStaticGlbScene(std::filesystem::path const &path,
+                                  std::string fallbackAlbedoPath) {
+  GlbChunks const chunks = readGlbChunks(path);
+  JsonValue const root = JsonParser(chunks.json).parse();
+  return loadStaticSceneFromGltfRoot(path, root, std::move(fallbackAlbedoPath),
+                                     &chunks.binary);
 }

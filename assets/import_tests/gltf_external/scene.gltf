@@ -1,0 +1,190 @@
+{
+  "asset": {
+    "version": "2.0",
+    "generator": "GraphicsPrograming external glTF importer test"
+  },
+  "scene": 0,
+  "scenes": [
+    {
+      "nodes": [0]
+    }
+  ],
+  "nodes": [
+    {
+      "name": "Root",
+      "children": [1, 2]
+    },
+    {
+      "name": "LeftInstance",
+      "mesh": 0,
+      "translation": [-0.65, 0.0, -0.2]
+    },
+    {
+      "name": "RightInstance",
+      "mesh": 0,
+      "translation": [0.65, 0.0, 0.1],
+      "rotation": [0.0, 0.0, 0.38268343, 0.92387953]
+    }
+  ],
+  "meshes": [
+    {
+      "name": "TwoPrimitiveMesh",
+      "primitives": [
+        {
+          "attributes": {
+            "POSITION": 0,
+            "NORMAL": 1,
+            "TEXCOORD_0": 2
+          },
+          "indices": 3,
+          "material": 0,
+          "mode": 4
+        },
+        {
+          "attributes": {
+            "POSITION": 4,
+            "NORMAL": 5,
+            "TEXCOORD_0": 6
+          },
+          "indices": 7,
+          "material": 1,
+          "mode": 4
+        }
+      ]
+    }
+  ],
+  "materials": [
+    {
+      "name": "OpaqueTextured",
+      "pbrMetallicRoughness": {
+        "baseColorTexture": {
+          "index": 0
+        },
+        "baseColorFactor": [1.0, 1.0, 1.0, 1.0]
+      }
+    },
+    {
+      "name": "MaskedTextured",
+      "pbrMetallicRoughness": {
+        "baseColorTexture": {
+          "index": 0
+        },
+        "baseColorFactor": [1.0, 1.0, 1.0, 1.0]
+      },
+      "alphaMode": "MASK",
+      "alphaCutoff": 0.5
+    }
+  ],
+  "images": [
+    {
+      "uri": "../../../texture/smile.png"
+    }
+  ],
+  "textures": [
+    {
+      "source": 0
+    }
+  ],
+  "buffers": [
+    {
+      "uri": "scene.bin",
+      "byteLength": 206
+    }
+  ],
+  "bufferViews": [
+    {
+      "buffer": 0,
+      "byteOffset": 0,
+      "byteLength": 36
+    },
+    {
+      "buffer": 0,
+      "byteOffset": 36,
+      "byteLength": 36
+    },
+    {
+      "buffer": 0,
+      "byteOffset": 72,
+      "byteLength": 24
+    },
+    {
+      "buffer": 0,
+      "byteOffset": 96,
+      "byteLength": 6
+    },
+    {
+      "buffer": 0,
+      "byteOffset": 104,
+      "byteLength": 36
+    },
+    {
+      "buffer": 0,
+      "byteOffset": 140,
+      "byteLength": 36
+    },
+    {
+      "buffer": 0,
+      "byteOffset": 176,
+      "byteLength": 24
+    },
+    {
+      "buffer": 0,
+      "byteOffset": 200,
+      "byteLength": 6
+    }
+  ],
+  "accessors": [
+    {
+      "bufferView": 0,
+      "componentType": 5126,
+      "count": 3,
+      "type": "VEC3",
+      "min": [-0.6, -0.4, 0.0],
+      "max": [0.0, 0.5, 0.0]
+    },
+    {
+      "bufferView": 1,
+      "componentType": 5126,
+      "count": 3,
+      "type": "VEC3"
+    },
+    {
+      "bufferView": 2,
+      "componentType": 5126,
+      "count": 3,
+      "type": "VEC2"
+    },
+    {
+      "bufferView": 3,
+      "componentType": 5123,
+      "count": 3,
+      "type": "SCALAR"
+    },
+    {
+      "bufferView": 4,
+      "componentType": 5126,
+      "count": 3,
+      "type": "VEC3",
+      "min": [0.1, -0.4, 0.0],
+      "max": [0.7, 0.5, 0.0]
+    },
+    {
+      "bufferView": 5,
+      "componentType": 5126,
+      "count": 3,
+      "type": "VEC3"
+    },
+    {
+      "bufferView": 6,
+      "componentType": 5126,
+      "count": 3,
+      "type": "VEC2"
+    },
+    {
+      "bufferView": 7,
+      "componentType": 5123,
+      "count": 3,
+      "type": "SCALAR"
+    }
+  ]
+}
