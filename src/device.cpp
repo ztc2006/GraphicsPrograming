@@ -2,6 +2,8 @@
 
 #include "device.hpp"
 
+#include <algorithm>
+#include <cctype>
 #include <cstring>
 #include <ranges>
 #include <set>
@@ -10,11 +12,22 @@
 
 Device::Device(vk::raii::Instance const &instance,
                vk::raii::SurfaceKHR const &surface,
-               std::vector<char const *> requiredDeviceExtensions)
+               std::vector<char const *> requiredDeviceExtensions,
+               std::string preferredGpu, bool debugUtils)
     : instance_(instance), surface_(surface),
-      requiredDeviceExtensions_(std::move(requiredDeviceExtensions)) {
+      requiredDeviceExtensions_(std::move(requiredDeviceExtensions)),
+      preferredGpu_(std::move(preferredGpu)), debugUtils_(debugUtils), gpuAllocator_(*this) {
   pickPhysicalDevice();
   createLogicalDevice();
+  if (debugUtils_) {
+    auto raw = static_cast<VkDevice>(*device_);
+    setName_ = reinterpret_cast<PFN_vkSetDebugUtilsObjectNameEXT>(
+        vkGetDeviceProcAddr(raw, "vkSetDebugUtilsObjectNameEXT"));
+    beginLabel_ = reinterpret_cast<PFN_vkCmdBeginDebugUtilsLabelEXT>(
+        vkGetDeviceProcAddr(raw, "vkCmdBeginDebugUtilsLabelEXT"));
+    endLabel_ = reinterpret_cast<PFN_vkCmdEndDebugUtilsLabelEXT>(
+        vkGetDeviceProcAddr(raw, "vkCmdEndDebugUtilsLabelEXT"));
+  }
 }
 
 vk::raii::Device const &Device::logicalDevice() const { return device_; }
@@ -45,81 +58,24 @@ std::uint32_t Device::presentQueueFamilyIndex() const {
   return queueFamilyIndices_.present;
 }
 
-std::uint32_t Device::findMemoryType(std::uint32_t typeFilter,
-                                     vk::MemoryPropertyFlags properties) const {
-  auto memoryProperties = physicalDevice_.getMemoryProperties();
-
-  for (std::uint32_t index = 0; index < memoryProperties.memoryTypeCount;
-       ++index) {
-    const bool supportsType = (typeFilter & (1u << index)) != 0;
-    const bool supportsProperties =
-        (memoryProperties.memoryTypes[index].propertyFlags & properties) ==
-        properties;
-
-    if (supportsType && supportsProperties) {
-      return index;
-    }
-  }
-  throw std::runtime_error("Failed to find suitable buffer memory type.");
-}
-
-std::pair<vk::raii::Buffer, vk::raii::DeviceMemory>
+Device::BufferResources
 Device::createBuffer(vk::DeviceSize size, vk::BufferUsageFlags usage,
-                     vk::MemoryPropertyFlags properties) const {
-  vk::BufferCreateInfo bufferCreateInfo{
-      .size = size,
-      .usage = usage,
-      .sharingMode = vk::SharingMode::eExclusive,
-  };
-  vk::raii::Buffer buffer(device_, bufferCreateInfo);
-
-  auto memoryRequirements = buffer.getMemoryRequirements();
-  vk::MemoryAllocateInfo allocatioInfo{
-      .allocationSize = memoryRequirements.size,
-      .memoryTypeIndex =
-          findMemoryType(memoryRequirements.memoryTypeBits, properties),
-  };
-  vk::raii::DeviceMemory bufferMemory(device_, allocatioInfo);
-
-  buffer.bindMemory(*bufferMemory, 0);
-  return {std::move(buffer), std::move(bufferMemory)};
+                     vk::MemoryPropertyFlags properties,
+                     ResourceLedger::Scope scope) const {
+  return gpuAllocator_.createBuffer(size, usage, properties, std::move(scope));
 }
 
-void Device::copyBuffer(vk::Buffer sourceBuffer, vk::Buffer destinationBuffer,
-                        vk::DeviceSize size) const {
-  vk::CommandPoolCreateInfo commandCreatePoolInfo{
-      .flags = vk::CommandPoolCreateFlagBits::eTransient,
-      .queueFamilyIndex = graphicsQueueFamilyIndex(),
-  };
-  vk::raii::CommandPool commandPool(device_, commandCreatePoolInfo);
+Device::BufferResources Device::createUploadBuffer(vk::DeviceSize size) const {
+  return gpuAllocator_.createBuffer(size, vk::BufferUsageFlagBits::eTransferSrc,
+      vk::MemoryPropertyFlagBits::eHostVisible,
+      resourceLedger_.scope(ResourceLedger::Domain::Staging), GpuAllocator::Lifetime::Upload);
+}
 
-  vk::CommandBufferAllocateInfo allocateInfo{
-      .commandPool = *commandPool,
-      .level = vk::CommandBufferLevel::ePrimary,
-      .commandBufferCount = 1,
-  };
-  vk::raii::CommandBuffers commandBuffers(device_, allocateInfo);
-  auto const &commandBuffer = commandBuffers.front();
-
-  commandBuffer.begin(vk::CommandBufferBeginInfo{
-      .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
-  });
-
-  vk::BufferCopy copyRegion{
-      .size = size,
-  };
-
-  commandBuffer.copyBuffer(sourceBuffer, destinationBuffer, {copyRegion});
-  commandBuffer.end();
-
-  vk::CommandBuffer rawCommandBuffer = *commandBuffer;
-  vk::SubmitInfo submitInfo{
-      .commandBufferCount = 1,
-      .pCommandBuffers = &rawCommandBuffer,
-  };
-
-  graphicsQueue_.submit({submitInfo}, nullptr);
-  graphicsQueue_.waitIdle();
+GpuImage Device::createImage(vk::ImageCreateInfo const &description,
+                              vk::DeviceSize payloadBytes,
+                              vk::MemoryPropertyFlags properties,
+                              ResourceLedger::Scope scope) const {
+  return gpuAllocator_.createImage(description, payloadBytes, properties, std::move(scope));
 }
 
 Device::QueueFamilyIndices Device::findQueueFamilies(
@@ -195,13 +151,28 @@ bool Device::isDeviceSuitable(
 
 void Device::pickPhysicalDevice() {
   auto physicalDevices = instance_.enumeratePhysicalDevices();
-  auto deviceIt =
-      std::ranges::find_if(physicalDevices, [&](auto const &physicalDevice) {
-        return isDeviceSuitable(physicalDevice);
-      });
+  auto lower = [](std::string s) {
+    std::ranges::transform(s, s.begin(), [](unsigned char c) {
+      return static_cast<char>(std::tolower(c));
+    });
+    return s;
+  };
+  auto matches = [&](auto const &gpu) {
+    return isDeviceSuitable(gpu) &&
+           (preferredGpu_.empty() ||
+            lower(gpu.getProperties().deviceName.data())
+                    .find(lower(preferredGpu_)) != std::string::npos);
+  };
+  auto deviceIt = std::ranges::find_if(physicalDevices, [&](auto const &gpu) {
+    return matches(gpu) && gpu.getProperties().deviceType ==
+                               vk::PhysicalDeviceType::eDiscreteGpu;
+  });
+  if (deviceIt == physicalDevices.end())
+    deviceIt = std::ranges::find_if(physicalDevices, matches);
 
   if (deviceIt == physicalDevices.end()) {
-    throw std::runtime_error("Failed to find a suitable GPU.");
+    throw std::runtime_error(
+        "Failed to find a suitable Vulkan 1.3 GPU matching: " + preferredGpu_);
   }
 
   physicalDevice_ = *deviceIt;
@@ -214,15 +185,14 @@ void Device::createLogicalDevice() {
         "Could not find queue families for graphics and present.");
   }
 
+  auto supported = physicalDevice_.getFeatures2<vk::PhysicalDeviceFeatures2,
+      vk::PhysicalDeviceVulkan12Features>();
+  timelineSemaphoreSupported_ = supported.get<vk::PhysicalDeviceVulkan12Features>().timelineSemaphore;
   vk::StructureChain<vk::PhysicalDeviceFeatures2,
-                     vk::PhysicalDeviceVulkan13Features>
-      featureChain = {
-          {},
-          {
-              .synchronization2 = true,
-              .dynamicRendering = true,
-          },
-      };
+                     vk::PhysicalDeviceVulkan12Features,
+                     vk::PhysicalDeviceVulkan13Features> featureChain = {
+      {}, {.timelineSemaphore = timelineSemaphoreSupported_},
+      {.synchronization2 = true, .dynamicRendering = true}};
 
   float queuePriority = 1.0f;
   std::set<std::uint32_t> uniqueQueueFamilies = {
@@ -253,4 +223,57 @@ void Device::createLogicalDevice() {
   device_ = vk::raii::Device(physicalDevice_, deviceCreateInfo);
   graphicsQueue_ = vk::raii::Queue(device_, queueFamilyIndices_.graphics, 0);
   presentQueue_ = vk::raii::Queue(device_, queueFamilyIndices_.present, 0);
+}
+
+void Device::setObjectName(vk::ObjectType type, std::uint64_t handle,
+                           char const *name) const {
+  if (!setName_)
+    return;
+  VkDebugUtilsObjectNameInfoEXT info{
+      VK_STRUCTURE_TYPE_DEBUG_UTILS_OBJECT_NAME_INFO_EXT};
+  info.objectType = static_cast<VkObjectType>(type);
+  info.objectHandle = handle;
+  info.pObjectName = name;
+  (void)setName_(static_cast<VkDevice>(*device_), &info);
+}
+void Device::beginLabel(vk::CommandBuffer command, char const *name) const {
+  if (!beginLabel_)
+    return;
+  VkDebugUtilsLabelEXT label{VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT};
+  label.pLabelName = name;
+  label.color[0] = 0.2f;
+  label.color[1] = 0.6f;
+  label.color[2] = 0.9f;
+  label.color[3] = 1;
+  beginLabel_(static_cast<VkCommandBuffer>(command), &label);
+}
+void Device::endLabel(vk::CommandBuffer command) const {
+  if (endLabel_)
+    endLabel_(static_cast<VkCommandBuffer>(command));
+}
+bool Device::memoryBudgetSupported() const {
+  auto extensions = physicalDevice_.enumerateDeviceExtensionProperties();
+  return std::ranges::any_of(extensions, [](auto const &e) {
+    return std::strcmp(e.extensionName, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME) ==
+           0;
+  });
+}
+std::pair<std::uint64_t, std::uint64_t> Device::memoryUsageBudget() const {
+  if (!memoryBudgetSupported())
+    return {};
+  auto chain =
+      physicalDevice_
+          .getMemoryProperties2<vk::PhysicalDeviceMemoryProperties2,
+                                vk::PhysicalDeviceMemoryBudgetPropertiesEXT>();
+  auto const &memory =
+      chain.get<vk::PhysicalDeviceMemoryProperties2>().memoryProperties;
+  auto const &budget = chain.get<vk::PhysicalDeviceMemoryBudgetPropertiesEXT>();
+  std::uint64_t usage = 0, available = 0;
+  for (unsigned i = 0; i < memory.memoryHeapCount; ++i) {
+    if (memory.memoryHeaps[i].flags & vk::MemoryHeapFlagBits::eDeviceLocal) {
+      usage += budget.heapUsage[i];
+      available += budget.heapBudget[i];
+    }
+  }
+  return {usage, available};
 }

@@ -3,12 +3,18 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <vector>
 
 #include "asset_ids.hpp"
+#include "asset_library.hpp"
 #include "device.hpp"
+#include "hdr_ibl.hpp"
+#include "hdr_output.hpp"
 #include "material_gpu_store.hpp"
+#include "measurement.hpp"
 #include "mesh.hpp"
 #include "scene.hpp"
 #include "scene_object.hpp"
@@ -16,9 +22,51 @@
 #include "texture.hpp"
 
 class Renderer {
+  friend struct RendererHdrTestAccess;
+  struct MeshGpuResources {
+    Device::BufferResources vertex, index;
+    std::uint32_t indexCount = 0;
+  };
+
 public:
+  // Preparation only records independent resource work; it may run in one
+  // background task while frames render. Candidates must not outlive Renderer.
+  class SceneAssets {
+    friend class Renderer;
+    SceneAssets() = default;
+    Renderer const *owner_ = nullptr;
+    ResourceLedger::Scope resourceScope_;
+    std::vector<MeshGpuResources> meshes_;
+    std::unique_ptr<MaterialGpuStore> materials_;
+    // Destroy command/staging storage before destination resources on fallback.
+    std::unique_ptr<UploadBatch> uploads_;
+
+  public:
+    ~SceneAssets() = default;
+  };
+  using PreparedScene = std::shared_ptr<SceneAssets>;
+
+  struct ResourceStatistics {
+    std::uint64_t sceneCommits = 0;
+    std::uint64_t environmentUploads = 0;
+    std::uint64_t pipelineBuilds = 0;
+    UploadBatch::Statistics lastSceneUpload{};
+    std::uint64_t sceneUploadSubmissions = 0, sceneImageCopies = 0;
+    std::uint64_t sceneUploadFenceWaits = 0, completedFrameId = 0;
+    std::size_t pendingSceneUploads = 0, retiredScenes = 0;
+  };
+  ResourceLedger::Snapshot resourceSnapshot() const {
+    return device_.resourceLedger().snapshot();
+  }
+  ResourceStatistics const &resourceStatistics() const {
+    return resourceStatistics_;
+  }
+
   struct RasterizerDebugSettings {
-    vk::CullModeFlagBits cullMode = vk::CullModeFlagBits::eNone;
+    vk::CullModeFlagBits cullMode = vk::CullModeFlagBits::eBack;
+    // The projection flips Y for Vulkan's positive-height viewport. Imported
+    // glTF/OBJ triangles with outward CCW winding remain CCW in framebuffer
+    // coordinates; marking them CW makes double-sided shading invert normals.
     vk::FrontFace frontFace = vk::FrontFace::eCounterClockwise;
   };
 
@@ -29,9 +77,20 @@ public:
   };
 
   explicit Renderer(Device const &device);
+  Renderer(Renderer const &) = delete;
+  Renderer &operator=(Renderer const &) = delete;
+  Renderer(Renderer &&) = delete;
+  Renderer &operator=(Renderer &&) = delete;
 
-  void setMeshes(std::vector<Mesh> const &meshes);
-  void setMaterials(std::vector<Material> const &materials);
+  PreparedScene prepareScene(AssetLibrary const &assets);
+  // Main thread, outside frame recording. First call submits upload and returns
+  // false; later calls poll and commit when ready. false preserves the candidate.
+  // retireSceneUi runs after old frame users complete, while old assets exist;
+  // it must not throw or reenter Renderer. Commit itself never waits for frames.
+  bool commitScene(PreparedScene &candidate,
+                   std::function<void()> retireSceneUi = {});
+  // Explicit blocking convenience only for cold startup and offline tests.
+  void waitSceneUpload(PreparedScene const &candidate);
   void setMaterialTint(MaterialId materialId, glm::vec4 const &tint);
   void setMaterialSurfaceParams(MaterialId materialId, float normalScale,
                                 float parallaxScale);
@@ -52,6 +111,7 @@ public:
                          bool shadowPassEnabled);
   void drawObject(MeshId meshId, MaterialId materialId,
                   glm::mat4 const &modelMatrix);
+  void drawEnvironment();
   void drawAabb(Aabb const &bounds, glm::vec4 const &color);
 
   FrameResult endFrame();
@@ -63,14 +123,25 @@ public:
                         LightingSettings const &lighting);
   void recreateForSwapChain(SwapChain const &swapChain);
   void beginMainPass();
+  GpuTimings const &gpuTimings() const { return gpuTimings_; }
+  bool gpuTimingSupported() const { return timestampBits_ != 0; }
+  std::uint64_t submittedFrameId() const { return submittedFrameId_; }
+  void collectCompletedWork();
+  struct CpuSyncTimes {
+    double fenceMs = 0, acquireMs = 0, submitMs = 0, presentMs = 0;
+  };
+  CpuSyncTimes const &cpuSyncTimes() const { return cpuSyncTimes_; }
 
 private:
   struct FrameContext {
     vk::raii::Semaphore imageAvailableSemaphore = nullptr;
     vk::raii::Fence inFlightFence = nullptr;
-    vk::raii::Buffer uniformBuffer = nullptr;
-    vk::raii::DeviceMemory uniformBufferMemory = nullptr;
+    Device::BufferResources uniform;
     vk::DescriptorSet descriptorSet = nullptr;
+    vk::raii::QueryPool timestamps = nullptr;
+    std::uint64_t frameId = 0;
+    bool submitted = false;
+    bool shadowEnabled = false, uiEnabled = false;
   };
 
   struct ActiveFrameState {
@@ -79,23 +150,50 @@ private:
     vk::Result acquireResult = vk::Result::eSuccess;
   };
 
-  struct MeshGpuResources {
-    vk::raii::Buffer vertexBuffer = nullptr;
-    vk::raii::DeviceMemory vertexBufferMemory = nullptr;
-    vk::raii::Buffer indexBuffer = nullptr;
-    vk::raii::DeviceMemory indexBufferMemory = nullptr;
-    std::uint32_t indexCount = 0;
-  };
   struct DepthResources {
-    vk::raii::Image image = nullptr;
-    vk::raii::DeviceMemory memory = nullptr;
+    DepthResources() = default;
+    DepthResources(DepthResources const &) = delete;
+    DepthResources &operator=(DepthResources const &) = delete;
+    DepthResources(DepthResources &&) noexcept = default;
+    DepthResources &operator=(DepthResources &&other) noexcept {
+      if (this != &other) {
+        imageView.clear();
+        accounting.reset();
+        storage = std::move(other.storage);
+        accounting = std::move(other.accounting);
+        imageView = std::move(other.imageView);
+        layout = other.layout;
+      }
+      return *this;
+    }
+    ResourceLedger::Lease accounting;
+    GpuImage storage;
     vk::raii::ImageView imageView = nullptr;
     vk::ImageLayout layout = vk::ImageLayout::eUndefined;
   };
 
   struct ShadowResources {
-    vk::raii::Image image = nullptr;
-    vk::raii::DeviceMemory memory = nullptr;
+    ShadowResources() = default;
+    ShadowResources(ShadowResources const &) = delete;
+    ShadowResources &operator=(ShadowResources const &) = delete;
+    ShadowResources(ShadowResources &&) noexcept = default;
+    ShadowResources &operator=(ShadowResources &&other) noexcept {
+      if (this != &other) {
+        sampler.clear();
+        debugSampler.clear();
+        imageView.clear();
+        accounting.reset();
+        storage = std::move(other.storage);
+        accounting = std::move(other.accounting);
+        imageView = std::move(other.imageView);
+        sampler = std::move(other.sampler);
+        debugSampler = std::move(other.debugSampler);
+        layout = other.layout;
+      }
+      return *this;
+    }
+    ResourceLedger::Lease accounting;
+    GpuImage storage;
     vk::raii::ImageView imageView = nullptr;
     vk::raii::Sampler sampler = nullptr;
     vk::raii::Sampler debugSampler = nullptr;
@@ -113,9 +211,17 @@ private:
 
   static std::vector<char> readBinaryFile(char const *path);
 
+  void collectFrameTimings(FrameContext &frame);
+  void timestamp(vk::raii::CommandBuffer const &command, std::uint32_t query);
+  unsigned timestampBits_ = 0;
+  double timestampPeriod_ = 0;
+  GpuTimings gpuTimings_{};
+  CpuSyncTimes cpuSyncTimes_{};
+  std::uint64_t submittedFrameId_ = 0;
   void createPersistentResources();
   void createFrameResources();
-  MeshGpuResources createGeometryResources(Mesh const &mesh);
+  MeshGpuResources createGeometryResources(Mesh const &mesh, UploadBatch &uploads,
+      ResourceLedger::Scope scope = {});
   void createCommandBuffers();
   void createCommandPool();
   void updateFrameUniformBuffer(FrameContext &frame,
@@ -127,13 +233,18 @@ private:
   void validateSwapChainState() const;
   vk::raii::Pipeline
   createGraphicsPipeline(SwapChain const &swapChain,
-                         vk::raii::PipelineLayout const &pipelineLayout) const;
+                         vk::raii::PipelineLayout const &pipelineLayout,
+                         vk::CullModeFlagBits cullMode) const;
   vk::raii::Pipeline
   createTransparentPipeline(SwapChain const &swapChain,
-                            vk::raii::PipelineLayout const &pipelineLayout) const;
+                            vk::raii::PipelineLayout const &pipelineLayout,
+                            vk::CullModeFlagBits cullMode) const;
   vk::raii::Pipeline
   createDebugLinePipeline(SwapChain const &swapChain,
                           vk::raii::PipelineLayout const &pipelineLayout) const;
+  vk::raii::Pipeline createEnvironmentPipeline(
+      SwapChain const &swapChain,
+      vk::raii::PipelineLayout const &pipelineLayout) const;
 
   void endCommandBuffer(vk::raii::CommandBuffer const &commandBuffer,
                         std::uint32_t imageIndex);
@@ -162,7 +273,8 @@ private:
 
   ShadowResources createShadowResources() const;
   vk::raii::Pipeline
-  createShadowPipeline(vk::raii::PipelineLayout const &pipelineLayout) const;
+  createShadowPipeline(vk::raii::PipelineLayout const &pipelineLayout,
+                       vk::CullModeFlagBits cullMode) const;
   void beginShadowPass(vk::raii::CommandBuffer const &commandBuffer,
                        FrameContext const &frame);
   void beginMainPass(vk::raii::CommandBuffer const &commandBuffer,
@@ -177,14 +289,25 @@ private:
 
 private:
   DepthResources depthResources_{};
+  std::unique_ptr<HdrOutput> hdrOutput_;
+  DisplaySettings displaySettings_;
 
   ShadowResources shadowResources_{};
   vk::raii::Pipeline shadowPipeline_ = nullptr;
+  vk::raii::Pipeline doubleSidedShadowPipeline_ = nullptr;
   MeshGpuResources debugAabbLineResources_{};
   ActivePass activePass_ = ActivePass::eNone;
 
   Device const &device_;
-  MaterialGpuStore materialGpuStore_;
+  vk::raii::DescriptorSetLayout materialDescriptorSetLayout_ = nullptr;
+  MaterialGpuStore &materials() const;
+  TextureCache textureCache_;
+  std::mutex preparationMutex_;
+  void submitSceneUpload(PreparedScene const &candidate);
+  void validateSceneCandidate(PreparedScene const &candidate) const;
+  ResourceStatistics resourceStatistics_{};
+  bool normalMapsEnabled_ = true;
+  bool parallaxEnabled_ = true;
   SwapChain const *swapChain_ = nullptr;
 
   vk::raii::CommandPool commandPool_ = nullptr;
@@ -194,16 +317,29 @@ private:
   std::optional<ActiveFrameState> activeFrame_;
 
   vk::raii::DescriptorSetLayout frameDescriptorSetLayout_ = nullptr;
+  ResourceLedger::Lease frameDescriptorAccounting_;
   vk::raii::DescriptorPool frameDescriptorPool_ = nullptr;
 
   vk::raii::PipelineLayout pipelineLayout_ = nullptr;
   vk::raii::Pipeline graphicsPipeline_ = nullptr;
+  vk::raii::Pipeline doubleSidedGraphicsPipeline_ = nullptr;
   vk::raii::Pipeline transparentPipeline_ = nullptr;
+  vk::raii::Pipeline doubleSidedTransparentPipeline_ = nullptr;
   vk::raii::Pipeline debugLinePipeline_ = nullptr;
+  vk::raii::Pipeline environmentPipeline_ = nullptr;
+  TextureResources environmentTexture_{};
+  EnvironmentSh environmentSh_{};
   std::vector<vk::raii::Semaphore> renderFinishedSemaphores_;
   std::vector<vk::ImageLayout> swapChainImageLayouts_;
   std::vector<vk::Fence> imagesInFlight_;
-  std::vector<MeshGpuResources> meshGpuResources_;
+  PreparedScene sceneAssets_;
+  std::vector<PreparedScene> pendingSceneUploads_;
+  struct RetiredScene {
+    std::uint64_t lastFrame = 0;
+    PreparedScene assets;
+    std::function<void()> releaseUi;
+  };
+  std::vector<RetiredScene> retiredScenes_;
   std::function<void(vk::CommandBuffer)> uiDrawCallback_;
   RasterizerDebugSettings rasterizerDebugSettings_{};
 };

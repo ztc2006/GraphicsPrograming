@@ -1,0 +1,3 @@
+#pragma once
+
+#define VULKAN_SOURCE_SHA256 "@BASELINE_SOURCE_HASH@"

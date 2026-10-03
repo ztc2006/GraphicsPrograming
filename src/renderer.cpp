@@ -2,6 +2,9 @@
 
 #include "renderer.hpp"
 
+#include "hdr_image.hpp"
+#include "material_pipeline.hpp"
+
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -29,6 +32,9 @@ struct FrameUniformBufferObject {
   glm::vec4 lightingParams{1.0f, 0.35f, 32.0f, 0.0f};
   glm::mat4 lightViewProj{1.0f};
   glm::vec4 shadowParams{0.0025f, 0.0007f, 1.0f, 1.0f};
+  glm::mat4 inverseViewProj{1.0f};
+  glm::vec4 environmentParams{1.0f, 0.0f, 0.0f, 0.0f};
+  std::array<glm::vec4, 9> environmentSh{};
 };
 
 glm::mat4 computeLightViewProj(glm::vec3 direction,
@@ -38,7 +44,7 @@ glm::mat4 computeLightViewProj(glm::vec3 direction,
   }
 
   glm::vec3 const lightDir = glm::normalize(direction);
-  glm::vec3 const target{0.0f};
+  glm::vec3 const target = lighting.shadowTarget;
   float const lightDistance = std::max(lighting.shadowLightDistance, 0.1f);
   glm::vec3 const eye = target + lightDir * lightDistance;
   glm::vec3 up{0.0f, 1.0f, 0.0f};
@@ -83,7 +89,10 @@ Mesh makeUnitAabbLineMesh() {
 } // namespace
 
 Renderer::Renderer(Device const &device)
-    : device_(device), materialGpuStore_(device) {
+    : device_(device),
+      materialDescriptorSetLayout_(
+          MaterialGpuStore::createDescriptorSetLayout(device)),
+      textureCache_(device) {
   createPersistentResources();
 }
 
@@ -104,7 +113,7 @@ void Renderer::recreateForSwapChain(SwapChain const &swapChain) {
 
   std::array layouts = {
       *frameDescriptorSetLayout_,
-      materialGpuStore_.descriptorSetLayout(),
+      *materialDescriptorSetLayout_,
   };
 
   vk::PipelineLayoutCreateInfo pipelineLayoutCreateInfo{
@@ -116,14 +125,23 @@ void Renderer::recreateForSwapChain(SwapChain const &swapChain) {
   vk::raii::PipelineLayout newPipelineLayout(device_.logicalDevice(),
                                              pipelineLayoutCreateInfo);
 
-  vk::raii::Pipeline newGraphicsPipeline =
-      createGraphicsPipeline(swapChain, newPipelineLayout);
-  vk::raii::Pipeline newTransparentPipeline =
-      createTransparentPipeline(swapChain, newPipelineLayout);
+  vk::raii::Pipeline newGraphicsPipeline = createGraphicsPipeline(
+      swapChain, newPipelineLayout, rasterizerDebugSettings_.cullMode);
+  vk::raii::Pipeline newDoubleSidedGraphicsPipeline = createGraphicsPipeline(
+      swapChain, newPipelineLayout, vk::CullModeFlagBits::eNone);
+  vk::raii::Pipeline newTransparentPipeline = createTransparentPipeline(
+      swapChain, newPipelineLayout, rasterizerDebugSettings_.cullMode);
+  vk::raii::Pipeline newDoubleSidedTransparentPipeline =
+      createTransparentPipeline(swapChain, newPipelineLayout,
+                                vk::CullModeFlagBits::eNone);
   vk::raii::Pipeline newDebugLinePipeline =
       createDebugLinePipeline(swapChain, newPipelineLayout);
-  vk::raii::Pipeline newShadowPipeline =
-      createShadowPipeline(newPipelineLayout);
+  vk::raii::Pipeline newEnvironmentPipeline =
+      createEnvironmentPipeline(swapChain, newPipelineLayout);
+  vk::raii::Pipeline newShadowPipeline = createShadowPipeline(
+      newPipelineLayout, rasterizerDebugSettings_.cullMode);
+  vk::raii::Pipeline newDoubleSidedShadowPipeline =
+      createShadowPipeline(newPipelineLayout, vk::CullModeFlagBits::eNone);
 
   std::vector<vk::raii::Semaphore> newRenderFinishedSemaphores;
   newRenderFinishedSemaphores.reserve(swapChain.images().size());
@@ -138,94 +156,100 @@ void Renderer::recreateForSwapChain(SwapChain const &swapChain) {
                                            vk::Fence{});
   SwapChain const *newSwapChain = &swapChain;
   DepthResources newDepthResource = createDepthResources(swapChain);
+  auto newHdrOutput = std::make_unique<HdrOutput>(device_, swapChain.extent(), swapChain.imageFormat());
 
   using std::swap;
   swap(pipelineLayout_, newPipelineLayout);
   swap(graphicsPipeline_, newGraphicsPipeline);
+  swap(doubleSidedGraphicsPipeline_, newDoubleSidedGraphicsPipeline);
   swap(transparentPipeline_, newTransparentPipeline);
+  swap(doubleSidedTransparentPipeline_, newDoubleSidedTransparentPipeline);
   swap(debugLinePipeline_, newDebugLinePipeline);
+  swap(environmentPipeline_, newEnvironmentPipeline);
   swap(shadowPipeline_, newShadowPipeline);
+  swap(doubleSidedShadowPipeline_, newDoubleSidedShadowPipeline);
   swap(renderFinishedSemaphores_, newRenderFinishedSemaphores);
   swap(swapChainImageLayouts_, newSwapChainImageLayouts);
   swap(imagesInFlight_, newImagesInFlight);
   swap(swapChain_, newSwapChain);
   swap(depthResources_, newDepthResource);
+  swap(hdrOutput_, newHdrOutput);
   currentFrame_ = 0;
   activeFrame_.reset();
   activePass_ = ActivePass::eNone;
+  resourceStatistics_.pipelineBuilds += 9;
 }
 
 void Renderer::createPersistentResources() {
   createCommandPool();
   createFrameResources();
-  debugAabbLineResources_ = createGeometryResources(makeUnitAabbLineMesh());
+  UploadBatch debugUpload(device_);
+  debugAabbLineResources_ = createGeometryResources(makeUnitAabbLineMesh(), debugUpload);
+  debugUpload.finish();
   shadowResources_ = createShadowResources();
+  HdrImage const environment =
+      loadHdrImage("assets/environments/environment.hdr");
+  environmentSh_ = projectEquirectangularToSh(environment);
+  environmentTexture_ = TextureLoader(device_, device_.resourceLedger().scope(
+      ResourceLedger::Domain::Persistent)).createFromHdrPixels(
+      environment.rgba, environment.width, environment.height);
+  ++resourceStatistics_.environmentUploads;
   createFrameDescriptorSetLayout();
   createFrameDescriptorPool();
   allocateAndWriteFrameDescriptorSets();
   createCommandBuffers();
+  device_.nameObject(*shadowResources_.storage.image, "Directional shadow depth");
+  device_.nameObject(environmentTexture_.image(), "HDR environment");
+  for (auto const &command : commandBuffers_)
+    device_.nameObject(*command, "Frame command buffer");
 }
 
 void Renderer::createFrameResources() {
+  auto properties = device_.physicalDevice().getProperties();
+  timestampPeriod_ = properties.limits.timestampPeriod;
+  timestampBits_ =
+      device_.physicalDevice()
+          .getQueueFamilyProperties()[device_.graphicsQueueFamilyIndex()]
+          .timestampValidBits;
   frames_.clear();
   frames_.reserve(kFramesInFlight);
 
   for (std::uint32_t index = 0; index < kFramesInFlight; ++index) {
     FrameContext frame{};
+    if (timestampBits_) {
+      frame.timestamps = vk::raii::QueryPool(
+          device_.logicalDevice(),
+          vk::QueryPoolCreateInfo{.queryType = vk::QueryType::eTimestamp,
+                                  .queryCount = 10});
+      device_.nameObject(*frame.timestamps, "Frame GPU timestamps");
+    }
     frame.imageAvailableSemaphore =
         vk::raii::Semaphore(device_.logicalDevice(), vk::SemaphoreCreateInfo{});
     frame.inFlightFence = vk::raii::Fence(
         device_.logicalDevice(),
         vk::FenceCreateInfo{.flags = vk::FenceCreateFlagBits::eSignaled});
 
-    auto [uniformBuffer, uniformBufferMemory] =
-        device_.createBuffer(sizeof(FrameUniformBufferObject),
-                             vk::BufferUsageFlagBits::eUniformBuffer,
-                             vk::MemoryPropertyFlagBits::eHostCoherent |
-                                 vk::MemoryPropertyFlagBits::eHostVisible);
-
-    frame.uniformBuffer = std::move(uniformBuffer);
-    frame.uniformBufferMemory = std::move(uniformBufferMemory);
+    frame.uniform = device_.createBuffer(
+        sizeof(FrameUniformBufferObject), vk::BufferUsageFlagBits::eUniformBuffer,
+        vk::MemoryPropertyFlagBits::eHostVisible);
     frames_.push_back(std::move(frame));
   }
 }
 
-Renderer::MeshGpuResources Renderer::createGeometryResources(Mesh const &mesh) {
-  auto uploadVectorToDeviceLocalBuffer =
-      [this]<typename T>(std::vector<T> const &sourceData,
-                         vk::BufferUsageFlags finalUsage)
-      -> std::pair<vk::raii::Buffer, vk::raii::DeviceMemory> {
-    vk::DeviceSize const bufferSize = sizeof(T) * sourceData.size();
-
-    auto [stagingBuffer, stagingMemory] =
-        device_.createBuffer(bufferSize, vk::BufferUsageFlagBits::eTransferSrc,
-                             vk::MemoryPropertyFlagBits::eHostVisible |
-                                 vk::MemoryPropertyFlagBits::eHostCoherent);
-
-    void *mappedMemory = stagingMemory.mapMemory(0, bufferSize);
-    std::memcpy(mappedMemory, sourceData.data(),
-                static_cast<std::size_t>(bufferSize));
-    stagingMemory.unmapMemory();
-
-    auto [deviceBuffer, deviceMemory] = device_.createBuffer(
-        bufferSize, vk::BufferUsageFlagBits::eTransferDst | finalUsage,
-        vk::MemoryPropertyFlagBits::eDeviceLocal);
-
-    device_.copyBuffer(*stagingBuffer, *deviceBuffer, bufferSize);
-    return {std::move(deviceBuffer), std::move(deviceMemory)};
+Renderer::MeshGpuResources Renderer::createGeometryResources(
+    Mesh const &mesh, UploadBatch &uploads, ResourceLedger::Scope scope) {
+  auto upload = [this, &uploads, &scope]<typename T>(std::vector<T> const &data,
+                                                   vk::BufferUsageFlags usage) {
+    auto bytes = std::as_bytes(std::span(data));
+    auto resources = device_.createBuffer(bytes.size_bytes(),
+        vk::BufferUsageFlagBits::eTransferDst | usage,
+        vk::MemoryPropertyFlagBits::eDeviceLocal, scope);
+    uploads.copyBuffer(bytes, *resources.buffer, usage);
+    return resources;
   };
-
-  auto [vertexBuffer, vertexBufferMemory] = uploadVectorToDeviceLocalBuffer(
-      mesh.vertices, vk::BufferUsageFlagBits::eVertexBuffer);
-
-  auto [indexBuffer, indexBufferMemory] = uploadVectorToDeviceLocalBuffer(
-      mesh.indices, vk::BufferUsageFlagBits::eIndexBuffer);
-
-  MeshGpuResources resources{};
-  resources.vertexBuffer = std::move(vertexBuffer);
-  resources.vertexBufferMemory = std::move(vertexBufferMemory);
-  resources.indexBuffer = std::move(indexBuffer);
-  resources.indexBufferMemory = std::move(indexBufferMemory);
+  MeshGpuResources resources;
+  resources.vertex = upload(mesh.vertices, vk::BufferUsageFlagBits::eVertexBuffer);
+  resources.index = upload(mesh.indices, vk::BufferUsageFlagBits::eIndexBuffer);
   resources.indexCount = static_cast<std::uint32_t>(mesh.indices.size());
   return resources;
 }
@@ -250,21 +274,12 @@ Renderer::createDepthResources(SwapChain const &swapChain) const {
       .initialLayout = vk::ImageLayout::eUndefined,
   };
 
-  vk::raii::Image image(device_.logicalDevice(), imageCreateInfo);
-  auto memoryRequirements = image.getMemoryRequirements();
-
-  vk::MemoryAllocateInfo allocateInfo{
-      .allocationSize = memoryRequirements.size,
-      .memoryTypeIndex =
-          device_.findMemoryType(memoryRequirements.memoryTypeBits,
-                                 vk::MemoryPropertyFlagBits::eDeviceLocal),
-  };
-
-  vk::raii::DeviceMemory memory(device_.logicalDevice(), allocateInfo);
-  image.bindMemory(*memory, 0);
+  DepthResources resources;
+  resources.storage = device_.createImage(imageCreateInfo,
+      std::uint64_t(swapChain.extent().width) * swapChain.extent().height * 4, vk::MemoryPropertyFlagBits::eDeviceLocal);
 
   vk::ImageViewCreateInfo imageViewCreateInfo{
-      .image = *image,
+      .image = *resources.storage.image,
       .viewType = vk::ImageViewType::e2D,
       .format = kDepthFormat,
       .subresourceRange =
@@ -276,11 +291,10 @@ Renderer::createDepthResources(SwapChain const &swapChain) const {
               .layerCount = 1,
           },
   };
-  DepthResources resources{};
-  resources.image = std::move(image);
-  resources.memory = std::move(memory);
   resources.imageView =
       vk::raii::ImageView(device_.logicalDevice(), imageViewCreateInfo);
+  resources.accounting = device_.resourceLedger().scope(
+      ResourceLedger::Domain::Persistent).track({.imageViews = 1});
   resources.layout = vk::ImageLayout::eUndefined;
   return resources;
 }
@@ -305,21 +319,12 @@ Renderer::ShadowResources Renderer::createShadowResources() const {
       .initialLayout = vk::ImageLayout::eUndefined,
   };
 
-  vk::raii::Image image(device_.logicalDevice(), imageCreateInfo);
-  auto memoryRequirements = image.getMemoryRequirements();
-
-  vk::MemoryAllocateInfo allocateInfo{
-      .allocationSize = memoryRequirements.size,
-      .memoryTypeIndex =
-          device_.findMemoryType(memoryRequirements.memoryTypeBits,
-                                 vk::MemoryPropertyFlagBits::eDeviceLocal),
-  };
-
-  vk::raii::DeviceMemory memory(device_.logicalDevice(), allocateInfo);
-  image.bindMemory(*memory, 0);
+  ShadowResources resources;
+  resources.storage = device_.createImage(imageCreateInfo,
+      std::uint64_t(kShadowMapSize) * kShadowMapSize * 4, vk::MemoryPropertyFlagBits::eDeviceLocal);
 
   vk::ImageViewCreateInfo imageViewCreateInfo{
-      .image = *image,
+      .image = *resources.storage.image,
       .viewType = vk::ImageViewType::e2D,
       .format = kDepthFormat,
       .subresourceRange =
@@ -352,82 +357,141 @@ Renderer::ShadowResources Renderer::createShadowResources() const {
   vk::SamplerCreateInfo debugSamplerCreateInfo = samplerCreateInfo;
   debugSamplerCreateInfo.compareEnable = false;
 
-  ShadowResources resources{};
-  resources.image = std::move(image);
-  resources.memory = std::move(memory);
   resources.imageView =
       vk::raii::ImageView(device_.logicalDevice(), imageViewCreateInfo);
   resources.sampler =
       vk::raii::Sampler(device_.logicalDevice(), samplerCreateInfo);
   resources.debugSampler =
       vk::raii::Sampler(device_.logicalDevice(), debugSamplerCreateInfo);
+  resources.accounting = device_.resourceLedger().scope(
+      ResourceLedger::Domain::Persistent).track({.imageViews = 1, .samplers = 2});
   resources.layout = vk::ImageLayout::eUndefined;
   return resources;
 }
 
-void Renderer::setMeshes(std::vector<Mesh> const &meshes) {
-  if (activeFrame_.has_value()) {
-    throw std::runtime_error(
-        "Cannot replace renderer meshes while a frame is in progress");
+Renderer::PreparedScene Renderer::prepareScene(AssetLibrary const &assets) {
+  std::lock_guard lock(preparationMutex_);
+  if (assets.meshes.empty() || assets.materials.empty())
+    throw std::runtime_error("A GPU scene requires meshes and materials.");
+  // Reject malformed geometry before issuing any upload or touching live state.
+  for (auto const &mesh : assets.meshes) {
+    if (mesh.vertices.empty() || mesh.indices.empty())
+      throw std::runtime_error("Mesh has no vertices or indices.");
+    if (mesh.indices.size() > std::numeric_limits<std::uint32_t>::max())
+      throw std::runtime_error("Mesh index count exceeds the draw limit.");
+    for (auto index : mesh.indices)
+      if (index >= mesh.vertices.size())
+        throw std::runtime_error("Mesh index is out of range.");
   }
-
-  if (meshes.empty()) {
-    throw std::runtime_error("Renderer requires at least one mesh.");
-  }
-
-  std::vector<MeshGpuResources> newMeshGpuResources;
-  newMeshGpuResources.reserve(meshes.size());
-
-  for (Mesh const &mesh : meshes) {
-    if (mesh.vertices.empty()) {
-      throw std::runtime_error("Mesh has no vertices.");
-    }
-    if (mesh.indices.empty()) {
-      throw std::runtime_error("Mesh has no indices.");
-    }
-    newMeshGpuResources.push_back(createGeometryResources(mesh));
-  }
-  meshGpuResources_.swap(newMeshGpuResources);
+  textureCache_.pruneExpired();
+  PreparedScene candidate(new SceneAssets);
+  candidate->uploads_ = std::make_unique<UploadBatch>(device_);
+  auto &uploads = *candidate->uploads_;
+  candidate->owner_ = this;
+  candidate->resourceScope_ = device_.resourceLedger().scope(ResourceLedger::Domain::PreparedScene);
+  candidate->meshes_.reserve(assets.meshes.size());
+  for (auto const &mesh : assets.meshes)
+    candidate->meshes_.push_back(createGeometryResources(mesh, uploads, candidate->resourceScope_));
+  candidate->materials_ = std::make_unique<MaterialGpuStore>(
+      device_, *materialDescriptorSetLayout_, assets.materials, textureCache_, uploads, candidate->resourceScope_);
+  return candidate;
 }
 
-void Renderer::setMaterials(std::vector<Material> const &materials) {
-  if (activeFrame_.has_value()) {
-    throw std::runtime_error(
-        "Cannot replace renderer materials while a frame is in progress.");
+void Renderer::validateSceneCandidate(PreparedScene const &candidate) const {
+  if (activeFrame_)
+    throw std::runtime_error("Cannot submit or commit a scene while recording a frame.");
+  if (!candidate || candidate->owner_ != this || candidate == sceneAssets_)
+    throw std::runtime_error("Scene candidate is invalid or belongs to a different renderer.");
+}
+
+void Renderer::submitSceneUpload(PreparedScene const &candidate) {
+  validateSceneCandidate(candidate);
+  if (!candidate->uploads_ || candidate->uploads_->submitted())
+    return;
+  // Retain destinations before submission. Dropping/canceling the caller's
+  // handle cannot destroy resources or wait for an upload still in flight.
+  pendingSceneUploads_.push_back(candidate);
+  try {
+    candidate->uploads_->submit();
+  } catch (...) {
+    pendingSceneUploads_.pop_back();
+    throw;
   }
-  materialGpuStore_.setMaterials(materials);
+  auto const &statistics = candidate->uploads_->statistics();
+  resourceStatistics_.lastSceneUpload = statistics;
+  resourceStatistics_.sceneUploadSubmissions += statistics.submissions;
+  resourceStatistics_.sceneImageCopies += statistics.imageCopies;
+  resourceStatistics_.pendingSceneUploads = pendingSceneUploads_.size();
+}
+
+void Renderer::waitSceneUpload(PreparedScene const &candidate) {
+  submitSceneUpload(candidate);
+  if (candidate->uploads_) {
+    auto before = candidate->uploads_->statistics().fenceWaits;
+    auto statistics = candidate->uploads_->finish();
+    resourceStatistics_.sceneUploadFenceWaits += statistics.fenceWaits - before;
+    resourceStatistics_.lastSceneUpload = statistics;
+  }
+}
+
+bool Renderer::commitScene(PreparedScene &candidate,
+                           std::function<void()> retireSceneUi) {
+  validateSceneCandidate(candidate);
+  if (candidate->uploads_ && !candidate->uploads_->submitted()) {
+    submitSceneUpload(candidate);
+    return false;
+  }
+  if (candidate->uploads_ && !candidate->uploads_->ready())
+    return false;
+  // Allocate the retirement entry before changing live state. The callback owns
+  // a snapshot of old preview descriptors, not references to new UI containers.
+  if (sceneAssets_ || retireSceneUi)
+    retiredScenes_.push_back(RetiredScene{submittedFrameId_, sceneAssets_, std::move(retireSceneUi)});
+  if (sceneAssets_)
+    sceneAssets_->resourceScope_.setDomain(ResourceLedger::Domain::RetiredScene);
+  candidate->resourceScope_.setDomain(ResourceLedger::Domain::LiveScene);
+  sceneAssets_.swap(candidate);
+  candidate.reset();
+  ++resourceStatistics_.sceneCommits;
+  resourceStatistics_.retiredScenes = retiredScenes_.size();
+  return true;
+}
+
+MaterialGpuStore &Renderer::materials() const {
+  if (!sceneAssets_)
+    throw std::runtime_error("Renderer has no committed scene assets.");
+  return *sceneAssets_->materials_;
 }
 
 void Renderer::setMaterialTint(MaterialId materialId, glm::vec4 const &tint) {
-  materialGpuStore_.setMaterialTint(materialId, tint);
+  materials().setMaterialTint(materialId, tint);
 }
 
 void Renderer::setMaterialSurfaceParams(MaterialId materialId,
                                         float normalScale,
                                         float parallaxScale) {
-  materialGpuStore_.setMaterialSurfaceParams(materialId, normalScale,
-                                             parallaxScale);
+  materials().setMaterialSurfaceParams(materialId, normalScale, parallaxScale);
 }
 
 void Renderer::setMaterialAlphaParams(MaterialId materialId,
-                                      AlphaMode alphaMode,
-                                      float alphaCutoff) {
-  materialGpuStore_.setMaterialAlphaParams(materialId, alphaMode,
-                                           alphaCutoff);
+                                      AlphaMode alphaMode, float alphaCutoff) {
+  materials().setMaterialAlphaParams(materialId, alphaMode, alphaCutoff);
 }
 
 void Renderer::setSurfaceDebugEnabled(bool normalMapsEnabled,
                                       bool parallaxEnabled) {
-  materialGpuStore_.setSurfaceDebugEnabled(normalMapsEnabled, parallaxEnabled);
+  normalMapsEnabled_ = normalMapsEnabled;
+  parallaxEnabled_ = parallaxEnabled;
 }
 
 TextureResources const &
 Renderer::materialAlbedoTexture(MaterialId materialId) const {
-  return materialGpuStore_.material(materialId).albedoTexture;
+  return materials().material(materialId).albedoTexture;
 }
 
-TextureResources const *Renderer::materialAlphaTexture(MaterialId materialId) const {
-  auto const &material = materialGpuStore_.material(materialId);
+TextureResources const *
+Renderer::materialAlphaTexture(MaterialId materialId) const {
+  auto const &material = materials().material(materialId);
   return material.alphaTexture.has_value() ? &*material.alphaTexture : nullptr;
 }
 
@@ -464,6 +528,12 @@ void Renderer::createFrameDescriptorSetLayout() {
           .stageFlags = vk::ShaderStageFlagBits::eFragment,
       },
       vk::DescriptorSetLayoutBinding{
+          .binding = 3,
+          .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+          .descriptorCount = 1,
+          .stageFlags = vk::ShaderStageFlagBits::eFragment,
+      },
+      vk::DescriptorSetLayoutBinding{
           .binding = 2,
           .descriptorType = vk::DescriptorType::eCombinedImageSampler,
           .descriptorCount = 1,
@@ -487,7 +557,7 @@ void Renderer::createFrameDescriptorPool() {
       },
       vk::DescriptorPoolSize{
           .type = vk::DescriptorType::eCombinedImageSampler,
-          .descriptorCount = kFramesInFlight * 2,
+          .descriptorCount = kFramesInFlight * 3,
       },
   };
 
@@ -511,12 +581,15 @@ void Renderer::allocateAndWriteFrameDescriptorSets() {
 
   auto descriptorSets =
       (*device_.logicalDevice()).allocateDescriptorSets(allocateInfo);
+  frameDescriptorAccounting_ = device_.resourceLedger().scope(
+      ResourceLedger::Domain::Persistent).track(
+          {.descriptorPools = 1, .descriptorSets = descriptorSets.size()});
 
   for (std::size_t index = 0; index < frames_.size(); ++index) {
     frames_[index].descriptorSet = descriptorSets[index];
 
     vk::DescriptorBufferInfo bufferInfo{
-        .buffer = *frames_[index].uniformBuffer,
+        .buffer = *frames_[index].uniform.buffer,
         .offset = 0,
         .range = sizeof(FrameUniformBufferObject),
     };
@@ -531,6 +604,11 @@ void Renderer::allocateAndWriteFrameDescriptorSets() {
         .sampler = *shadowResources_.debugSampler,
         .imageView = *shadowResources_.imageView,
         .imageLayout = vk::ImageLayout::eDepthReadOnlyOptimal,
+    };
+    vk::DescriptorImageInfo environmentImageInfo{
+        .sampler = environmentTexture_.sampler(),
+        .imageView = environmentTexture_.imageView(),
+        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
     };
 
     std::array writes = {
@@ -555,6 +633,13 @@ void Renderer::allocateAndWriteFrameDescriptorSets() {
             .descriptorType = vk::DescriptorType::eCombinedImageSampler,
             .pImageInfo = &shadowDebugImageInfo,
         },
+        vk::WriteDescriptorSet{
+            .dstSet = frames_[index].descriptorSet,
+            .dstBinding = 3,
+            .descriptorCount = 1,
+            .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+            .pImageInfo = &environmentImageInfo,
+        },
     };
 
     device_.logicalDevice().updateDescriptorSets(writes, {});
@@ -565,6 +650,12 @@ Renderer::FrameResult Renderer::beginFrame(glm::mat4 const &viewProjMatrix,
                                            glm::vec3 const &cameraPosition,
                                            LightingSettings const &lighting,
                                            bool shadowPassEnabled) {
+  auto display = DisplaySettings{.exposureEv = lighting.exposureEv,
+                                 .toneMap = lighting.toneMappingEnabled};
+  validateDisplaySettings(display);
+  bool dataDebug = (lighting.pbrDebugMode >= 1 && lighting.pbrDebugMode <= 5) ||
+                   lighting.shadowDebugMode == 2 || lighting.shadowDebugMode == 3;
+  if (dataDebug) { display.exposureEv = 0; display.toneMap = false; }
   validateSwapChainState();
 
   if (activeFrame_.has_value()) {
@@ -572,12 +663,20 @@ Renderer::FrameResult Renderer::beginFrame(glm::mat4 const &viewProjMatrix,
         "Cannot begin a new frame while another frame is in progress.");
   }
 
+  displaySettings_ = display;
   std::uint32_t const frameIndex = currentFrame_;
   auto &frame = frames_[frameIndex];
   auto &commandBuffer = commandBuffers_[frameIndex];
 
+  auto waitStart = std::chrono::steady_clock::now();
   (void)device_.logicalDevice().waitForFences(
       {*frame.inFlightFence}, true, std::numeric_limits<std::uint64_t>::max());
+  cpuSyncTimes_.fenceMs = std::chrono::duration<double, std::milli>(
+                              std::chrono::steady_clock::now() - waitStart)
+                              .count();
+  collectFrameTimings(frame);
+  collectCompletedWork();
+  auto acquireStart = std::chrono::steady_clock::now();
 
   vk::Result acquireResult = vk::Result::eSuccess;
   std::uint32_t imageIndex = 0;
@@ -591,6 +690,10 @@ Renderer::FrameResult Renderer::beginFrame(glm::mat4 const &viewProjMatrix,
   } catch (vk::OutOfDateKHRError const &) {
     return FrameResult::eSwapChainOutOfDate;
   }
+
+  cpuSyncTimes_.acquireMs = std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - acquireStart)
+                                .count();
 
   if (acquireResult != vk::Result::eSuccess &&
       acquireResult != vk::Result::eSuboptimalKHR) {
@@ -618,11 +721,23 @@ Renderer::FrameResult Renderer::beginFrame(glm::mat4 const &viewProjMatrix,
       .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
   });
 
+  frame.frameId = ++submittedFrameId_;
+  frame.shadowEnabled = shadowPassEnabled;
+  frame.uiEnabled = static_cast<bool>(uiDrawCallback_);
+  if (*frame.timestamps)
+    commandBuffer.resetQueryPool(*frame.timestamps, 0, 10);
   activeFrame_ = ActiveFrameState{
       .frameIndex = frameIndex,
       .imageIndex = imageIndex,
       .acquireResult = acquireResult,
   };
+  device_.beginLabel(*commandBuffer, "Frame");
+  timestamp(commandBuffer, 0);
+  timestamp(commandBuffer, 1);
+  if (shadowPassEnabled)
+    device_.beginLabel(*commandBuffer, "Shadow");
+  else
+    timestamp(commandBuffer, 2);
   if (shadowPassEnabled) {
     beginShadowPass(commandBuffer, frame);
     activePass_ = ActivePass::eShadow;
@@ -640,32 +755,32 @@ void Renderer::drawObject(MeshId meshId, MaterialId materialId,
     throw std::runtime_error("Cannot draw without an active frame.");
   }
 
-  if (meshId >= meshGpuResources_.size()) {
+  if (!sceneAssets_ || meshId >= sceneAssets_->meshes_.size()) {
     throw std::runtime_error("Renderer mesh id is out of range.");
   }
 
-  MeshGpuResources const &meshResources = meshGpuResources_[meshId];
+  MeshGpuResources const &meshResources = sceneAssets_->meshes_[meshId];
 
   auto const &frameState = *activeFrame_;
   auto &commandBuffer = commandBuffers_[frameState.frameIndex];
 
-  vk::Buffer vertexBuffer = *meshResources.vertexBuffer;
+  vk::Buffer vertexBuffer = *meshResources.vertex.buffer;
   vk::DeviceSize vertexOffset = 0;
   commandBuffer.bindVertexBuffers(0, {vertexBuffer}, {vertexOffset});
-  commandBuffer.bindIndexBuffer(*meshResources.indexBuffer, 0,
+  commandBuffer.bindIndexBuffer(*meshResources.index.buffer, 0,
                                 vk::IndexType::eUint32);
 
-  auto const &materialResource = materialGpuStore_.material(materialId);
+  auto const &materialResource = materials().material(materialId);
   PushConstants pushConstants{
       .transform = modelMatrix,
       .materialTint = materialResource.tint,
       .surfaceParams = materialResource.surfaceParams,
       .alphaParams = materialResource.alphaParams,
   };
-  if (!materialGpuStore_.normalMapsEnabled()) {
+  if (!normalMapsEnabled_) {
     pushConstants.surfaceParams.z = 0.0f;
   }
-  if (!materialGpuStore_.parallaxEnabled()) {
+  if (!parallaxEnabled_) {
     pushConstants.surfaceParams.w = 0.0f;
   }
 
@@ -674,6 +789,14 @@ void Renderer::drawObject(MeshId meshId, MaterialId materialId,
       throw std::runtime_error(
           "Transparent materials are not supported in the shadow pass.");
     }
+    MaterialPipelineVariant const variant = selectMaterialPipeline(
+        materialResource.alphaMode, materialResource.doubleSided,
+        RasterPass::Shadow);
+    vk::raii::Pipeline const &pipeline =
+        variant == MaterialPipelineVariant::ShadowDoubleSided
+            ? doubleSidedShadowPipeline_
+            : shadowPipeline_;
+    commandBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics, *pipeline);
     commandBuffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics,
                                      *pipelineLayout_, 1,
                                      {materialResource.descriptorSet}, {});
@@ -689,10 +812,28 @@ void Renderer::drawObject(MeshId meshId, MaterialId materialId,
     throw std::runtime_error("Renderer has no active draw pass.");
   }
 
-  vk::raii::Pipeline const &pipeline =
-      materialResource.alphaMode == AlphaMode::Blend ? transparentPipeline_
-                                                     : graphicsPipeline_;
-  commandBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics, *pipeline);
+  MaterialPipelineVariant const variant =
+      selectMaterialPipeline(materialResource.alphaMode,
+                             materialResource.doubleSided, RasterPass::Main);
+  vk::raii::Pipeline const *pipeline = nullptr;
+  switch (variant) {
+  case MaterialPipelineVariant::OpaqueSingleSided:
+    pipeline = &graphicsPipeline_;
+    break;
+  case MaterialPipelineVariant::OpaqueDoubleSided:
+    pipeline = &doubleSidedGraphicsPipeline_;
+    break;
+  case MaterialPipelineVariant::TransparentSingleSided:
+    pipeline = &transparentPipeline_;
+    break;
+  case MaterialPipelineVariant::TransparentDoubleSided:
+    pipeline = &doubleSidedTransparentPipeline_;
+    break;
+  case MaterialPipelineVariant::ShadowSingleSided:
+  case MaterialPipelineVariant::ShadowDoubleSided:
+    throw std::runtime_error("Shadow pipeline selected during the main pass.");
+  }
+  commandBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics, **pipeline);
   commandBuffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics,
                                    *pipelineLayout_, 1,
                                    {materialResource.descriptorSet}, {});
@@ -703,6 +844,22 @@ void Renderer::drawObject(MeshId meshId, MaterialId materialId,
       pushConstants);
 
   commandBuffer.drawIndexed(meshResources.indexCount, 1, 0, 0, 0);
+}
+
+void Renderer::drawEnvironment() {
+  if (!activeFrame_.has_value() || activePass_ != ActivePass::eMain) {
+    throw std::runtime_error(
+        "Environment draw requires an active main rendering pass.");
+  }
+
+  ActiveFrameState const frameState = *activeFrame_;
+  auto &commandBuffer = commandBuffers_[frameState.frameIndex];
+  commandBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics,
+                             *environmentPipeline_);
+  commandBuffer.bindDescriptorSets(
+      vk::PipelineBindPoint::eGraphics, *pipelineLayout_, 0,
+      {frames_[frameState.frameIndex].descriptorSet}, {});
+  commandBuffer.draw(3, 1, 0, 0);
 }
 
 void Renderer::drawAabb(Aabb const &bounds, glm::vec4 const &color) {
@@ -731,7 +888,7 @@ void Renderer::drawAabb(Aabb const &bounds, glm::vec4 const &color) {
       .materialTint = color,
   };
 
-  vk::Buffer vertexBuffer = *debugAabbLineResources_.vertexBuffer;
+  vk::Buffer vertexBuffer = *debugAabbLineResources_.vertex.buffer;
   vk::DeviceSize vertexOffset = 0;
   commandBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics,
                              *debugLinePipeline_);
@@ -739,7 +896,7 @@ void Renderer::drawAabb(Aabb const &bounds, glm::vec4 const &color) {
                                    *pipelineLayout_, 0, {frame.descriptorSet},
                                    {});
   commandBuffer.bindVertexBuffers(0, {vertexBuffer}, {vertexOffset});
-  commandBuffer.bindIndexBuffer(*debugAabbLineResources_.indexBuffer, 0,
+  commandBuffer.bindIndexBuffer(*debugAabbLineResources_.index.buffer, 0,
                                 vk::IndexType::eUint32);
   commandBuffer.pushConstants<PushConstants>(
       *pipelineLayout_,
@@ -781,7 +938,12 @@ Renderer::FrameResult Renderer::endFrame() {
       .pSignalSemaphores = &signalSemaphore,
   };
 
+  auto submitStart = std::chrono::steady_clock::now();
   device_.graphicsQueue().submit({submitInfo}, *frame.inFlightFence);
+  frame.submitted = true;
+  cpuSyncTimes_.submitMs = std::chrono::duration<double, std::milli>(
+                               std::chrono::steady_clock::now() - submitStart)
+                               .count();
 
   vk::SwapchainKHR swapChainHandle = *swapChain_->handle();
   vk::PresentInfoKHR presentInfo{
@@ -796,6 +958,7 @@ Renderer::FrameResult Renderer::endFrame() {
     currentFrame_ = (currentFrame_ + 1) % kFramesInFlight;
   };
 
+  auto presentStart = std::chrono::steady_clock::now();
   vk::Result presentResult = vk::Result::eSuccess;
   try {
     presentResult = device_.presentQueue().presentKHR(presentInfo);
@@ -806,6 +969,9 @@ Renderer::FrameResult Renderer::endFrame() {
     return FrameResult::eSwapChainOutOfDate;
   }
 
+  cpuSyncTimes_.presentMs = std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - presentStart)
+                                .count();
   if (presentResult != vk::Result::eSuccess &&
       presentResult != vk::Result::eSuboptimalKHR) {
     throw std::runtime_error("Failed to present swapchain image.");
@@ -915,20 +1081,21 @@ void Renderer::validateSwapChainState() const {
     throw std::runtime_error("Renderer pipeline layout is not initialized.");
   }
 
-  if (graphicsPipeline_ == nullptr) {
+  if (graphicsPipeline_ == nullptr || doubleSidedGraphicsPipeline_ == nullptr) {
     throw std::runtime_error("Renderer graphics pipeline is not initialized.");
   }
 
-  if (transparentPipeline_ == nullptr) {
+  if (transparentPipeline_ == nullptr ||
+      doubleSidedTransparentPipeline_ == nullptr) {
     throw std::runtime_error(
         "Renderer transparent pipeline is not initialized.");
   }
 
-  if (shadowPipeline_ == nullptr) {
+  if (shadowPipeline_ == nullptr || doubleSidedShadowPipeline_ == nullptr) {
     throw std::runtime_error("Renderer shadow pipeline is not initialized.");
   }
 
-  if (debugLinePipeline_ == nullptr) {
+  if (debugLinePipeline_ == nullptr || environmentPipeline_ == nullptr) {
     throw std::runtime_error(
         "Renderer debug line pipeline is not initialized.");
   }
@@ -946,55 +1113,137 @@ void Renderer::validateSwapChainState() const {
   }
 
   for (auto const &frame : frames_) {
-    if (frame.uniformBuffer == nullptr ||
-        frame.uniformBufferMemory == nullptr ||
+    if (frame.uniform.buffer == nullptr ||
+        !frame.uniform.valid() ||
         frame.descriptorSet == nullptr) {
       throw std::runtime_error(
           "Renderer frame uniform resources are not initialized.");
     }
   }
 
-  if (meshGpuResources_.empty()) {
-    throw std::runtime_error(
-        "Renderer mesh GPU resources are not initialized.");
-  }
-
-  if (materialGpuStore_.empty()) {
-    throw std::runtime_error(
-        "Renderer material GPU resources are not initialized.");
-  }
-
-  if (depthResources_.image == nullptr || depthResources_.memory == nullptr ||
+  if (!depthResources_.storage.valid() ||
       depthResources_.imageView == nullptr) {
     throw std::runtime_error("Renderer depth resources are not initialized.");
   }
 
-  if (shadowResources_.image == nullptr || shadowResources_.memory == nullptr ||
+  if (!shadowResources_.storage.valid() ||
       shadowResources_.imageView == nullptr ||
       shadowResources_.sampler == nullptr ||
       shadowResources_.debugSampler == nullptr) {
     throw std::runtime_error("Renderer shadow resources are not initialized.");
   }
 
-  for (auto const &meshResources : meshGpuResources_) {
-    if (meshResources.vertexBuffer == nullptr ||
-        meshResources.vertexBufferMemory == nullptr ||
-        meshResources.indexBuffer == nullptr ||
-        meshResources.indexBufferMemory == nullptr ||
-        meshResources.indexCount == 0) {
-      throw std::runtime_error(
-          "Renderer mesh GPU resources are not initialized.");
+  if (sceneAssets_)
+    for (auto const &meshResources : sceneAssets_->meshes_) {
+      if (meshResources.vertex.buffer == nullptr ||
+          !meshResources.vertex.valid() ||
+          meshResources.index.buffer == nullptr ||
+          !meshResources.index.valid() ||
+          meshResources.indexCount == 0) {
+        throw std::runtime_error(
+            "Renderer mesh GPU resources are not initialized.");
+      }
     }
-  }
 
-  if (debugAabbLineResources_.vertexBuffer == nullptr ||
-      debugAabbLineResources_.vertexBufferMemory == nullptr ||
-      debugAabbLineResources_.indexBuffer == nullptr ||
-      debugAabbLineResources_.indexBufferMemory == nullptr ||
+  if (debugAabbLineResources_.vertex.buffer == nullptr ||
+      !debugAabbLineResources_.vertex.valid() ||
+      debugAabbLineResources_.index.buffer == nullptr ||
+      !debugAabbLineResources_.index.valid() ||
       debugAabbLineResources_.indexCount == 0) {
     throw std::runtime_error(
         "Renderer debug AABB resources are not initialized.");
   }
+}
+
+vk::raii::Pipeline Renderer::createEnvironmentPipeline(
+    SwapChain const &swapChain,
+    vk::raii::PipelineLayout const &pipelineLayout) const {
+  auto vertCode = readBinaryFile("shaders/environment.vert.spv");
+  auto fragCode = readBinaryFile("shaders/environment.frag.spv");
+
+  vk::raii::ShaderModule vertexShaderModule(
+      device_.logicalDevice(),
+      vk::ShaderModuleCreateInfo{
+          .codeSize = vertCode.size(),
+          .pCode = reinterpret_cast<std::uint32_t const *>(vertCode.data()),
+      });
+  vk::raii::ShaderModule fragmentShaderModule(
+      device_.logicalDevice(),
+      vk::ShaderModuleCreateInfo{
+          .codeSize = fragCode.size(),
+          .pCode = reinterpret_cast<std::uint32_t const *>(fragCode.data()),
+      });
+  std::array shaderStages = {
+      vk::PipelineShaderStageCreateInfo{
+          .stage = vk::ShaderStageFlagBits::eVertex,
+          .module = *vertexShaderModule,
+          .pName = "main",
+      },
+      vk::PipelineShaderStageCreateInfo{
+          .stage = vk::ShaderStageFlagBits::eFragment,
+          .module = *fragmentShaderModule,
+          .pName = "main",
+      },
+  };
+
+  vk::PipelineVertexInputStateCreateInfo vertexInput{};
+  vk::PipelineInputAssemblyStateCreateInfo inputAssembly{
+      .topology = vk::PrimitiveTopology::eTriangleList,
+  };
+  vk::PipelineViewportStateCreateInfo viewportState{
+      .viewportCount = 1,
+      .scissorCount = 1,
+  };
+  vk::PipelineRasterizationStateCreateInfo rasterizer{
+      .polygonMode = vk::PolygonMode::eFill,
+      .cullMode = vk::CullModeFlagBits::eNone,
+      .frontFace = vk::FrontFace::eClockwise,
+      .lineWidth = 1.0f,
+  };
+  vk::PipelineMultisampleStateCreateInfo multisampling{
+      .rasterizationSamples = vk::SampleCountFlagBits::e1,
+  };
+  vk::PipelineDepthStencilStateCreateInfo depthStencil{
+      .depthTestEnable = true,
+      .depthWriteEnable = false,
+      .depthCompareOp = vk::CompareOp::eLessOrEqual,
+  };
+  vk::PipelineColorBlendAttachmentState colorBlendAttachment{
+      .colorWriteMask =
+          vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
+          vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA,
+  };
+  vk::PipelineColorBlendStateCreateInfo colorBlending{
+      .attachmentCount = 1,
+      .pAttachments = &colorBlendAttachment,
+  };
+  std::array dynamicStates = {vk::DynamicState::eViewport,
+                              vk::DynamicState::eScissor};
+  vk::PipelineDynamicStateCreateInfo dynamicState{
+      .dynamicStateCount = static_cast<std::uint32_t>(dynamicStates.size()),
+      .pDynamicStates = dynamicStates.data(),
+  };
+  vk::Format colorAttachmentFormat = HdrOutput::sceneFormat;
+  vk::PipelineRenderingCreateInfo renderingInfo{
+      .colorAttachmentCount = 1,
+      .pColorAttachmentFormats = &colorAttachmentFormat,
+      .depthAttachmentFormat = kDepthFormat,
+  };
+  vk::GraphicsPipelineCreateInfo pipelineInfo{
+      .pNext = &renderingInfo,
+      .stageCount = static_cast<std::uint32_t>(shaderStages.size()),
+      .pStages = shaderStages.data(),
+      .pVertexInputState = &vertexInput,
+      .pInputAssemblyState = &inputAssembly,
+      .pViewportState = &viewportState,
+      .pRasterizationState = &rasterizer,
+      .pMultisampleState = &multisampling,
+      .pDepthStencilState = &depthStencil,
+      .pColorBlendState = &colorBlending,
+      .pDynamicState = &dynamicState,
+      .layout = *pipelineLayout,
+  };
+  return vk::raii::Pipeline(device_.logicalDevice(), nullptr, pipelineInfo);
 }
 
 void Renderer::createCommandPool() {
@@ -1005,9 +1254,10 @@ void Renderer::createCommandPool() {
   commandPool_ = vk::raii::CommandPool(device_.logicalDevice(), createInfo);
 }
 
-vk::raii::Pipeline Renderer::createGraphicsPipeline(
-    SwapChain const &swapChain,
-    vk::raii::PipelineLayout const &pipelineLayout) const {
+vk::raii::Pipeline
+Renderer::createGraphicsPipeline(SwapChain const &swapChain,
+                                 vk::raii::PipelineLayout const &pipelineLayout,
+                                 vk::CullModeFlagBits cullMode) const {
   auto vertCode = readBinaryFile("shaders/triangle.vert.spv");
   auto fragCode = readBinaryFile("shaders/triangle.frag.spv");
 
@@ -1060,7 +1310,7 @@ vk::raii::Pipeline Renderer::createGraphicsPipeline(
       .depthClampEnable = false,
       .rasterizerDiscardEnable = false,
       .polygonMode = vk::PolygonMode::eFill,
-      .cullMode = rasterizerDebugSettings_.cullMode,
+      .cullMode = cullMode,
       .frontFace = rasterizerDebugSettings_.frontFace,
       .depthBiasEnable = false,
       .lineWidth = 1.0f,
@@ -1099,7 +1349,7 @@ vk::raii::Pipeline Renderer::createGraphicsPipeline(
       .pDynamicStates = dynamicStates.data(),
   };
 
-  vk::Format colorAttachmentFormat = swapChain.imageFormat();
+  vk::Format colorAttachmentFormat = HdrOutput::sceneFormat;
   vk::PipelineRenderingCreateInfo pipelineRenderingCreateInfo{
       .colorAttachmentCount = 1,
       .pColorAttachmentFormats = &colorAttachmentFormat,
@@ -1126,8 +1376,8 @@ vk::raii::Pipeline Renderer::createGraphicsPipeline(
 }
 
 vk::raii::Pipeline Renderer::createTransparentPipeline(
-    SwapChain const &swapChain,
-    vk::raii::PipelineLayout const &pipelineLayout) const {
+    SwapChain const &swapChain, vk::raii::PipelineLayout const &pipelineLayout,
+    vk::CullModeFlagBits cullMode) const {
   auto vertCode = readBinaryFile("shaders/triangle.vert.spv");
   auto fragCode = readBinaryFile("shaders/triangle.frag.spv");
 
@@ -1180,7 +1430,7 @@ vk::raii::Pipeline Renderer::createTransparentPipeline(
       .depthClampEnable = false,
       .rasterizerDiscardEnable = false,
       .polygonMode = vk::PolygonMode::eFill,
-      .cullMode = rasterizerDebugSettings_.cullMode,
+      .cullMode = cullMode,
       .frontFace = rasterizerDebugSettings_.frontFace,
       .depthBiasEnable = false,
       .lineWidth = 1.0f,
@@ -1225,7 +1475,7 @@ vk::raii::Pipeline Renderer::createTransparentPipeline(
       .pDynamicStates = dynamicStates.data(),
   };
 
-  vk::Format colorAttachmentFormat = swapChain.imageFormat();
+  vk::Format colorAttachmentFormat = HdrOutput::sceneFormat;
   vk::PipelineRenderingCreateInfo pipelineRenderingCreateInfo{
       .colorAttachmentCount = 1,
       .pColorAttachmentFormats = &colorAttachmentFormat,
@@ -1351,7 +1601,7 @@ vk::raii::Pipeline Renderer::createDebugLinePipeline(
       .pDynamicStates = dynamicStates.data(),
   };
 
-  vk::Format colorAttachmentFormat = swapChain.imageFormat();
+  vk::Format colorAttachmentFormat = HdrOutput::sceneFormat;
   vk::PipelineRenderingCreateInfo pipelineRenderingCreateInfo{
       .colorAttachmentCount = 1,
       .pColorAttachmentFormats = &colorAttachmentFormat,
@@ -1377,8 +1627,9 @@ vk::raii::Pipeline Renderer::createDebugLinePipeline(
                             pipelineCreateInfo);
 }
 
-vk::raii::Pipeline Renderer::createShadowPipeline(
-    vk::raii::PipelineLayout const &pipelineLayout) const {
+vk::raii::Pipeline
+Renderer::createShadowPipeline(vk::raii::PipelineLayout const &pipelineLayout,
+                               vk::CullModeFlagBits cullMode) const {
   auto vertCode = readBinaryFile("shaders/shadow.vert.spv");
   auto fragCode = readBinaryFile("shaders/shadow.frag.spv");
 
@@ -1431,8 +1682,8 @@ vk::raii::Pipeline Renderer::createShadowPipeline(
       .depthClampEnable = false,
       .rasterizerDiscardEnable = false,
       .polygonMode = vk::PolygonMode::eFill,
-      .cullMode = vk::CullModeFlagBits::eNone,
-      .frontFace = vk::FrontFace::eCounterClockwise,
+      .cullMode = cullMode,
+      .frontFace = rasterizerDebugSettings_.frontFace,
       .depthBiasEnable = true,
       .depthBiasConstantFactor = 1.25f,
       .depthBiasSlopeFactor = 1.75f,
@@ -1513,15 +1764,23 @@ void Renderer::updateFrameUniformBuffer(
   ubo.ambientColor = glm::vec4(lightColor * lighting.ambientStrength, 1.0f);
   ubo.lightingParams =
       glm::vec4(lighting.diffuseStrength, lighting.specularStrength,
-                lighting.shininess, 0.0f);
+                lighting.shininess, static_cast<float>(lighting.pbrDebugMode));
   ubo.lightViewProj = computeLightViewProj(lighting.direction, lighting);
   ubo.shadowParams = glm::vec4(
       lighting.shadowBiasSlope, lighting.shadowBiasConstant,
       lighting.shadowPcfRadius, static_cast<float>(lighting.shadowDebugMode));
+  ubo.inverseViewProj = glm::inverse(viewProjMatrix);
+  ubo.environmentParams =
+      glm::vec4(lighting.environmentIntensity, lighting.environmentRotation,
+                lighting.environmentDiffuseStrength,
+                lighting.environmentSpecularStrength);
+  for (std::size_t coefficient = 0; coefficient < environmentSh_.size();
+       ++coefficient) {
+    ubo.environmentSh[coefficient] =
+        glm::vec4(environmentSh_[coefficient], 0.0f);
+  }
 
-  void *mapped = frame.uniformBufferMemory.mapMemory(0, sizeof(ubo));
-  std::memcpy(mapped, &ubo, sizeof(ubo));
-  frame.uniformBufferMemory.unmapMemory();
+  frame.uniform.write(std::as_bytes(std::span{&ubo, 1}));
 }
 
 void Renderer::beginShadowPass(vk::raii::CommandBuffer const &commandBuffer,
@@ -1602,10 +1861,11 @@ void Renderer::beginMainPass() {
 
 void Renderer::beginMainPass(vk::raii::CommandBuffer const &commandBuffer,
                              FrameContext const &frame,
-                             std::uint32_t imageIndex,
-                             bool shadowPassEnabled) {
+                             std::uint32_t imageIndex, bool shadowPassEnabled) {
   if (shadowPassEnabled) {
     commandBuffer.endRendering();
+    timestamp(commandBuffer, 2);
+    device_.endLabel(*commandBuffer);
 
     transitionShadowImage(commandBuffer, vk::ImageLayout::eDepthReadOnlyOptimal,
                           vk::PipelineStageFlagBits2::eLateFragmentTests,
@@ -1614,12 +1874,7 @@ void Renderer::beginMainPass(vk::raii::CommandBuffer const &commandBuffer,
                           vk::AccessFlagBits2::eShaderSampledRead);
   }
 
-  transitionSwapChainImage(commandBuffer, imageIndex,
-                           vk::ImageLayout::eColorAttachmentOptimal,
-                           vk::PipelineStageFlagBits2::eAllCommands,
-                           vk::AccessFlagBits2::eMemoryRead,
-                           vk::PipelineStageFlagBits2::eColorAttachmentOutput,
-                           vk::AccessFlagBits2::eColorAttachmentWrite);
+  hdrOutput_->prepareScene(*commandBuffer);
 
   vk::ClearValue clearValue{
       .color =
@@ -1652,7 +1907,7 @@ void Renderer::beginMainPass(vk::raii::CommandBuffer const &commandBuffer,
   };
 
   vk::RenderingAttachmentInfo colorAttachment{
-      .imageView = *swapChain_->imageViews()[imageIndex],
+      .imageView = hdrOutput_->sceneView(),
       .imageLayout = vk::ImageLayout::eColorAttachmentOptimal,
       .loadOp = vk::AttachmentLoadOp::eClear,
       .storeOp = vk::AttachmentStoreOp::eStore,
@@ -1670,6 +1925,9 @@ void Renderer::beginMainPass(vk::raii::CommandBuffer const &commandBuffer,
       .pDepthAttachment = &depthAttachment,
   };
 
+  timestamp(commandBuffer, 3);
+  device_.beginLabel(*commandBuffer,
+                     "Main scene (sky + opaque + mask + blend + debug)");
   commandBuffer.beginRendering(renderingInfo);
 
   commandBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics,
@@ -1696,10 +1954,25 @@ void Renderer::beginMainPass(vk::raii::CommandBuffer const &commandBuffer,
 
 void Renderer::endCommandBuffer(vk::raii::CommandBuffer const &commandBuffer,
                                 std::uint32_t imageIndex) {
-  if (uiDrawCallback_) {
-    uiDrawCallback_(*commandBuffer);
-  }
-
+  commandBuffer.endRendering();
+  timestamp(commandBuffer, 4);
+  device_.endLabel(*commandBuffer);
+  device_.beginLabel(*commandBuffer, "Display output (exposure + filmic + sRGB)");
+  timestamp(commandBuffer, 5);
+  transitionSwapChainImage(commandBuffer, imageIndex,
+                           vk::ImageLayout::eColorAttachmentOptimal,
+                           vk::PipelineStageFlagBits2::eAllCommands,
+                           vk::AccessFlagBits2::eMemoryRead,
+                           vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+                           vk::AccessFlagBits2::eColorAttachmentWrite);
+  hdrOutput_->drawDisplay(*commandBuffer, *swapChain_->imageViews()[imageIndex], displaySettings_);
+  timestamp(commandBuffer, 6);
+  device_.endLabel(*commandBuffer);
+  device_.beginLabel(*commandBuffer, "UI");
+  timestamp(commandBuffer, 7);
+  if (uiDrawCallback_) uiDrawCallback_(*commandBuffer);
+  timestamp(commandBuffer, 8);
+  device_.endLabel(*commandBuffer);
   commandBuffer.endRendering();
 
   transitionSwapChainImage(commandBuffer, imageIndex,
@@ -1709,6 +1982,8 @@ void Renderer::endCommandBuffer(vk::raii::CommandBuffer const &commandBuffer,
                            vk::PipelineStageFlagBits2::eAllCommands,
                            vk::AccessFlagBits2::eMemoryRead);
 
+  timestamp(commandBuffer, 9);
+  device_.endLabel(*commandBuffer);
   commandBuffer.end();
 }
 
@@ -1758,7 +2033,7 @@ void Renderer::transitionDepthImage(
       .newLayout = newLayout,
       .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
       .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-      .image = *depthResources_.image,
+      .image = *depthResources_.storage.image,
       .subresourceRange =
           {
               .aspectMask = vk::ImageAspectFlagBits::eDepth,
@@ -1795,7 +2070,7 @@ void Renderer::transitionShadowImage(
       .newLayout = newLayout,
       .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
       .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-      .image = *shadowResources_.image,
+      .image = *shadowResources_.storage.image,
       .subresourceRange =
           {
               .aspectMask = vk::ImageAspectFlagBits::eDepth,
@@ -1812,4 +2087,69 @@ void Renderer::transitionShadowImage(
 
   commandBuffer.pipelineBarrier2(dependencyInfo);
   shadowResources_.layout = newLayout;
+}
+
+void Renderer::timestamp(vk::raii::CommandBuffer const &command,
+                         std::uint32_t query) {
+  if (!timestampBits_ || !activeFrame_)
+    return;
+  command.writeTimestamp2(vk::PipelineStageFlagBits2::eBottomOfPipe,
+                          *frames_[activeFrame_->frameIndex].timestamps, query);
+}
+void Renderer::collectFrameTimings(FrameContext &frame) {
+  if (!frame.submitted)
+    return;
+  resourceStatistics_.completedFrameId =
+      std::max(resourceStatistics_.completedFrameId, frame.frameId);
+  GpuTimings result{.frameId = frame.frameId};
+  if (*frame.timestamps) {
+    std::array<std::uint64_t, 20> values{};
+    auto status = vkGetQueryPoolResults(
+        static_cast<VkDevice>(device_.deviceHandle()),
+        static_cast<VkQueryPool>(*frame.timestamps), 0, 10, sizeof(values),
+        values.data(), 2 * sizeof(std::uint64_t),
+        VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+    if (status != VK_SUCCESS && status != VK_NOT_READY)
+      throw std::runtime_error("GPU timestamp readback failed");
+    bool ready = true;
+    for (unsigned i = 0; i < 10; ++i)
+      ready = ready && values[2 * i + 1] != 0;
+    if (!ready)
+      return;
+    auto elapsed = [&](unsigned a, unsigned b) {
+      return timestampMilliseconds(values[2 * a], values[2 * b], timestampBits_,
+                                   timestampPeriod_);
+    };
+    result.valid = true;
+    result.totalMs = elapsed(0, 9);
+    result.shadowMs = frame.shadowEnabled ? elapsed(1, 2) : 0;
+    result.mainMs = elapsed(3, 4);
+    result.outputMs = elapsed(5, 6);
+    result.uiMs = frame.uiEnabled ? elapsed(7, 8) : 0;
+  }
+  gpuTimings_ = result;
+  frame.submitted = false;
+}
+void Renderer::collectCompletedWork() {
+  for (auto &frame : frames_) {
+    if (frame.submitted &&
+        frame.inFlightFence.getStatus() == vk::Result::eSuccess)
+      collectFrameTimings(frame);
+  }
+  std::erase_if(pendingSceneUploads_, [](auto const &candidate) {
+    if (!candidate->uploads_ || candidate->uploads_->ready()) {
+      candidate->uploads_.reset();
+      return true;
+    }
+    return false;
+  });
+  std::erase_if(retiredScenes_, [this](auto &retired) {
+    if (retired.lastFrame > resourceStatistics_.completedFrameId)
+      return false;
+    if (retired.releaseUi)
+      retired.releaseUi();
+    return true;
+  });
+  resourceStatistics_.pendingSceneUploads = pendingSceneUploads_.size();
+  resourceStatistics_.retiredScenes = retiredScenes_.size();
 }

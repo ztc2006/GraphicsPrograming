@@ -56,15 +56,30 @@
   "materials": [
     {
       "name": "OpaqueTextured",
+      "doubleSided": true,
       "pbrMetallicRoughness": {
         "baseColorTexture": {
           "index": 0
         },
-        "baseColorFactor": [1.0, 1.0, 1.0, 1.0]
-      }
+        "baseColorFactor": [1.0, 1.0, 1.0, 1.0],
+        "metallicFactor": 0.25,
+        "roughnessFactor": 0.75,
+        "metallicRoughnessTexture": {
+          "index": 0
+        }
+      },
+      "occlusionTexture": {
+        "index": 0,
+        "strength": 0.6
+      },
+      "emissiveTexture": {
+        "index": 0
+      },
+      "emissiveFactor": [0.1, 0.2, 0.3]
     },
     {
       "name": "MaskedTextured",
+      "doubleSided": false,
       "pbrMetallicRoughness": {
         "baseColorTexture": {
           "index": 0

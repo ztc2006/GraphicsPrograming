@@ -6,14 +6,19 @@
 
 namespace {
 glm::vec3 fallbackTangent(glm::vec3 normal) {
-  glm::vec3 const axis =
-      std::abs(normal.y) < 0.999f ? glm::vec3{0.0f, 1.0f, 0.0f}
-                                  : glm::vec3{1.0f, 0.0f, 0.0f};
+  glm::vec3 const axis = std::abs(normal.y) < 0.999f
+                             ? glm::vec3{0.0f, 1.0f, 0.0f}
+                             : glm::vec3{1.0f, 0.0f, 0.0f};
   return glm::normalize(glm::cross(axis, normal));
 }
 } // namespace
 
-void generateMeshTangents(Mesh &mesh) {
+void generateMeshTangents(Mesh &mesh, bool useNormalUv) {
+  if (!useNormalUv) {
+    for (Vertex &v : mesh.vertices) {
+      v.normalUv = v.metallicRoughnessUv = v.occlusionUv = v.emissiveUv = v.uv;
+    }
+  }
   std::vector<glm::vec3> tangents(mesh.vertices.size(), glm::vec3{0.0f});
   std::vector<glm::vec3> bitangents(mesh.vertices.size(), glm::vec3{0.0f});
 
@@ -31,10 +36,10 @@ void generateMeshTangents(Mesh &mesh) {
     Vertex const &v2 = mesh.vertices[i2];
     glm::vec3 const edge1 = v1.position - v0.position;
     glm::vec3 const edge2 = v2.position - v0.position;
-    glm::vec2 const deltaUv1 = v1.uv - v0.uv;
-    glm::vec2 const deltaUv2 = v2.uv - v0.uv;
-    float const determinant =
-        deltaUv1.x * deltaUv2.y - deltaUv1.y * deltaUv2.x;
+    glm::vec2 const uv0 = useNormalUv ? v0.normalUv : v0.uv;
+    glm::vec2 const deltaUv1 = (useNormalUv ? v1.normalUv : v1.uv) - uv0;
+    glm::vec2 const deltaUv2 = (useNormalUv ? v2.normalUv : v2.uv) - uv0;
+    float const determinant = deltaUv1.x * deltaUv2.y - deltaUv1.y * deltaUv2.x;
     if (std::abs(determinant) <= 0.000001f) {
       continue;
     }
@@ -71,7 +76,7 @@ void generateMeshTangents(Mesh &mesh) {
 
     float const handedness =
         glm::dot(glm::cross(normal, tangent), bitangents[index]) < 0.0f ? -1.0f
-                                                                       : 1.0f;
+                                                                        : 1.0f;
     vertex.tangent = glm::vec4{tangent, handedness};
   }
 }

@@ -4,6 +4,13 @@ layout(set = 1, binding = 0) uniform sampler2D albedoTexture;
 layout(set = 1, binding = 1) uniform sampler2D normalTexture;
 layout(set = 1, binding = 2) uniform sampler2D heightTexture;
 layout(set = 1, binding = 3) uniform sampler2D alphaMaskTexture;
+layout(set = 1, binding = 4) uniform sampler2D metallicRoughnessTexture;
+layout(set = 1, binding = 5) uniform sampler2D occlusionTexture;
+layout(set = 1, binding = 6) uniform sampler2D emissiveTexture;
+layout(set = 1, binding = 7) uniform MaterialUbo {
+  vec4 pbrParams;
+  vec4 emissiveFactor;
+} material;
 
 layout(push_constant) uniform PushConstants {
   mat4 transform;
@@ -22,11 +29,15 @@ layout(set = 0, binding = 0) uniform FrameUbo {
   vec4 lightingParams;
   mat4 lightViewProj;
   vec4 shadowParams;
+  mat4 inverseViewProj;
+  vec4 environmentParams;
+  vec4 environmentSh[9];
 }
 ubo;
 
 layout(set = 0, binding = 1) uniform sampler2DShadow shadowMap;
 layout(set = 0, binding = 2) uniform sampler2D shadowDebugMap;
+layout(set = 0, binding = 3) uniform sampler2D environmentTexture;
 
 layout(location = 0) in vec3 inColor;
 layout(location = 1) in vec2 inUv;
@@ -34,7 +45,84 @@ layout(location = 2) in vec3 inWorldPos;
 layout(location = 3) in vec3 inWorldNormal;
 layout(location = 4) in vec4 inLightClipPos;
 layout(location = 5) in vec4 inWorldTangent;
+layout(location = 6) in vec2 inNormalUv;
+layout(location = 7) in vec2 inMetallicRoughnessUv;
+layout(location = 8) in vec2 inOcclusionUv;
+layout(location = 9) in vec2 inEmissiveUv;
 layout(location = 0) out vec4 outFragColor;
+
+const float PI = 3.14159265359;
+const vec2 INV_ATAN = vec2(0.15915494309, 0.31830988618);
+
+float distributionGGX(vec3 N, vec3 H, float roughness) {
+  float alpha = roughness * roughness;
+  float alphaSquared = alpha * alpha;
+  float nDotH = max(dot(N, H), 0.0);
+  float denominator = nDotH * nDotH * (alphaSquared - 1.0) + 1.0;
+  return alphaSquared / max(PI * denominator * denominator, 0.000001);
+}
+
+float geometrySchlickGGX(float nDotDirection, float roughness) {
+  float remapped = roughness + 1.0;
+  float k = remapped * remapped / 8.0;
+  return nDotDirection /
+         max(nDotDirection * (1.0 - k) + k, 0.000001);
+}
+
+float geometrySmith(vec3 N, vec3 V, vec3 L, float roughness) {
+  return geometrySchlickGGX(max(dot(N, V), 0.0), roughness) *
+         geometrySchlickGGX(max(dot(N, L), 0.0), roughness);
+}
+
+vec3 fresnelSchlick(float cosTheta, vec3 F0) {
+  return F0 + (1.0 - F0) *
+                  pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
+}
+
+vec3 fresnelSchlickRoughness(float cosTheta, vec3 F0, float roughness) {
+  return F0 + (max(vec3(1.0 - roughness), F0) - F0) *
+                  pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
+}
+
+vec3 rotateEnvironmentDirection(vec3 direction) {
+  float rotation = ubo.environmentParams.y;
+  float cosine = cos(rotation);
+  float sine = sin(rotation);
+  direction.xz = mat2(cosine, -sine, sine, cosine) * direction.xz;
+  return direction;
+}
+
+vec2 directionToEquirectangularUv(vec3 direction) {
+  vec2 uv = vec2(atan(direction.z, direction.x), asin(direction.y));
+  return uv * INV_ATAN + 0.5;
+}
+
+vec3 evaluateIrradianceSh(vec3 direction) {
+  float basis[9] = float[](
+      0.28209479,
+      0.48860251 * direction.y,
+      0.48860251 * direction.z,
+      0.48860251 * direction.x,
+      1.09254843 * direction.x * direction.y,
+      1.09254843 * direction.y * direction.z,
+      0.31539156 * (3.0 * direction.z * direction.z - 1.0),
+      1.09254843 * direction.x * direction.z,
+      0.54627421 *
+          (direction.x * direction.x - direction.y * direction.y));
+
+  vec3 irradiance = ubo.environmentSh[0].rgb * basis[0] * PI;
+  for (int coefficient = 1; coefficient <= 3; ++coefficient) {
+    irradiance += ubo.environmentSh[coefficient].rgb * basis[coefficient] *
+                  (2.0 * PI / 3.0);
+  }
+  for (int coefficient = 4; coefficient < 9; ++coefficient) {
+    irradiance += ubo.environmentSh[coefficient].rgb * basis[coefficient] *
+                  (PI / 4.0);
+  }
+  return max(irradiance, vec3(0.0));
+}
+
+
 
 bool uvInsideUnitSquare(vec2 uv) {
   return uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0;
@@ -194,21 +282,54 @@ void main() {
 
   vec3 albedo = texel.rgb * inColor * pushConstants.materialTint.rgb;
   if (pushConstants.surfaceParams.z > 0.5) {
-    vec3 tangentNormal = texture(normalTexture, uv).xyz * 2.0 - 1.0;
+    vec3 tangentNormal = texture(normalTexture, inNormalUv + (uv - inUv)).xyz * 2.0 - 1.0;
     tangentNormal.xy *= pushConstants.surfaceParams.x;
     N = normalize(tangentToWorld * normalize(tangentNormal));
   } else if (pushConstants.surfaceParams.w > 0.5) {
     N = normalize(tangentToWorld * normalFromHeight(uv));
   }
 
-  vec3 H = normalize(L + V);
+  vec4 metallicRoughness = texture(metallicRoughnessTexture, inMetallicRoughnessUv + (uv - inUv));
+  float metallic = clamp(metallicRoughness.b * material.pbrParams.x, 0.0, 1.0);
+  float roughness = clamp(metallicRoughness.g * material.pbrParams.y, 0.04, 1.0);
+  float sampledAo = texture(occlusionTexture, inOcclusionUv + (uv - inUv)).r;
+  float ao = mix(1.0, sampledAo, clamp(material.pbrParams.z, 0.0, 1.0));
+  vec3 emissive = texture(emissiveTexture, inEmissiveUv + (uv - inUv)).rgb * material.emissiveFactor.rgb;
 
-  float nDotL = dot(N, L);
-  float diffuse = max(nDotL, 0.0) * ubo.lightingParams.x;
-  float specular = nDotL > 0.0
-                       ? pow(max(dot(N, H), 0.0), ubo.lightingParams.z) *
-                             ubo.lightingParams.y
-                       : 0.0;
+  vec3 H = safeNormalize(L + V, N);
+  float nDotL = max(dot(N, L), 0.0);
+  float nDotV = max(dot(N, V), 0.0);
+  vec3 F0 = mix(vec3(0.04), albedo, metallic);
+  float D = distributionGGX(N, H, roughness);
+  float G = geometrySmith(N, V, L, roughness);
+  vec3 F = fresnelSchlick(max(dot(H, V), 0.0), F0);
+  vec3 specular = D * G * F / max(4.0 * nDotV * nDotL, 0.0001);
+  vec3 diffuseWeight = (vec3(1.0) - F) * (1.0 - metallic);
+  vec3 diffuse = diffuseWeight * albedo / PI;
+
+  vec3 environmentNormal = rotateEnvironmentDirection(N);
+  vec3 irradiance = evaluateIrradianceSh(environmentNormal);
+  vec3 environmentFresnel =
+      fresnelSchlickRoughness(nDotV, F0, roughness);
+  vec3 environmentDiffuseWeight =
+      (vec3(1.0) - environmentFresnel) * (1.0 - metallic);
+  vec3 diffuseIbl = environmentDiffuseWeight * albedo * irradiance / PI;
+
+  vec3 reflectionDirection = reflect(-V, N);
+  vec3 environmentReflection =
+      rotateEnvironmentDirection(reflectionDirection);
+  vec3 reflectedRadiance =
+      texture(environmentTexture,
+              directionToEquirectangularUv(environmentReflection)).rgb;
+  // Temporary roughness approximation until GGX prefiltering and the split-sum
+  // BRDF LUT replace this first environment-lighting slice.
+  vec3 lowFrequencyRadiance = evaluateIrradianceSh(environmentReflection) / PI;
+  vec3 prefilteredRadiance =
+      mix(reflectedRadiance, lowFrequencyRadiance, roughness * roughness);
+  vec3 specularIbl = prefilteredRadiance * environmentFresnel;
+
+  diffuseIbl *= ubo.environmentParams.x * ubo.environmentParams.z * ao;
+  specularIbl *= ubo.environmentParams.x * ubo.environmentParams.w * ao;
 
   int shadowMode = int(round(ubo.shadowParams.w));
   float visibility =
@@ -232,9 +353,44 @@ void main() {
     return;
   }
 
-  vec3 lit = albedo * ubo.ambientColor.rgb +
-             visibility * (albedo * ubo.lightColor.rgb * diffuse +
-                           ubo.lightColor.rgb * specular);
+  int pbrDebugMode = int(round(ubo.lightingParams.w));
+  if (pbrDebugMode == 1) {
+    outFragColor = vec4(albedo, alpha);
+    return;
+  }
+  if (pbrDebugMode == 2) {
+    outFragColor = vec4(vec3(metallic), alpha);
+    return;
+  }
+  if (pbrDebugMode == 3) {
+    outFragColor = vec4(vec3(roughness), alpha);
+    return;
+  }
+  if (pbrDebugMode == 4) {
+    outFragColor = vec4(N * 0.5 + 0.5, alpha);
+    return;
+  }
+  if (pbrDebugMode == 5) {
+    outFragColor = vec4(vec3(ao), alpha);
+    return;
+  }
+  if (pbrDebugMode == 6) {
+    outFragColor = vec4(emissive, alpha);
+    return;
+  }
+  if (pbrDebugMode == 7) {
+    outFragColor = vec4(diffuseIbl, alpha);
+    return;
+  }
+  if (pbrDebugMode == 8) {
+    outFragColor = vec4(specularIbl, alpha);
+    return;
+  }
+
+  vec3 direct = ubo.lightColor.rgb * nDotL *
+                (diffuse * ubo.lightingParams.x +
+                 specular * ubo.lightingParams.y);
+  vec3 lit = diffuseIbl + specularIbl + visibility * direct + emissive;
 
   outFragColor = vec4(lit, alpha);
 }

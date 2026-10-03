@@ -20,6 +20,10 @@ struct Vertex {
   glm::vec3 normal;
   glm::vec2 uv;
   glm::vec4 tangent{1.0f, 0.0f, 0.0f, 1.0f};
+  glm::vec2 normalUv{0.0f};
+  glm::vec2 metallicRoughnessUv{0.0f};
+  glm::vec2 occlusionUv{0.0f};
+  glm::vec2 emissiveUv{0.0f};
 
   static vk::VertexInputBindingDescription bindingDescription() {
     return vk::VertexInputBindingDescription{
@@ -29,7 +33,7 @@ struct Vertex {
     };
   }
 
-  static std::array<vk::VertexInputAttributeDescription, 5>
+  static std::array<vk::VertexInputAttributeDescription, 9>
   attributeDescriptions() {
     return {
         vk::VertexInputAttributeDescription{
@@ -62,6 +66,26 @@ struct Vertex {
             .format = vk::Format::eR32G32B32A32Sfloat,
             .offset = offsetof(Vertex, tangent),
         },
+        vk::VertexInputAttributeDescription{.location = 5,
+                                            .binding = 0,
+                                            .format = vk::Format::eR32G32Sfloat,
+                                            .offset =
+                                                offsetof(Vertex, normalUv)},
+        vk::VertexInputAttributeDescription{
+            .location = 6,
+            .binding = 0,
+            .format = vk::Format::eR32G32Sfloat,
+            .offset = offsetof(Vertex, metallicRoughnessUv)},
+        vk::VertexInputAttributeDescription{.location = 7,
+                                            .binding = 0,
+                                            .format = vk::Format::eR32G32Sfloat,
+                                            .offset =
+                                                offsetof(Vertex, occlusionUv)},
+        vk::VertexInputAttributeDescription{.location = 8,
+                                            .binding = 0,
+                                            .format = vk::Format::eR32G32Sfloat,
+                                            .offset =
+                                                offsetof(Vertex, emissiveUv)},
     };
   }
 };
@@ -71,4 +95,4 @@ struct Mesh {
   Aabb localBounds{};
 };
 
-void generateMeshTangents(Mesh &mesh);
+void generateMeshTangents(Mesh &mesh, bool useNormalUv = false);

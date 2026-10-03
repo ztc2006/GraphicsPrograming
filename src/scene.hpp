@@ -8,6 +8,7 @@
 #include "camera.hpp"
 #include "glm_include.hpp"
 #include "scene_object.hpp"
+#include "texture_sampler.hpp"
 
 enum class AlphaMode : std::uint32_t {
   Opaque = 0,
@@ -28,17 +29,36 @@ inline char const *alphaModeLabel(AlphaMode mode) {
 }
 
 struct Material {
+  std::string name;
   std::string albedoPath;
   std::vector<std::byte> albedoBytes;
   std::string normalPath;
   std::vector<std::byte> normalBytes;
+  std::string metallicRoughnessPath;
+  std::vector<std::byte> metallicRoughnessBytes;
+  std::string occlusionPath;
+  std::vector<std::byte> occlusionBytes;
+  std::string emissivePath;
+  std::vector<std::byte> emissiveBytes;
   std::string heightPath;
   std::string alphaPath;
+  TextureSamplerDescription albedoSampler, normalSampler, metallicRoughnessSampler;
+  TextureSamplerDescription occlusionSampler, emissiveSampler, heightSampler, alphaSampler;
+  int albedoTexCoord = 0;
+  int normalTexCoord = 0;
+  int metallicRoughnessTexCoord = 0;
+  int occlusionTexCoord = 0;
+  int emissiveTexCoord = 0;
   glm::vec4 tint{1.0f};
+  glm::vec3 emissiveFactor{0.0f};
+  float metallicFactor = 0.0f;
+  float roughnessFactor = 1.0f;
+  float occlusionStrength = 1.0f;
   float normalScale = 1.0f;
   float parallaxScale = 0.04f;
   AlphaMode alphaMode = AlphaMode::Opaque;
   float alphaCutoff = 0.5f;
+  bool doubleSided = false;
 };
 
 struct LightingSettings {
@@ -47,8 +67,9 @@ struct LightingSettings {
   glm::vec3 color{1.0f, 0.98f, 0.92f};
   float ambientStrength = 0.08f;
   float diffuseStrength = 1.0f;
-  float specularStrength = 0.35f;
+  float specularStrength = 1.0f;
   float shininess = 32.0f;
+  int pbrDebugMode = 0;
   float shadowBiasSlope = 0.0025f;
   float shadowBiasConstant = 0.0007f;
   float shadowPcfRadius = 1.0f;
@@ -57,6 +78,13 @@ struct LightingSettings {
   float shadowNearPlane = 0.1f;
   float shadowFarPlane = 12.0f;
   float shadowLightDistance = 6.0f;
+  glm::vec3 shadowTarget{0.0f};
+  float environmentIntensity = 1.0f;
+  float exposureEv = 0.0f;
+  bool toneMappingEnabled = true;
+  float environmentRotation = 0.0f;
+  float environmentDiffuseStrength = 1.0f;
+  float environmentSpecularStrength = 1.0f;
 };
 
 struct Scene {

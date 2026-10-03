@@ -10,9 +10,11 @@
 #include <GLFW/glfw3.h>
 
 SwapChain::SwapChain(Device const &device, vk::raii::SurfaceKHR const &surface,
-                     GLFWwindow *window, vk::SwapchainKHR oldSwapChain)
+                     GLFWwindow *window, vk::SwapchainKHR oldSwapChain,
+                     std::string requestedPresent)
     : device_(device), surface_(surface), window_(window),
-      oldSwapChain_(oldSwapChain) {
+      oldSwapChain_(oldSwapChain),
+      requestedPresent_(std::move(requestedPresent)) {
   createSwapChain();
   createImageViews();
 }
@@ -43,17 +45,30 @@ std::uint32_t SwapChain::chooseSwapMinImageCount(
 vk::SurfaceFormatKHR SwapChain::chooseSwapSurfaceFormat(
     std::vector<vk::SurfaceFormatKHR> const &availableFormats) {
   assert(!availableFormats.empty());
-  auto formatIt =
-      std::ranges::find_if(availableFormats, [](auto const &format) {
-        return format.format == vk::Format::eB8G8R8A8Srgb &&
-               format.colorSpace == vk::ColorSpaceKHR::eSrgbNonlinear;
-      });
+  for (auto desired : {vk::Format::eB8G8R8A8Srgb, vk::Format::eR8G8B8A8Srgb,
+                       vk::Format::eB8G8R8A8Unorm, vk::Format::eR8G8B8A8Unorm}) {
+    auto found = std::ranges::find_if(availableFormats, [&](auto const &format) {
+      return format.format == desired && format.colorSpace == vk::ColorSpaceKHR::eSrgbNonlinear;
+    });
+    if (found != availableFormats.end()) return *found;
+  }
+  throw std::runtime_error("No supported 8-bit SDR sRGB-nonlinear surface format");
 
-  return formatIt != availableFormats.end() ? *formatIt : availableFormats[0];
 }
 
 vk::PresentModeKHR SwapChain::chooseSwapPresentMode(
-    std::vector<vk::PresentModeKHR> const &availablePresentModes) {
+    std::vector<vk::PresentModeKHR> const &availablePresentModes,
+    std::string const &requested) {
+  if (requested != "auto") {
+    auto mode = requested == "fifo"      ? vk::PresentModeKHR::eFifo
+                : requested == "mailbox" ? vk::PresentModeKHR::eMailbox
+                                         : vk::PresentModeKHR::eImmediate;
+    if (std::ranges::find(availablePresentModes, mode) ==
+        availablePresentModes.end())
+      throw std::runtime_error("Requested present mode is unsupported: " +
+                               requested);
+    return mode;
+  }
   assert(std::ranges::any_of(availablePresentModes, [](auto presentMode) {
     return presentMode == vk::PresentModeKHR::eFifo;
   }));
@@ -98,7 +113,8 @@ void SwapChain::createSwapChain() {
 
   auto availablePresentModes =
       device_.physicalDevice().getSurfacePresentModesKHR(*surface_);
-  auto presentMode = chooseSwapPresentMode(availablePresentModes);
+  presentMode_ =
+      chooseSwapPresentMode(availablePresentModes, requestedPresent_);
 
   std::array<std::uint32_t, 2> queueFamilyIndices = {
       device_.graphicsQueueFamilyIndex(),
@@ -121,7 +137,7 @@ void SwapChain::createSwapChain() {
           separateQueues ? queueFamilyIndices.data() : nullptr,
       .preTransform = surfaceCapabilities.currentTransform,
       .compositeAlpha = vk::CompositeAlphaFlagBitsKHR::eOpaque,
-      .presentMode = presentMode,
+      .presentMode = presentMode_,
       .clipped = true,
       .oldSwapchain = oldSwapChain_,
   };

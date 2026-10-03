@@ -1,451 +1,77 @@
-# Renderer 重构清单
-
-## 目标
-
-这一阶段的目标是完成当前渲染器的生命周期重构，而不是继续叠加新的渲染功能。
-
-只有满足下面这些条件，这一阶段才算完成：
-
-- `Renderer` 的构造函数不再依赖 `SwapChain`
-- 首次初始化和窗口 resize 后的重建都统一走 `renderer_->recreateForSwapChain(...)`
-- `Renderer` 内部已经清楚分出“长期资源”和“依赖 swapchain 的资源”
-- `drawFrame()` 已经按 `FrameContext + currentFrame_ + imagesInFlight_` 的模型组织
-- `Application` 在 swapchain 重建时不再销毁并重建整个 `Renderer`
-
-## 资源边界
-
-### 长期资源
-
-- `Device const &device_`
-- `vk::raii::CommandPool commandPool_`
-- `std::vector<FrameContext> frames_`
-- `vk::raii::CommandBuffers commandBuffers_`
-- `std::uint32_t currentFrame_`
-
-### 依赖 swapchain 的资源
-
-- `SwapChain const *swapChain_`
-- `vk::raii::PipelineLayout pipelineLayout_`
-- `vk::raii::Pipeline graphicsPipeline_`
-- `std::vector<vk::ImageLayout> swapChainImageLayouts_`
-- `std::vector<vk::Fence> imagesInFlight_`
-
-## Renderer 接口改造
-
-- 把构造函数改成 `explicit Renderer(Device const &device);`
-- 把 `SwapChain const &swapChain_` 改成 `SwapChain const *swapChain_ = nullptr;`
-- `FrameResult` 只保留这三种状态：
-  - `eSuccess`
-  - `eSwapChainOutOfDate`
-  - `eSwapChainSuboptimal`
-- 新增一个私有嵌套类型 `FrameContext`
-- 新增这些函数：
-  - `void recreateForSwapChain(SwapChain const &swapChain);`
-  - `void createPersistentResources();`
-  - `void createFrameResources();`
-  - `void createSwapChainDependentResources();`
-  - `void destroySwapChainDependentResources();`
-
-## FrameContext 结构草案
-
-```cpp
-struct FrameContext {
-  vk::raii::Semaphore imageAvailableSemaphore = nullptr;
-  vk::raii::Semaphore renderFinishedSemaphore = nullptr;
-  vk::raii::Fence inFlightFence = nullptr;
-};
-```
-
-这里的约束是：
-
-- `FrameContext` 作为 `Renderer` 的私有嵌套类型
-- 不要把 command buffer 塞进 `FrameContext`
-- `frames_[i]` 和 `commandBuffers_[i]` 永远表示同一个 frame slot
-
-## 同步模型
-
-- 这一阶段先固定 `kFramesInFlight = 1`
-- command buffer 按 `kFramesInFlight` 分配，而不是按 swapchain image 数量分配
-- 初始化时需要建立：
-  - `frames_.resize(kFramesInFlight)`
-  - `imagesInFlight_.assign(swapChain_->images().size(), vk::Fence{});`
-  - `swapChainImageLayouts_.assign(swapChain_->images().size(), vk::ImageLayout::eUndefined);`
-
-### drawFrame 规则
-
-- 用 `currentFrame_` 选出当前 frame slot
-- 在 acquire 前先等待当前 frame 的 fence
-- 如果 acquire 阶段因为 out-of-date 失败：
-  - 返回 `eSwapChainOutOfDate`
-  - 不推进 `currentFrame_`
-- 如果 `imagesInFlight_[imageIndex]` 不是空句柄，就先等它
-- 用下面这句把 swapchain image 和当前帧关联起来：
-  - `imagesInFlight_[imageIndex] = *frame.inFlightFence;`
-- 只有在 acquire 成功之后、submit 之前，才 reset 当前帧 fence
-- submit 时使用当前 frame 的 semaphore 和 fence
-- 如果 present 发生 out-of-date 或 suboptimal，并且 submit 已经发生：
-  - 返回对应的 `FrameResult`
-  - 仍然推进 `currentFrame_`
-- 只有在这次提交路径真的消耗了当前 frame slot 之后，才推进 `currentFrame_`
-
-## 异常处理规则
-
-- 在下面两个调用点周围捕获 `vk::OutOfDateKHRError`：
-  - `acquireNextImage(...)`
-  - `presentKHR(...)`
-- `Renderer` 内部不要吞掉资源创建失败的异常
-- `recreateForSwapChain(...)` 失败时，异常继续往上抛
-- 顶层清理边界保留在 `Application::run()`
-
-## recreateForSwapChain 的契约
-
-把它实现成一次原子状态切换：
-
-1. `destroySwapChainDependentResources()`
-2. `swapChain_ = nullptr`
-3. 绑定新的 swapchain
-4. 创建新的依赖 swapchain 的资源
-
-这里的规则是：
-
-- `destroySwapChainDependentResources()` 不能去查询 `swapChain_`
-- `destroySwapChainDependentResources()` 需要清掉：
-  - `graphicsPipeline_`
-  - `pipelineLayout_`
-  - `swapChainImageLayouts_`
-  - `imagesInFlight_`
-  - `swapChain_`
-- `createSwapChainDependentResources()` 必须要求 `swapChain_ != nullptr`
-- 如果重建失败，要让 `Renderer` 留在“未就绪但干净”的状态，不能留下“半旧半新”的混合状态
-
-## Application 侧改造
-
-### initVulkan
-
-- 用只依赖 `Device` 的方式创建 `Renderer`
-- 首次初始化也必须走统一入口：
-  - `renderer_ = std::make_unique<Renderer>(*device_);`
-  - `renderer_->recreateForSwapChain(*swapChain_);`
-
-### recreateSwapChain
-
-- `device_->logicalDevice().waitIdle()` 继续留在 `Application`
-- `SwapChain` 继续保留 `oldSwapchain` 交接逻辑
-- 不再销毁并重建整个 `Renderer`
-- 重建完 swapchain 之后调用：
-  - `renderer_->recreateForSwapChain(*swapChain_);`
-
-### mainLoop
-
-- `eSwapChainOutOfDate` 和 `eSwapChainSuboptimal` 都立即触发重建
-- `framebufferResized_` 继续作为额外的重建触发条件
-
-## SwapChain 规则
-
-- 保留 `oldSwapchain` 支持
-- 第一次创建时不传 old swapchain
-- 重建时传上一个原始 `vk::SwapchainKHR` 句柄
-- 旧的 swapchain 对象必须活到新的 swapchain 创建成功之后
-
-## 推荐实现顺序
-
-1. 先改 `renderer.hpp`
-2. 再改 `renderer.cpp` 里的资源归属和生命周期辅助函数
-3. 再改 `renderer.cpp` 里的帧同步和 `drawFrame()`
-4. 最后改 `application.cpp` 的初始化和重建流程
-5. 用 `.\run.ps1 -Compiler clang` 重新编译验证
-6. 对 resize 路径做压力测试
-
-## 验收清单
-
-- 程序仍然能正常绘制三角形
-- 窗口 resize 正常
-- 最小化和恢复正常
-- 快速连续 resize 30 到 60 秒不崩溃
-- resize / recreate 过程中没有 validation error
-- `Application::recreateSwapChain()` 里不再整颗重建 `Renderer`
-## Renderer / SwapChain 重建补充
-
-### 这一轮的目标
-
-这一轮不是加新渲染功能，而是把 `Renderer` 和 `Application` 的 swapchain 重建路径收紧成事务式切换。
-
-核心目标：
-
-- `Renderer::recreateForSwapChain(...)` 提供 strong guarantee
-- `Application::recreateSwapChain()` 也提供 strong guarantee
-- 失败时不留下半旧半新的状态
-- 成功时一次性提交新状态
-- `drawFrame()` 只运行在“已提交且完整”的 renderer 状态上
-
----
-
-## 设计原则
-
-### 1. Renderer 重建必须是事务式的
-
-`Renderer::recreateForSwapChain(SwapChain const &swapChain)` 不再走：
-
-1. 先销毁旧资源
-2. 再创建新资源
-
-而是改成：
-
-1. 校验传入的 `swapChain`
-2. 在局部变量里创建新的 pipeline / semaphore / 状态数组
-3. 全部成功后，用 `swap` 提交到成员
-4. 最后再更新 `swapChain_`
-5. 提交成功后把 `currentFrame_` 重置为 `0`
-
-要求：
-
-- 提交前不修改 `swapChain_`
-- 提交前不修改旧的 `pipelineLayout_`
-- 提交前不修改旧的 `graphicsPipeline_`
-- 提交前不修改旧的 `renderFinishedSemaphores_`
-- 提交前不修改旧的 `imagesInFlight_`
-- 提交前不修改旧的 `swapChainImageLayouts_`
-
-### 2. Application 重建也必须是事务式的
-
-`Application::recreateSwapChain()` 不再先 `move` 走成员 `swapChain_`。
-
-而是改成：
-
-1. 等待 framebuffer 尺寸恢复为非零
-2. `device_->logicalDevice().waitIdle()`
-3. 借用 `swapChain_->handle()` 作为 `oldSwapChainHandle`
-4. 在局部变量里创建 `newSwapChain`
-5. 调用 `renderer_->recreateForSwapChain(*newSwapChain)`
-6. 两者都成功后，再 `swapChain_.swap(newSwapChain)`
-7. 成功提交后再把 `framebufferResized_ = false`
-
-要求：
-
-- 提交前不 `std::move(swapChain_)`
-- 失败时保留旧的 `swapChain_`
-- 失败时保留旧的 renderer 已提交状态
-- `framebufferResized_` 只在成功提交后清零
-
----
-
-## 需要修改的文件
-
-- `src/renderer.hpp`
-- `src/renderer.cpp`
-- `src/application.cpp`
-
----
-
-## renderer.hpp 需要调整的点
-
-### 删掉这些旧接口
-
-- `createSwapChainDependentResources()`
-- `destroySwapChainDependentResources()`
-
-### 新增这些私有接口
-
-- `void validateSwapChainCandidate(SwapChain const &swapChain) const;`
-- `void validateSwapChainState() const;`
-- `vk::raii::Pipeline createGraphicsPipeline(SwapChain const &swapChain, vk::raii::PipelineLayout const &pipelineLayout) const;`
-
-### 保留这些成员边界
-
-长期资源：
-
-- `Device const &device_`
-- `vk::raii::CommandPool commandPool_`
-- `std::vector<FrameContext> frames_`
-- `vk::raii::CommandBuffers commandBuffers_`
-- `std::uint32_t currentFrame_`
-
-swapchain 相关资源：
-
-- `SwapChain const *swapChain_`
-- `vk::raii::PipelineLayout pipelineLayout_`
-- `vk::raii::Pipeline graphicsPipeline_`
-- `std::vector<vk::raii::Semaphore> renderFinishedSemaphores_`
-- `std::vector<vk::ImageLayout> swapChainImageLayouts_`
-- `std::vector<vk::Fence> imagesInFlight_`
-
----
-
-## renderer.cpp 需要调整的点
-
-### 1. `recreateForSwapChain(...)` 改成 strong guarantee
-
-实现顺序固定为：
-
-1. `validateSwapChainCandidate(swapChain)`
-2. 局部创建 `newPipelineLayout`
-3. 局部创建 `newGraphicsPipeline`
-4. 局部创建 `newRenderFinishedSemaphores`
-5. 局部创建 `newSwapChainImageLayouts`
-6. 局部创建 `newImagesInFlight`
-7. 用 `swap` 提交成员
-8. 最后提交 `swapChain_`
-9. `currentFrame_ = 0`
-
-提交阶段优先使用：
-
-- `swap(pipelineLayout_, newPipelineLayout)`
-- `swap(graphicsPipeline_, newGraphicsPipeline)`
-- `swap(renderFinishedSemaphores_, newRenderFinishedSemaphores)`
-- `swap(swapChainImageLayouts_, newSwapChainImageLayouts)`
-- `swap(imagesInFlight_, newImagesInFlight)`
-- 最后再提交 `swapChain_`
-
-### 2. `createGraphicsPipeline(...)` 改成纯构建函数
-
-要求：
-
-- 不再读取成员 `swapChain_`
-- 不再写成员 `pipelineLayout_`
-- 只依赖传入的 `SwapChain const &swapChain`
-- 只依赖传入的 `PipelineLayout`
-- 返回新建好的 `vk::raii::Pipeline`
-
-### 3. `drawFrame()` 开头先做状态校验
-
-在任何操作前先调用：
-
-- `validateSwapChainState()`
-
-然后再访问：
-
-- `frames_[currentFrame_]`
-- `commandBuffers_[currentFrame_]`
-- `swapChain_->handle()`
-
-### 4. `drawFrame()` 里增加边界检查
-
-至少显式检查：
-
-- `currentFrame_ < frames_.size()`
-- `imageIndex < renderFinishedSemaphores_.size()`
-
-### 5. `validateSwapChainCandidate(...)` 检查这些条件
-
-- `swapChain.images().size() > 0`
-- `swapChain.imageViews().size() == swapChain.images().size()`
-- `swapChain.imageFormat() != vk::Format::eUndefined`
-- `swapChain.extent().width > 0`
-- `swapChain.extent().height > 0`
-
-### 6. `validateSwapChainState()` 检查这些条件
-
-- `swapChain_ != nullptr`
-- `frames_.size() == kFramesInFlight`
-- `commandBuffers_.size() == kFramesInFlight`
-- `currentFrame_ < frames_.size()`
-- `pipelineLayout_` 已有效
-- `graphicsPipeline_` 已有效
-- `swapChain_->images().size() > 0`
-- `swapChain_->imageViews().size() == swapChain_->images().size()`
-- `renderFinishedSemaphores_.size() == swapChain_->images().size()`
-- `imagesInFlight_.size() == swapChain_->images().size()`
-- `swapChainImageLayouts_.size() == swapChain_->images().size()`
-
----
-
-## application.cpp 需要调整的点
-
-### 1. `mainLoop()` 不要在调用重建前提前清空 `framebufferResized_`
-
-现在的要求是：
-
-- 只有 `recreateSwapChain()` 成功提交后
-- 才把 `framebufferResized_ = false`
-
-### 2. `recreateSwapChain()` 开头加顶层状态检查
-
-至少检查：
-
-- `window_ != nullptr`
-- `device_ != nullptr`
-- `renderer_ != nullptr`
-- `swapChain_ != nullptr`
-
-### 3. `recreateSwapChain()` 改成 strong guarantee
-
-推荐顺序：
-
-1. 检查依赖成员存在
-2. 等待 framebuffer 尺寸非零
-3. `device_->logicalDevice().waitIdle()`
-4. 读取 `vk::SwapchainKHR oldSwapChainHandle = *swapChain_->handle();`
-5. 局部创建 `auto newSwapChain = std::make_unique<SwapChain>(...)`
-6. `renderer_->recreateForSwapChain(*newSwapChain)`
-7. `swapChain_.swap(newSwapChain)`
-8. `framebufferResized_ = false`
-
-### 4. 首次初始化保持现状
-
-`initVulkan()` 仍然用：
-
-- `renderer_ = std::make_unique<Renderer>(*device_);`
-- `renderer_->recreateForSwapChain(*swapChain_);`
-
-如果这里失败，直接让异常往上抛。
-
----
-
-## 额外实现细节
-
-### 头文件
-
-如果实现里用了 `std::move` 或 `swap`，记得补：
-
-- `#include <utility>`
-
-### 提交阶段规则
-
-提交阶段应该只做这些低风险动作：
-
-- `swap`
-- 指针切换
-- `currentFrame_ = 0`
-
-不要在提交阶段里再创建 Vulkan 资源。
-
----
-
-## 这一轮不做的事
-
-这轮不要顺手加入：
-
-- vertex buffer
-- index buffer
-- staging upload
-- push constant
-- scene / entity / camera
-- descriptor / material / resource manager
-
-这轮只收口：
-
-- swapchain 重建原子性
-- renderer 内部状态完整性
-- resize / recreate 异常安全
-
----
-
-## 验收标准补充
-
-编译标准：
-
-- `.\run.ps1 -Compiler clang` 重新通过
-
-运行标准：
-
-- 三角形仍然正常绘制
-- window resize 正常
-- minimize / restore 正常
-- 快速连续 resize 30 到 60 秒不崩溃
-- resize / recreate 过程中没有 validation warning / error
-
-语义标准：
-
-- `Renderer::recreateForSwapChain(...)` 失败时保持旧状态不变
-- `Application::recreateSwapChain()` 失败时保持旧状态不变
-- `drawFrame()` 不会看到半更新状态
+# Renderer 阶段执行清单
+
+更新：2026-10-03。当前入口：M2-B 最小单队列 Render Graph；M2-A 线性 HDR/统一显示输出已交付软件实现；M1-C cgltf 与 VMA buffer/image/staging 适配已交付。正式范围与依赖以 [Engine_Roadmap.md](./Engine_Roadmap.md) 为准；代码依据见 [Renderer_Design_Review.md](./Renderer_Design_Review.md)。
+
+旧生命周期重构方案已归档到 [完整旧版](./docs/archive/Renderer_Refactor_Checklist_before_2026-10-02.md)，其中先销毁旧资源、Windows launcher 和三角形验收等规则不再生效。
+
+## M0：真实硬件与图像基线
+
+状态：测量基础和软件设备功能证据已交付；硬件与画质验收按用户要求延后，等其通知换回 RTX 4060 Ti 后再执行。
+
+- [x] 记录实际运行设备、驱动、Vulkan API、堆容量、构建和 validation 启用状态；报告区分软件设备。
+- [x] GPU timestamp 按提交帧匹配、处理有效位/回绕；加入 Frame/Shadow/Main/UI 标签与资源名称。
+- [x] 输出 CPU 准备、fence/acquire/submit/present 时间，以及 GPU total/shadow/main/UI 的 CSV 和 p50/p95/p99。
+- [x] 记录初次场景加载耗时；支持 memory-budget 采样，包含新旧资源并存点，明确采样堆用量不是精确应用显存。
+- [x] 固定 static/orbit 相机路径、原生 framebuffer 尺寸校验、配置记录与 C++/shader 源码 SHA-256。
+- [x] 加入金属/粗糙度、UV 高频、alpha mask/blend、镜像单面几何诊断输入；保留 UV/矩阵、HDR 数据等语义回归。
+- [x] Release 原生 1080p 软件设备短测：材质场景 78 帧、四合院 orbit/UI 7 帧，GPU 查询全部匹配；图形退出回归通过。
+- [x] RenderDoc 1.45 实际抓帧并验证标签/资源，保存材质场景图像；作为功能与缺陷基线。
+- [ ] RTX 4060 Ti 实际显存/驱动/能力、validation layer 检查；可用 layer 下无错误。
+- [ ] RTX 4060 Ti 普通运行验收四合院和 Sponza_2；检查启动/UI/拖放/Reload、失败保留旧场景、连续切换及 resize。
+- [ ] 至少三次 30 秒预热 + 120 秒稳态：原生 1080p Release，吞吐/VSync 分开；接受硬件帧预算与显存余量。
+- [ ] 录制固定路径运动画质，建立 sampler/HDR/透明和镜像几何的参考对照；当前诊断图不能作为已正确的 PBR golden image。
+
+之前的 M0 执行环境未暴露硬件设备，软件设备没有代替硬件验收；当时的 `VK_LAYER_KHRONOS_validation` 不可用。本轮依用户要求不再排查物理设备访问，开发继续推进。命令与报告字段见 [README](./README.md#repeatable-m0-measurements)。
+
+## M1：资产生命周期与上传
+
+- [x] M1-A：用候选 GPU 资产集合替代候选完整 Renderer；上传完成后提交，失败保留旧场景。
+- [x] M1-A：场景资产与环境、流水线、frame context 解耦；现由 M1-B 在使用旧集合的帧完成后清理预览并释放旧集合，提交本身不等待。
+- [x] 软件 Vulkan 事务回归：4 次提交、6 帧，损坏纹理/非法网格/提交拒绝后仍可绘制；环境上传保持 1 次、流水线构建保持 8 次，UI 回调和帧编号连续。
+- [x] M1-B：每次场景准备只提交一个 UploadBatch，用一个 fence 确认完成并释放 staging；准备失败不提交半批资源。
+- [x] M1-B：单后台任务准备、主线程提交/就绪轮询、按完成帧退休旧集合与预览；运行时加载不显式等待上传/旧帧 fence。
+- [x] 应用回归：连续请求、失败回退、上传前后取消、真实 ImGui 预览退休、准备中退出；未提交候选缓存隔离和未完成上传强所有权。
+- [x] 单 mip 的图像/颜色空间视图、sampler、material binding 分离；相同编码内容去重，文件原地修改产生新图像，弱缓存不持有闲置 GPU 资源。
+- [x] glTF 每贴图 sampler/filter/wrap 解析与非法值回归；实际 mip 链、typed mip 用途与各向异性仍属 M3。
+- [x] 精确资源账本：有效数据与实际 allocation 字节分离；独立记录持久、准备/使用/退休场景私有资源、共享纹理与 staging 当前/峰值；共享对象不重复计数，保留单独 driver heap 采样。
+- [x] 账本回归：后台并发注册、失败回退、取消中保活、旧集合退休、重复加载共享稳定、Renderer 销毁归零；报告与 UI 暴露统计，硬件结果等待换机。
+- [x] staging 批量上传与完成 fence 替代每张纹理单独 queue.waitIdle；旧 Device 单次复制接口已移除。
+- [x] 软件 Vulkan 扩展回归：5 张不同图像单批上传，GPU 像素回读一致，采样器独立、文件/内嵌内容共享、文件修改失效、重复场景零新增图像复制。
+- [x] 比较 cgltf / fastgltf / TinyGLTF 当前主线及 VMA；固定 cgltf 1.15、MIT/provenance，库类型留在项目适配层，构建不下载依赖。见 [选择记录](docs/M1_C_Library_Decision.md)。
+- [x] sparse/normalized、交错基础+sparse、精确 sparse 索引、原始 tangent/handedness、独立 UV/变换、无 material 的默认材质与错误输入回归。
+- [x] required 扩展拒绝策略；optional 扩展警告随场景提交到 UI，失败保留旧场景与警告。10 项 CTest（含 2 项软件 Vulkan）及 ASan/UBSan 导入回归通过。
+- [x] VMA 3.3.0 buffer/staging 适配：项目所有权、映射/flush/invalidate、按 Upload/Resident 隔离生命周期、唯一 backing 与资源 range 分开记账；schema 2，保持异步/取消/退休/归零。
+- [x] 分配回归：共享块/偏移读写/越界/移动/并发/VMA 统计与上传块完全回收；10 项 CTest 与场景/报告烟测通过。见 [适配合同](docs/M1_C_VMA_Buffer_Adapter.md)。
+- [x] image 分配迁移：Texture/HDR、depth/shadow 使用公共 GpuAllocator；独立 view/sampler、默认 granularity、混合范围、RGBA32F 回读、失败/最后 image 归零与 3 次真实 resize/绘制通过。10 CTests、34 帧报告与四合院烟测；见 [图像适配](docs/M1_C_VMA_Image_Adapter.md)。
+- [ ] M3 验收现有资产必需的材质扩展，包括四合院 KHR_materials_specular；当前 optional fallback 警告明确，尚未宣称材质完全还原。
+
+## M2：线性 HDR 与通道资源
+
+- [x] M2-A：RGBA16F 主场景、天空、透明线性合成与统一 EV/filmic/sRGB 输出；环境强度独立，数据 debug 绕过显示曲线，UI 后绘制。实现前使用实时渲染技能，见 [决定](docs/M2_A_HDR_Decision.md)。
+- [x] M2-A：四种 sRGB/UNORM RGBA/BGRA、5 组显示设置数值回读；实际 PBR emissive/alpha blend 保留 >1、天空 EV/强度分离、非法 EV/nested frame 拒绝、输出构建失败保留旧资源、3 次 resize、最终账本归零。
+- [x] M2-A：10 项 CTest、24 帧完整 output 查询报告与四合院原生 1080p/UI/orbit 烟测；报告 schema 3，HDR 增加 15.82 MiB。见 [实施合同](docs/M2_A_HDR_Implementation.md)。
+- [ ] M2-A：换回 RTX 4060 Ti 后补新 RenderDoc 抓帧、画质与输出 pass 成本；本轮直接 Vulkan 1.3 软件设备注入未通过设备选择，未宣称抓帧成功。
+- [ ] 阴影、主场景、输出、UI 逐步迁移到最小单队列 Render Graph。
+- [ ] 正确处理可采样深度、resource 状态、attachment 保留、resize 与 GPU 退休资源。
+- [ ] frame context 具备正确生命周期后比较一帧/两帧配置；历史资源显式管理。
+
+## M3–M5：材质、光照和阴影
+
+- [ ] M3：typed mip、sampler/各向异性、alpha coverage、镜面抗锯齿；必要 glTF 扩展。
+- [ ] M3：GGX 环境预过滤、BRDF LUT、SH 校准与环境缓存；材质球和四合院参考对照。
+- [ ] M4：普通多灯 forward 先作为正确性对照，再接 clustered light culling；低灯数成本与溢出有回退。
+- [ ] M5：稳定 CSM、边界混合与偏移测试；四盏重点聚光灯阴影额度及投影者剔除。
+
+## M6–M8：运动画质和局部效果
+
+- [ ] M6：相机/物体运动矢量、jitter、历史拒绝与 clamp；透明、灯光变化和曝光变化测试。
+- [ ] M6：场景切换、相机跳变、resize 清历史；固定轨迹检查拖影与细节损失。
+- [ ] M7：GTAO 与滤波，正确调制间接光；可控 Bloom 与可关闭自动曝光。
+- [ ] M8：静态/按需局部探针、预过滤、箱体视差校正、混合与更新状态。
+- [ ] M8：SSR 深度层级与置信度、时间稳定和 probe fallback；镜面来源不重复累加。
+
+## 每次验收记录
+
+写图形代码前使用 `real-time-rendering-advisor` 核对资源、精度、同步、替代方案与可否证的验收，再实现。记录输入资产、提交/源码状态、驱动、构建类型、分辨率、相机路径、环境强度/曝光和质量档。保留开关对照、相关测试、GPU pass 时序、p50/p95/p99 与峰值显存；不能用软件 GPU 抓帧时间宣称 RTX 4060 Ti 达标。
+
+单个增量以 1–2 周可运行交付为目标，较大阶段拆分。主线之外的 GI、RT、GPU-driven、bindless、异步队列或虚拟几何只在需求/测量重新支持时立项。

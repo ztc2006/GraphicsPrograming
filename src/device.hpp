@@ -1,9 +1,14 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 #include "vulkan_include.hpp"
+#include "resource_ledger.hpp"
+#include "gpu_allocator.hpp"
 
 class Device {
 public:
@@ -16,17 +21,25 @@ public:
 
   Device(vk::raii::Instance const &instance,
          vk::raii::SurfaceKHR const &surface,
-         std::vector<char const *> requiredDeviceExtensions);
+         std::vector<char const *> requiredDeviceExtensions,
+         std::string preferredGpu = {}, bool debugUtils = false);
 
-  std::pair<vk::raii::Buffer, vk::raii::DeviceMemory>
+  using BufferResources = GpuBuffer;
+  BufferResources
   createBuffer(vk::DeviceSize size, vk::BufferUsageFlags usage,
-               vk::MemoryPropertyFlags properties) const;
+               vk::MemoryPropertyFlags properties,
+               ResourceLedger::Scope scope = {}) const;
 
-  std::uint32_t findMemoryType(std::uint32_t typeFilter,
-                               vk::MemoryPropertyFlags properties) const;
+  // Upload memory has independent lifetime: resident UBOs cannot pin its blocks.
+  BufferResources createUploadBuffer(vk::DeviceSize size) const;
 
-  void copyBuffer(vk::Buffer sourceBuffer, vk::Buffer destinationBuffer,
-                  vk::DeviceSize size) const;
+  GpuAllocator::Statistics gpuAllocationStatistics() const { return gpuAllocator_.statistics(); }
+
+  ResourceLedger const &resourceLedger() const { return resourceLedger_; }
+  GpuImage createImage(vk::ImageCreateInfo const &description,
+                       vk::DeviceSize payloadBytes,
+                       vk::MemoryPropertyFlags properties,
+                       ResourceLedger::Scope scope = {}) const;
 
   vk::raii::Device const &logicalDevice() const;
   vk::raii::PhysicalDevice const &physicalDevice() const;
@@ -39,7 +52,25 @@ public:
   std::uint32_t graphicsQueueFamilyIndex() const;
   std::uint32_t presentQueueFamilyIndex() const;
 
+  template <typename Handle>
+  void nameObject(Handle handle, char const *name) const {
+    auto raw = static_cast<typename Handle::CType>(handle);
+    std::uint64_t value;
+    if constexpr (std::is_pointer_v<decltype(raw)>)
+      value = reinterpret_cast<std::uint64_t>(raw);
+    else
+      value = static_cast<std::uint64_t>(raw);
+    setObjectName(Handle::objectType, value, name);
+  }
+  void beginLabel(vk::CommandBuffer command, char const *name) const;
+  void endLabel(vk::CommandBuffer command) const;
+  bool memoryBudgetSupported() const;
+  bool timelineSemaphoreSupported() const { return timelineSemaphoreSupported_; }
+  std::pair<std::uint64_t, std::uint64_t> memoryUsageBudget() const;
+
 private:
+  void setObjectName(vk::ObjectType type, std::uint64_t handle,
+                     char const *name) const;
   QueueFamilyIndices
   findQueueFamilies(vk::raii::PhysicalDevice const &physicalDevice) const;
   bool supportsRequiredExtensions(
@@ -53,9 +84,17 @@ private:
   vk::raii::SurfaceKHR const &surface_;
   std::vector<char const *> requiredDeviceExtensions_;
 
+  ResourceLedger resourceLedger_;
   vk::raii::PhysicalDevice physicalDevice_ = nullptr;
   vk::raii::Device device_ = nullptr;
   vk::raii::Queue graphicsQueue_ = nullptr;
   vk::raii::Queue presentQueue_ = nullptr;
   QueueFamilyIndices queueFamilyIndices_{};
+  std::string preferredGpu_;
+  bool debugUtils_ = false;
+  bool timelineSemaphoreSupported_ = false;
+  PFN_vkSetDebugUtilsObjectNameEXT setName_ = nullptr;
+  PFN_vkCmdBeginDebugUtilsLabelEXT beginLabel_ = nullptr;
+  PFN_vkCmdEndDebugUtilsLabelEXT endLabel_ = nullptr;
+  GpuAllocator gpuAllocator_;
 };

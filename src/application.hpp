@@ -1,18 +1,25 @@
 #pragma once
 
+#include <array>
 #include <chrono>
+#include <filesystem>
 #include <memory>
+#include <optional>
+#include <string>
 #include <vector>
 
 #include <imgui.h>
 
 #include "asset_ids.hpp"
 #include "asset_library.hpp"
+#include "benchmark_report.hpp"
 #include "input_state.hpp"
 #include "orbit_camera_controller.hpp"
 #include "scene.hpp"
 #include "scene_ecs.hpp"
+#include "viewer_options.hpp"
 #include "vulkan_include.hpp"
+#include <unordered_map>
 
 class Device;
 class Renderer;
@@ -21,12 +28,13 @@ struct GLFWwindow;
 
 class Application {
 public:
-  Application();
+  explicit Application(ViewerOptions options = {});
   ~Application();
 
   void run();
 
 private:
+  friend class ApplicationSceneLoadTest;
   void initWindow();
   void initVulkan();
   void mainLoop();
@@ -37,9 +45,20 @@ private:
   void createSurface();
   void updateScene();
   void createScene();
+  void loadScene(std::filesystem::path const &path);
+  void processPendingScene();
+  void cancelSceneLoad();
+  void advanceSceneLoad(bool waitForStartup = false);
+  struct SceneCandidate;
+  struct SceneLoad;
+  std::unique_ptr<SceneLoad> sceneLoad_;
+  void drawSceneBrowser();
+  static void dropCallback(GLFWwindow *window, int count, char const **paths);
   void initImGui();
   void beginImGuiFrame();
   void drawImGui();
+  void harvestBenchmarkTimings();
+  void finishBenchmark();
   void cleanupImGui();
   void clearMaterialPreviewTextures();
   ImTextureID materialAlbedoPreviewTexture(MaterialId materialId);
@@ -67,6 +86,14 @@ private:
       vk::DebugUtilsMessengerCallbackDataEXT const *callbackData, void *);
 
 private:
+  ViewerOptions options_;
+  BenchmarkMetadata benchmarkMetadata_{};
+  std::vector<BenchmarkFrame> benchmarkFrames_;
+  std::unordered_map<std::uint64_t, std::size_t> benchmarkFrameIndices_;
+  Camera benchmarkCamera_{};
+  bool debugUtilsEnabled_ = false;
+  unsigned validationErrors_ = 0, validationWarnings_ = 0;
+  std::chrono::steady_clock::time_point benchmarkStart_{};
   GLFWwindow *window_ = nullptr;
   bool framebufferResized_ = false;
 
@@ -80,12 +107,19 @@ private:
   std::vector<char const *> requiredDeviceExtensions_;
   bool validationLayersEnabled_ = false;
   bool imguiInitialized_ = false;
-  bool showAabbDebug_ = true;
+  bool showAabbDebug_ = false;
   bool shadowDebugEnabled_ = true;
   bool normalMapDebugEnabled_ = true;
   bool parallaxDebugEnabled_ = true;
   bool frustumCullingEnabled_ = false;
   bool animateScene_ = false;
+  std::optional<std::filesystem::path> startupScenePath_;
+  std::optional<std::filesystem::path> pendingScenePath_;
+  std::filesystem::path loadedScenePath_;
+  std::array<char, 4096> scenePathInput_{};
+  std::string sceneLoadError_;
+  std::vector<std::string> sceneLoadWarnings_;
+  std::filesystem::path browserDirectory_{"assets/models"};
   std::size_t renderQueueItems_ = 0;
   std::size_t visibleRenderQueueItems_ = 0;
   std::size_t culledRenderQueueItems_ = 0;
@@ -99,6 +133,7 @@ private:
   InputState input_{};
   AssetLibrary assets_{};
   Scene scene_{};
+  Camera sceneCamera_{};
   SceneEcs sceneEcs_{};
   OrbitCameraController orbitCameraController_{};
   std::chrono::steady_clock::time_point animationStartTime_ =

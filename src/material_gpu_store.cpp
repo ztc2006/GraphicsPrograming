@@ -1,14 +1,40 @@
 #include "material_gpu_store.hpp"
 
 #include <array>
+#include <cstring>
 #include <stdexcept>
 #include <utility>
 
-MaterialGpuStore::MaterialGpuStore(Device const &device) : device_(device) {
+vk::raii::DescriptorSetLayout
+MaterialGpuStore::createDescriptorSetLayout(Device const &device) {
   std::array bindings = {
       vk::DescriptorSetLayoutBinding{
           .binding = 0,
           .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+          .descriptorCount = 1,
+          .stageFlags = vk::ShaderStageFlagBits::eFragment,
+      },
+      vk::DescriptorSetLayoutBinding{
+          .binding = 4,
+          .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+          .descriptorCount = 1,
+          .stageFlags = vk::ShaderStageFlagBits::eFragment,
+      },
+      vk::DescriptorSetLayoutBinding{
+          .binding = 5,
+          .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+          .descriptorCount = 1,
+          .stageFlags = vk::ShaderStageFlagBits::eFragment,
+      },
+      vk::DescriptorSetLayoutBinding{
+          .binding = 6,
+          .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+          .descriptorCount = 1,
+          .stageFlags = vk::ShaderStageFlagBits::eFragment,
+      },
+      vk::DescriptorSetLayoutBinding{
+          .binding = 7,
+          .descriptorType = vk::DescriptorType::eUniformBuffer,
           .descriptorCount = 1,
           .stageFlags = vk::ShaderStageFlagBits::eFragment,
       },
@@ -37,30 +63,32 @@ MaterialGpuStore::MaterialGpuStore(Device const &device) : device_(device) {
       .pBindings = bindings.data(),
   };
 
-  materialDescriptorSetLayout_ =
-      vk::raii::DescriptorSetLayout(device_.logicalDevice(), createInfo);
-
-  TextureLoader textureLoader(device_);
-  flatNormalTexture_ = textureLoader.createSolidColor({128, 128, 255, 255});
-  flatHeightTexture_ = textureLoader.createSolidColor({0, 0, 0, 255});
-  flatAlphaTexture_ = textureLoader.createSolidColor({255, 255, 255, 255});
+  return vk::raii::DescriptorSetLayout(device.logicalDevice(), createInfo);
 }
 
-void MaterialGpuStore::setMaterials(std::vector<Material> const &materials) {
-  std::vector<MaterialGpuResources> newMaterials =
-      createMaterialResources(materials);
-
-  vk::raii::DescriptorPool newPool = createMaterialDescriptorPool(
-      static_cast<std::uint32_t>(newMaterials.size()));
-
-  materialGpuResources_.swap(newMaterials);
-  materialDescriptorPool_ = std::move(newPool);
+MaterialGpuStore::MaterialGpuStore(Device const &device,
+                                   vk::DescriptorSetLayout layout,
+                                   std::vector<Material> const &materials,
+                                   TextureCache &textures, UploadBatch &uploads, ResourceLedger::Scope scope)
+    : device_(device), materialDescriptorSetLayout_(layout), resourceScope_(std::move(scope)) {
+  flatNormalTexture_ =
+      textures.solid({128, 128, 255, 255}, TextureColorSpace::Linear, uploads);
+  flatHeightTexture_ =
+      textures.solid({0, 0, 0, 255}, TextureColorSpace::Linear, uploads);
+  whiteDataTexture_ =
+      textures.solid({255, 255, 255, 255}, TextureColorSpace::Linear, uploads);
+  whiteColorTexture_ =
+      textures.solid({255, 255, 255, 255}, TextureColorSpace::Srgb, uploads);
+  materialGpuResources_ = createMaterialResources(materials, textures, uploads);
+  materialDescriptorPool_ = createMaterialDescriptorPool(
+      static_cast<std::uint32_t>(materialGpuResources_.size()));
   writeMaterialDescriptorSets();
 }
 
 std::vector<MaterialGpuStore::MaterialGpuResources>
 MaterialGpuStore::createMaterialResources(
-    std::vector<Material> const &materials) const {
+    std::vector<Material> const &materials, TextureCache &textures,
+    UploadBatch &uploads) const {
   if (materials.empty()) {
     throw std::runtime_error(
         "Material GPU store requires at least one material.");
@@ -69,33 +97,52 @@ MaterialGpuStore::createMaterialResources(
   std::vector<MaterialGpuResources> newMaterials;
   newMaterials.reserve(materials.size());
 
-  TextureLoader textureLoader(device_);
-
+  auto load = [&](std::string const &path, std::vector<std::byte> const &bytes,
+                  char const *label, TextureColorSpace colorSpace,
+                  TextureSamplerDescription const &sampler)
+      -> std::optional<TextureResources> {
+    if (!bytes.empty())
+      return textures.encoded(bytes, label, colorSpace, sampler, uploads);
+    if (!path.empty())
+      return textures.file(path, colorSpace, sampler, uploads);
+    return std::nullopt;
+  };
   for (Material const &material : materials) {
     MaterialGpuResources resources{};
-    if (!material.albedoBytes.empty()) {
-      resources.albedoTexture =
-          textureLoader.createFromEncodedBytes(material.albedoBytes,
-                                               "material albedo");
-    } else {
-      resources.albedoTexture =
-          material.albedoPath.empty()
-              ? textureLoader.createSolidColor({255, 255, 255, 255})
-              : textureLoader.createFromFile(material.albedoPath);
-    }
-    if (!material.normalBytes.empty()) {
-      resources.normalTexture =
-          textureLoader.createFromEncodedBytes(material.normalBytes,
-                                               "material normal");
-    } else if (!material.normalPath.empty()) {
-      resources.normalTexture = textureLoader.createFromFile(material.normalPath);
-    }
-    if (!material.heightPath.empty()) {
-      resources.heightTexture = textureLoader.createFromFile(material.heightPath);
-    }
-    if (!material.alphaPath.empty()) {
-      resources.alphaTexture = textureLoader.createFromFile(material.alphaPath);
-    }
+    auto albedo =
+        load(material.albedoPath, material.albedoBytes, "material albedo",
+             TextureColorSpace::Srgb, material.albedoSampler);
+    resources.albedoTexture = albedo ? *albedo : whiteColorTexture_;
+    resources.normalTexture =
+        load(material.normalPath, material.normalBytes, "material normal",
+             TextureColorSpace::Linear, material.normalSampler);
+    resources.heightTexture =
+        load(material.heightPath, {}, "material height",
+             TextureColorSpace::Linear, material.heightSampler);
+    resources.alphaTexture =
+        load(material.alphaPath, {}, "material alpha",
+             TextureColorSpace::Linear, material.alphaSampler);
+    resources.metallicRoughnessTexture =
+        load(material.metallicRoughnessPath, material.metallicRoughnessBytes,
+             "material metallic-roughness", TextureColorSpace::Linear,
+             material.metallicRoughnessSampler);
+    resources.occlusionTexture = load(
+        material.occlusionPath, material.occlusionBytes, "material occlusion",
+        TextureColorSpace::Linear, material.occlusionSampler);
+    resources.emissiveTexture =
+        load(material.emissivePath, material.emissiveBytes, "material emissive",
+             TextureColorSpace::Srgb, material.emissiveSampler);
+
+    resources.uniform = device_.createBuffer(
+        sizeof(MaterialUniformBufferObject), vk::BufferUsageFlagBits::eUniformBuffer,
+        vk::MemoryPropertyFlagBits::eHostVisible,
+        resourceScope_);
+    MaterialUniformBufferObject materialUbo{
+        .pbrParams = {material.metallicFactor, material.roughnessFactor,
+                      material.occlusionStrength, 0.0f},
+        .emissiveFactor = glm::vec4(material.emissiveFactor, 0.0f),
+    };
+    resources.uniform.write(std::as_bytes(std::span{&materialUbo, 1}));
     resources.tint = material.tint;
     resources.surfaceParams = {
         material.normalScale,
@@ -105,6 +152,7 @@ MaterialGpuStore::createMaterialResources(
         material.heightPath.empty() ? 0.0f : 1.0f,
     };
     resources.alphaMode = material.alphaMode;
+    resources.doubleSided = material.doubleSided;
     resources.alphaParams = {
         static_cast<float>(material.alphaMode),
         material.alphaCutoff,
@@ -151,23 +199,23 @@ void MaterialGpuStore::setMaterialAlphaParams(MaterialId materialId,
   material.alphaParams.y = alphaCutoff;
 }
 
-void MaterialGpuStore::setSurfaceDebugEnabled(bool normalMapsEnabled,
-                                              bool parallaxEnabled) {
-  normalMapsEnabled_ = normalMapsEnabled;
-  parallaxEnabled_ = parallaxEnabled;
-}
-
 vk::raii::DescriptorPool MaterialGpuStore::createMaterialDescriptorPool(
     std::uint32_t materialCount) const {
-  vk::DescriptorPoolSize poolSize{
-      .type = vk::DescriptorType::eCombinedImageSampler,
-      .descriptorCount = materialCount * 4,
+  std::array poolSizes = {
+      vk::DescriptorPoolSize{
+          .type = vk::DescriptorType::eCombinedImageSampler,
+          .descriptorCount = materialCount * 7,
+      },
+      vk::DescriptorPoolSize{
+          .type = vk::DescriptorType::eUniformBuffer,
+          .descriptorCount = materialCount,
+      },
   };
 
   vk::DescriptorPoolCreateInfo createInfo{
       .maxSets = materialCount,
-      .poolSizeCount = 1,
-      .pPoolSizes = &poolSize,
+      .poolSizeCount = static_cast<std::uint32_t>(poolSizes.size()),
+      .pPoolSizes = poolSizes.data(),
   };
 
   return vk::raii::DescriptorPool(device_.logicalDevice(), createInfo);
@@ -183,7 +231,7 @@ MaterialGpuStore::material(MaterialId materialId) const {
 
 void MaterialGpuStore::writeMaterialDescriptorSets() {
   std::vector<vk::DescriptorSetLayout> layouts(materialGpuResources_.size(),
-                                               *materialDescriptorSetLayout_);
+                                               materialDescriptorSetLayout_);
 
   vk::DescriptorSetAllocateInfo allocateInfo{
       .descriptorPool = *materialDescriptorPool_,
@@ -193,41 +241,73 @@ void MaterialGpuStore::writeMaterialDescriptorSets() {
 
   auto descriptorSets =
       (*device_.logicalDevice()).allocateDescriptorSets(allocateInfo);
+  descriptorAccounting_ = resourceScope_.track(
+      {.descriptorPools = 1, .descriptorSets = descriptorSets.size()});
 
   for (std::size_t index = 0; index < materialGpuResources_.size(); ++index) {
     auto &material = materialGpuResources_[index];
     material.descriptorSet = descriptorSets[index];
 
-    TextureResources const &normalTexture =
-        material.normalTexture.has_value() ? *material.normalTexture
-                                           : flatNormalTexture_;
-    TextureResources const &heightTexture =
-        material.heightTexture.has_value() ? *material.heightTexture
-                                           : flatHeightTexture_;
-    TextureResources const &alphaTexture =
-        material.alphaTexture.has_value() ? *material.alphaTexture
-                                          : flatAlphaTexture_;
+    TextureResources const &normalTexture = material.normalTexture.has_value()
+                                                ? *material.normalTexture
+                                                : flatNormalTexture_;
+    TextureResources const &heightTexture = material.heightTexture.has_value()
+                                                ? *material.heightTexture
+                                                : flatHeightTexture_;
+    TextureResources const &alphaTexture = material.alphaTexture.has_value()
+                                               ? *material.alphaTexture
+                                               : whiteDataTexture_;
+    TextureResources const &metallicRoughnessTexture =
+        material.metallicRoughnessTexture.has_value()
+            ? *material.metallicRoughnessTexture
+            : whiteDataTexture_;
+    TextureResources const &occlusionTexture =
+        material.occlusionTexture.has_value() ? *material.occlusionTexture
+                                              : whiteDataTexture_;
+    TextureResources const &emissiveTexture =
+        material.emissiveTexture.has_value() ? *material.emissiveTexture
+                                             : whiteColorTexture_;
     std::array imageInfos = {
         vk::DescriptorImageInfo{
-            .sampler = *material.albedoTexture.sampler,
-            .imageView = *material.albedoTexture.imageView,
+            .sampler = material.albedoTexture.sampler(),
+            .imageView = material.albedoTexture.imageView(),
             .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
         },
         vk::DescriptorImageInfo{
-            .sampler = *normalTexture.sampler,
-            .imageView = *normalTexture.imageView,
+            .sampler = normalTexture.sampler(),
+            .imageView = normalTexture.imageView(),
             .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
         },
         vk::DescriptorImageInfo{
-            .sampler = *heightTexture.sampler,
-            .imageView = *heightTexture.imageView,
+            .sampler = heightTexture.sampler(),
+            .imageView = heightTexture.imageView(),
             .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
         },
         vk::DescriptorImageInfo{
-            .sampler = *alphaTexture.sampler,
-            .imageView = *alphaTexture.imageView,
+            .sampler = alphaTexture.sampler(),
+            .imageView = alphaTexture.imageView(),
             .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
         },
+        vk::DescriptorImageInfo{
+            .sampler = metallicRoughnessTexture.sampler(),
+            .imageView = metallicRoughnessTexture.imageView(),
+            .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+        },
+        vk::DescriptorImageInfo{
+            .sampler = occlusionTexture.sampler(),
+            .imageView = occlusionTexture.imageView(),
+            .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+        },
+        vk::DescriptorImageInfo{
+            .sampler = emissiveTexture.sampler(),
+            .imageView = emissiveTexture.imageView(),
+            .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+        },
+    };
+    vk::DescriptorBufferInfo bufferInfo{
+        .buffer = *material.uniform.buffer,
+        .offset = 0,
+        .range = sizeof(MaterialUniformBufferObject),
     };
 
     std::array writes = {
@@ -258,6 +338,34 @@ void MaterialGpuStore::writeMaterialDescriptorSets() {
             .descriptorCount = 1,
             .descriptorType = vk::DescriptorType::eCombinedImageSampler,
             .pImageInfo = &imageInfos[3],
+        },
+        vk::WriteDescriptorSet{
+            .dstSet = material.descriptorSet,
+            .dstBinding = 4,
+            .descriptorCount = 1,
+            .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+            .pImageInfo = &imageInfos[4],
+        },
+        vk::WriteDescriptorSet{
+            .dstSet = material.descriptorSet,
+            .dstBinding = 5,
+            .descriptorCount = 1,
+            .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+            .pImageInfo = &imageInfos[5],
+        },
+        vk::WriteDescriptorSet{
+            .dstSet = material.descriptorSet,
+            .dstBinding = 6,
+            .descriptorCount = 1,
+            .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+            .pImageInfo = &imageInfos[6],
+        },
+        vk::WriteDescriptorSet{
+            .dstSet = material.descriptorSet,
+            .dstBinding = 7,
+            .descriptorCount = 1,
+            .descriptorType = vk::DescriptorType::eUniformBuffer,
+            .pBufferInfo = &bufferInfo,
         },
     };
 

@@ -23,6 +23,10 @@ layout(location = 1) in vec3 inColor;
 layout(location = 2) in vec3 inNormal;
 layout(location = 3) in vec2 inUv;
 layout(location = 4) in vec4 inTangent;
+layout(location = 5) in vec2 inNormalUv;
+layout(location = 6) in vec2 inMetallicRoughnessUv;
+layout(location = 7) in vec2 inOcclusionUv;
+layout(location = 8) in vec2 inEmissiveUv;
 
 layout(location = 0) out vec3 outColor;
 layout(location = 1) out vec2 outUv;
@@ -30,6 +34,10 @@ layout(location = 2) out vec3 outWorldPos;
 layout(location = 3) out vec3 outWorldNormal;
 layout(location = 4) out vec4 outLightClipPos;
 layout(location = 5) out vec4 outWorldTangent;
+layout(location = 6) out vec2 outNormalUv;
+layout(location = 7) out vec2 outMetallicRoughnessUv;
+layout(location = 8) out vec2 outOcclusionUv;
+layout(location = 9) out vec2 outEmissiveUv;
 
 void main()
 {
@@ -39,10 +47,14 @@ void main()
   gl_Position = ubo.viewProj * worldPos;
   outColor = inColor;
   outUv = inUv;
+  outNormalUv = inNormalUv;
+  outMetallicRoughnessUv = inMetallicRoughnessUv;
+  outOcclusionUv = inOcclusionUv;
+  outEmissiveUv = inEmissiveUv;
   outWorldPos = worldPos.xyz;
   outWorldNormal = normalize(normalMatrix * inNormal);
   outLightClipPos = ubo.lightViewProj * worldPos;
   outWorldTangent =
       vec4(normalize(mat3(pushConstants.transform) * inTangent.xyz),
-           inTangent.w);
+           inTangent.w * sign(determinant(mat3(pushConstants.transform))));
 }

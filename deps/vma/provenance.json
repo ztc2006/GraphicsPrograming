@@ -1,0 +1,12 @@
+{
+  "library": "VulkanMemoryAllocator",
+  "version": "3.3.0",
+  "commit": "1d8f600fd424278486eade7ed3e877c99f0846b1",
+  "source": "https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator/tree/v3.3.0",
+  "license": "MIT",
+  "sha256": {
+    "vk_mem_alloc.h": "90ce12fc4a2466235a09ae02905dd0c13aee80c1bbf11b331ab61230c2ceb112",
+    "LICENSE.txt": "8d70e4cf2a9941f6454da71cd60e38484dd3e34810c824760d550e982af6d97a"
+  },
+  "modified_upstream_files": false
+}
