@@ -31,9 +31,9 @@ if bash "$TMP/project/run.sh" --no-build one.glb two.glb; then exit 1; fi
 bash "$TMP/project/run.sh" --build-only
 test ! -s "$LAUNCH_TEST_ARGS"
 cd "$TMP/caller"
-bash "$TMP/project/run.sh" --no-build --benchmark "results with spaces" --size 1920x1080 --warmup 0 --duration 2 --gpu "RTX 2060" --no-ui "model with spaces.GLB"
+bash "$TMP/project/run.sh" --no-build --benchmark "results with spaces" --size 1920x1080 --warmup 0 --duration 2 --gpu "RTX 2060" --frames-in-flight 2 --present-sync legacy --no-ui "model with spaces.GLB"
 python3 - "$LAUNCH_TEST_ARGS" "$TMP/caller" <<'PY'
 import pathlib,sys
 lines=pathlib.Path(sys.argv[1]).read_text().splitlines()[1:]
-assert lines == ['--benchmark',sys.argv[2]+'/results with spaces','--size','1920x1080','--warmup','0','--duration','2','--gpu','RTX 2060','--no-ui',sys.argv[2]+'/model with spaces.GLB'], lines
+assert lines == ['--benchmark',sys.argv[2]+'/results with spaces','--size','1920x1080','--warmup','0','--duration','2','--gpu','RTX 2060','--frames-in-flight','2','--present-sync','legacy','--no-ui',sys.argv[2]+'/model with spaces.GLB'], lines
 PY

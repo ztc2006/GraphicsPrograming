@@ -41,7 +41,7 @@ void writeBenchmarkReport(std::filesystem::path const &directory,
       csv << ",,,,";
     csv << ',' << f.shadowDraws << ',' << f.mainDraws << '\n';
   }
-  json << std::boolalpha << std::setprecision(9) << "{\n  \"schema\": 3,\n";
+  json << std::boolalpha << std::setprecision(9) << "{\n  \"schema\": 4,\n";
   auto text = [&](char const *key, std::string const &v) {
     json << "  \"" << key << "\": " << jsonString(v) << ",\n";
   };
@@ -54,6 +54,18 @@ void writeBenchmarkReport(std::filesystem::path const &directory,
   text("camera_path", m.cameraPath);
   text("present_mode", m.presentMode);
   text("build_type", m.buildType);
+  text("frame_target_policy", "shared_hdr_depth_shadow");
+  text("present_sync_backend", m.presentSyncBackend);
+  text("present_sync_reason", m.presentSyncReason);
+  json << "  \"present_fences_enabled\": " << m.presentFencesEnabled
+       << ",\n  \"presentation_release_proven\": " << m.presentationReleaseProven
+       << ",\n  \"present_queued_count\": " << m.presentQueued
+       << ",\n  \"present_fence_completed_count\": " << m.presentCompleted
+       << ",\n  \"pending_present_fences\": " << m.pendingPresentFences
+       << ",\n  \"present_fence_wait_count\": " << m.presentFenceWaits
+       << ",\n  \"legacy_present_drain_count\": " << m.legacyPresentDrains << ",\n";
+  json << "  \"frames_in_flight\": " << m.framesInFlight
+       << ",\n  \"swapchain_image_count\": " << m.swapchainImageCount << ",\n";
   json << "  \"width\": " << m.width << ",\n  \"height\": " << m.height
        << ",\n  \"software_device\": " << m.software
        << ",\n  \"validation_enabled\": " << m.validation

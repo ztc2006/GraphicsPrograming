@@ -21,8 +21,26 @@ are tested; see the [image allocator contract](docs/M1_C_VMA_Image_Adapter.md).
 M2-A now renders scene, sky and transparent surfaces into linear RGBA16F, then
 applies one exposure/tone-map/sRGB display output before UI. See the
 [HDR decision](docs/M2_A_HDR_Decision.md) and
-[implementation contract](docs/M2_A_HDR_Implementation.md). M2-B next migrates
-passes into the minimal single-queue Render Graph.
+[implementation contract](docs/M2_A_HDR_Implementation.md). M2-B now schedules
+shadow/main/display/UI through a minimal single-queue Render Graph, with sampled
+scene depth, explicit attachment preservation and an inspectable resource/pass
+plan. See the [graph contract](docs/M2_B_Graph_Implementation.md). M2-C1 provides
+startup-selectable one/two frame contexts with separate mutable resources and
+per-submission completion delivery. See the [frame contract](docs/M2_C_Frames_Implementation.md).
+M2-C2 adds capability-selected KHR/EXT present fences and swapchain-owned
+presentation resources. See the [presentation contract](docs/M2_C2_Presentation_Implementation.md).
+M3-A1 adds typed CPU mip chains, complete image uploads/views and working glTF
+minification; see the [decision](docs/M3_A1_Texture_Mips_Decision.md).
+M3-A2 adds single-source alpha coverage, editable fallback views, vertex alpha,
+pinned MikkTSpace and normal/reflected-culling contracts;
+[19/19 software regressions pass](docs/M3_A2_Material_Implementation.md).
+M3-B adds GGX cubemap prefiltering, a split-sum BRDF LUT, calibrated SH and
+versioned environment baking caches; [20/20 software regressions pass](docs/M3_B_IBL_Implementation.md).
+M3-C1 adds KHR_materials_specular (factor, linear alpha/sRGB color textures,
+independent UV/samplers, direct and IBL response) and a UI-loadable
+[reference grid](assets/render_tests/specular_reference.gltf);
+[20/20 software regressions pass](docs/M3_C1_Specular_Implementation.md).
+Next: M3-C2 normal variance filtering and specular antialiasing.
 
 Build and open the viewer:
 
@@ -63,8 +81,8 @@ Rendering includes direct Cook-Torrance PBR and SH diffuse environment lighting.
 The **Lighting** panel separates **Environment Intensity** (sky and IBL radiance)
 from **Exposure EV** (whole-scene display exposure; +1 EV doubles input radiance)
 and **Tone Mapping**. Data debug views bypass exposure and tone mapping.
-Specular IBL currently uses an approximation; GGX environment prefiltering and a
-split-sum BRDF LUT are still pending. Lighting's PBR Debug selector exposes base
+Specular IBL samples a GGX prefiltered cubemap and split-sum BRDF LUT;
+see the [IBL decision](docs/M3_B_IBL_Decision.md). Lighting's PBR Debug selector exposes base
 color, metallic, roughness, normals, AO and environment-light components.
 
 
@@ -89,12 +107,14 @@ Each run writes `frames.csv` and `summary.json`, refuses to overwrite a previous
 report and exits after the requested duration. Reports include the actual device,
 driver/API, build type, a SHA-256 fingerprint of project C++/shader sources,
 framebuffer size, initial camera, environment intensity, exposure EV, tone mapping,
-scene color format, load time, draw counts and p50/p95/p99. Report schema 3 adds
+scene color format, load time, draw counts and p50/p95/p99. Current schema 4 adds
+`frames_in_flight`, `swapchain_image_count` and `frame_target_policy`. Schema 3 added
 `gpu_output_ms`, `exposure_ev`, `tone_mapping_enabled` and `scene_color_format`;
 `environment_intensity` replaces the misleading `environment_exposure` key.
 CPU frame/preparation, fence/acquire/submit/present call time and GPU total/shadow/
 main/output/UI intervals are recorded separately. GPU query results are matched to their
-submitted frame after the existing fence completes. Unsupported timing is marked
+submitted frame through a completion callback after its fence completes. All
+completed slots are delivered once, including final drain. Unsupported timing is marked
 missing; disabled UI has zero GPU UI time.
 
 Device-local heap capacity and optional driver-reported memory-budget samples
@@ -179,10 +199,30 @@ metric. VMA backing allocations belong to `allocator_blocks`; resource domains r
 payloads and suballocations. Final resource release also releases allocator blocks.
 
 glTF mag/min/mip filter choices and wrapS/wrapT now remain separate per texture;
-invalid sampler indices/filter/wrap values produce errors. Images still have one
-mip level with maxLod=0. Typed mip generation, anisotropy and alpha coverage are
-M3 work, so this change does not resolve the diagnostic ground's minification
-aliasing by itself.
+invalid sampler indices/filter/wrap values produce errors. M3-A1 now generates
+complete typed mip chains: color RGB is filtered in linear space and re-encoded;
+data channels average independently; normal vectors are averaged/renormalized.
+NPOT edge texels contribute through area weights. Encoded content, color space,
+mip policy and algorithm version identify shared images; samplers remain separate.
+Omitted filters default to linear/trilinear; explicit glTF modes remain intact.
+Mip sampling uses the image view's complete chain. Non-mip modes use nearest mip
+and maxLod=0.25 to preserve different min/mag filters. Eligible linear/trilinear
+requests use up to 8x anisotropy when the enabled device feature/limit permits it.
+M3-A2 adds cutoff/factor-aware coverage mips for a single opacity source:
+baseColor A or separate OBJ opacity R. Material edits, compound sources,
+non-unit vertex alpha and active parallax use prebound LOD 0 views sharing the
+same storage; restoring parameters restores coverage filtering. COLOR_0 alpha
+is preserved. Pinned MikkTSpace splits incompatible mirrored-UV corners;
+normalScale, backface TBN, nonuniform/negative transforms and single-sided
+reflected culling have production shader pixel regressions. See the
+[decision](docs/M3_A2_Material_Decision.md) and
+[implementation](docs/M3_A2_Material_Implementation.md): 19/19 CPU/software
+Vulkan tests pass. These approximations do not complete motion stability.
+M3-B retains the original HDR sky and uploads an immutable GGX cube/LUT in one
+cold-start batch. Its CPU cache at `.cache/ibl` validates source/settings/version
+and recovers from corrupted or unwritable files. Roughness selects the cube LOD;
+exposure remains in the display output. Normal variance/specular AA, necessary
+specular extensions and final hardware quality remain open.
 
 An optional graphical regression exercises the real Renderer, including texture
 decode failure after geometry recording, invalid geometry, commit rejection while
@@ -232,3 +272,81 @@ It retains the asynchronous scene/ImGui tests and final-zero resource checks.
 Current llvmpipe results establish numeric correctness, not RTX frame-budget or
 motion-quality acceptance. The direct Vulkan 1.3 RenderDoc attempt on this software
 configuration failed device selection; a new hardware capture remains pending.
+
+
+## Minimal Render Graph (M2-B)
+
+`Application` submits scene draw lists once; `Renderer` organizes passes. The graph
+imports shadow/depth/HDR/swapchain images, checks initialized contents and
+attachment load/store contracts, infers RAW/WAR/WAW dependencies, and records
+synchronization2 barriers and dynamic-rendering boundaries. Main depth is stored
+and exported read-only. UI uses a separate LOAD/STORE pass with a same-layout
+color dependency. Initially disabled shadows get one far-depth clear; later
+frames reuse the defined read-only image. State is published after successful
+submission. The Render Debug panel exposes the resource/pass/barrier plan.
+
+Eleven CTests pass (nine CPU and two llvmpipe/X11 GPU), including numeric HDR,
+UI pixel preservation, opaque depth beneath alpha blend, shadow toggles and
+independent visible/caster lists, failed target replacement, actual resize,
+asynchronous ImGui scene loading and final resource zero. The window manager did
+not confirm native iconify; explicit restore/recreation and rendering passed,
+while native minimize and zero-size waiting still need acceptance. No aliasing,
+multiple queues or temporal-history allocation is included in this increment.
+See the [decision](docs/M2_B_Graph_Decision.md) and
+[implementation contract](docs/M2_B_Graph_Implementation.md).
+
+
+## Frame contexts (M2-C1)
+
+```bash
+./run.sh --no-build --frames-in-flight 2 assets/models/siheyuan/source/siheyuan.glb
+```
+
+Default is one frame; startup accepts only one or two. Uniforms, descriptor sets,
+commands, query pools, acquire semaphores and submit fences are independent per
+slot. HDR/depth/shadow images stay shared with graph barriers across submissions;
+render-finished semaphores remain per swapchain image. This is a correctness and
+measurement configuration; throughput and latency require RTX 4060 Ti measurements.
+Report schema 4 and Render Debug identify the active configuration.
+
+One/two-frame WSI tests cover HDR, real ImGui loading/preview retirement, resize
+and shutdown. A timeline-gated offscreen scene verifies distinct pending uniforms,
+query delivery without loss/duplicates, slot reuse, reverse completion order and
+scene/UI lifetime. See the [implementation contract](docs/M2_C_Frames_Implementation.md).
+Presentation objects now belong to SwapChain; see the M2-C2 contract below.
+
+
+## Presentation resources (M2-C2)
+
+```bash
+./run.sh --no-build --frames-in-flight 2 --present-sync fence assets/models/siheyuan/source/siheyuan.glb
+```
+
+Default `--present-sync auto` enables KHR/EXT swapchain maintenance only when its
+instance dependencies, device extension and feature are available. `fence` fails
+startup if unavailable; `legacy` deliberately uses the idle fallback. Present mode
+(`--present fifo|mailbox|immediate|auto`) remains a separate choice.
+SwapChain owns per-image finished semaphores and present fences. Renderer rebuilds
+preserve those handles; resize/exit drain known present requests before destroying
+the old generation. Enqueued WSI errors retain fence ownership; rejected OOM never
+waits an unsubmitted fence. Render Debug and schema 4 report backend/reason,
+pending/completed counts and resource-release proof. Legacy reports proof false;
+a present fence does not measure screen display or latency.
+
+The software validation command on this host is:
+
+```bash
+env -u WAYLAND_DISPLAY \
+  VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json \
+  MESA_VK_WSI_DEBUG=sw,noshm \
+  ctest --test-dir build-linux --output-on-failure
+```
+
+Seventeen tests cover CPU contracts and real one/two-frame KHR/EXT/legacy WSI,
+HDR/graph, ImGui loading, queries, resize and shutdown. The software settings avoid
+the current isolated session's MIT-SHM/DRI3 `FenceFromFD` failure, reproduced during
+the full EXT test sequence. They are only a validation environment; normal startup
+keeps its native driver path. That native shared-image failure, actual OUT_OF_DATE,
+device-lost, native minimize, validation and RTX 4060 Ti acceptance remain open.
+See the [decision](docs/M2_C2_Presentation_Decision.md) and
+[implementation/evidence](docs/M2_C2_Presentation_Implementation.md).

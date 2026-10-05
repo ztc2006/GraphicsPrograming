@@ -1,82 +1,135 @@
-#include "pch.hpp"
-
 #include "mesh.hpp"
-
+#include "pch.hpp"
+#include <bit>
 #include <cmath>
+#include <limits>
+#include <mikktspace.h>
+#include <stdexcept>
+#include <unordered_map>
 
 namespace {
+glm::vec3 unitNormal(glm::vec3 n) {
+  return glm::dot(n, n) > 1e-12f ? glm::normalize(n) : glm::vec3(0, 0, 1);
+}
 glm::vec3 fallbackTangent(glm::vec3 normal) {
-  glm::vec3 const axis = std::abs(normal.y) < 0.999f
-                             ? glm::vec3{0.0f, 1.0f, 0.0f}
-                             : glm::vec3{1.0f, 0.0f, 0.0f};
+  auto axis =
+      std::abs(normal.y) < .999f ? glm::vec3(0, 1, 0) : glm::vec3(1, 0, 0);
   return glm::normalize(glm::cross(axis, normal));
 }
+struct TangentInput {
+  Mesh const &mesh;
+  std::vector<glm::vec4> corners;
+  Vertex const &vertex(int face, int corner) const {
+    return mesh.vertices[mesh.indices[std::size_t(face) * 3 + corner]];
+  }
+};
+TangentInput &input(SMikkTSpaceContext const *ctx) {
+  return *static_cast<TangentInput *>(ctx->m_pUserData);
+}
+struct CornerKey {
+  std::array<std::uint32_t, 5> bits;
+  bool operator==(CornerKey const &) const = default;
+};
+struct CornerHash {
+  std::size_t operator()(CornerKey const &key) const {
+    std::size_t hash = 0;
+    for (auto value : key.bits)
+      hash ^= std::size_t(value) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+    return hash;
+  }
+};
 } // namespace
 
 void generateMeshTangents(Mesh &mesh, bool useNormalUv) {
-  if (!useNormalUv) {
-    for (Vertex &v : mesh.vertices) {
-      v.normalUv = v.metallicRoughnessUv = v.occlusionUv = v.emissiveUv = v.uv;
-    }
+  if (mesh.indices.size() % 3 ||
+      mesh.indices.size() / 3 > std::numeric_limits<int>::max())
+    throw std::runtime_error("Tangent generation requires indexed triangles.");
+  for (auto index : mesh.indices)
+    if (index >= mesh.vertices.size())
+      throw std::runtime_error("Tangent triangle index is out of range.");
+  for (auto &v : mesh.vertices) {
+    if (!useNormalUv)
+      v.normalUv = v.metallicRoughnessUv = v.occlusionUv = v.emissiveUv =
+          v.specularUv = v.specularColorUv = v.uv;
+    for (auto value : {v.position.x, v.position.y, v.position.z, v.normal.x,
+                       v.normal.y, v.normal.z, v.normalUv.x, v.normalUv.y})
+      if (!std::isfinite(value))
+        throw std::runtime_error("Tangent source must be finite.");
+    v.tangent = glm::vec4(fallbackTangent(unitNormal(v.normal)), 1);
   }
-  std::vector<glm::vec3> tangents(mesh.vertices.size(), glm::vec3{0.0f});
-  std::vector<glm::vec3> bitangents(mesh.vertices.size(), glm::vec3{0.0f});
-
-  for (std::size_t index = 0; index + 2 < mesh.indices.size(); index += 3) {
-    std::uint32_t const i0 = mesh.indices[index + 0];
-    std::uint32_t const i1 = mesh.indices[index + 1];
-    std::uint32_t const i2 = mesh.indices[index + 2];
-    if (i0 >= mesh.vertices.size() || i1 >= mesh.vertices.size() ||
-        i2 >= mesh.vertices.size()) {
+  if (mesh.indices.empty())
+    return;
+  TangentInput data{mesh, std::vector<glm::vec4>(mesh.indices.size())};
+  SMikkTSpaceInterface interface{};
+  interface.m_getNumFaces = [](SMikkTSpaceContext const *ctx) {
+    return int(input(ctx).mesh.indices.size() / 3);
+  };
+  interface.m_getNumVerticesOfFace = [](SMikkTSpaceContext const *, int) {
+    return 3;
+  };
+  interface.m_getPosition = [](SMikkTSpaceContext const *ctx, float out[],
+                               int face, int corner) {
+    auto v = input(ctx).vertex(face, corner).position;
+    for (int c = 0; c < 3; ++c)
+      out[c] = v[c];
+  };
+  interface.m_getNormal = [](SMikkTSpaceContext const *ctx, float out[],
+                             int face, int corner) {
+    auto v = unitNormal(input(ctx).vertex(face, corner).normal);
+    for (int c = 0; c < 3; ++c)
+      out[c] = v[c];
+  };
+  interface.m_getTexCoord = [](SMikkTSpaceContext const *ctx, float out[],
+                               int face, int corner) {
+    auto uv = input(ctx).vertex(face, corner).normalUv;
+    out[0] = uv.x;
+    out[1] = uv.y;
+  };
+  interface.m_setTSpaceBasic = [](SMikkTSpaceContext const *ctx,
+                                  float const tangent[], float sign, int face,
+                                  int corner) {
+    auto &data = input(ctx);
+    glm::vec3 t(tangent[0], tangent[1], tangent[2]);
+    auto n = unitNormal(data.vertex(face, corner).normal);
+    t -= n * glm::dot(n, t);
+    if (!std::isfinite(t.x) || !std::isfinite(t.y) || !std::isfinite(t.z) ||
+        glm::dot(t, t) < 1e-12f)
+      t = fallbackTangent(n);
+    else
+      t = glm::normalize(t);
+    data.corners[std::size_t(face) * 3 + corner] =
+        glm::vec4(t, sign < 0 ? -1 : 1);
+  };
+  SMikkTSpaceContext context{&interface, &data};
+  if (!genTangSpaceDefault(&context))
+    throw std::runtime_error("MikkTSpace tangent generation failed.");
+  std::vector<bool> assigned(mesh.vertices.size());
+  std::unordered_map<CornerKey, std::uint32_t, CornerHash> remap;
+  remap.reserve(mesh.indices.size());
+  // Preserve original vertex order. Split only incompatible per-corner frames;
+  // averaging mirrored signs would corrupt both triangles' normal maps.
+  for (std::size_t corner = 0; corner < mesh.indices.size(); ++corner) {
+    auto original = mesh.indices[corner];
+    auto t = data.corners[corner];
+    CornerKey key{{original}};
+    for (int c = 0; c < 4; ++c)
+      key.bits[c + 1] = std::bit_cast<std::uint32_t>(t[c] == 0 ? 0.0f : t[c]);
+    auto found = remap.find(key);
+    if (found != remap.end()) {
+      mesh.indices[corner] = found->second;
       continue;
     }
-
-    Vertex const &v0 = mesh.vertices[i0];
-    Vertex const &v1 = mesh.vertices[i1];
-    Vertex const &v2 = mesh.vertices[i2];
-    glm::vec3 const edge1 = v1.position - v0.position;
-    glm::vec3 const edge2 = v2.position - v0.position;
-    glm::vec2 const uv0 = useNormalUv ? v0.normalUv : v0.uv;
-    glm::vec2 const deltaUv1 = (useNormalUv ? v1.normalUv : v1.uv) - uv0;
-    glm::vec2 const deltaUv2 = (useNormalUv ? v2.normalUv : v2.uv) - uv0;
-    float const determinant = deltaUv1.x * deltaUv2.y - deltaUv1.y * deltaUv2.x;
-    if (std::abs(determinant) <= 0.000001f) {
-      continue;
+    std::uint32_t index = original;
+    if (assigned[original]) {
+      if (mesh.vertices.size() >= std::numeric_limits<std::uint32_t>::max())
+        throw std::runtime_error("Tangent seam vertex count overflows.");
+      index = static_cast<std::uint32_t>(mesh.vertices.size());
+      Vertex copy = mesh.vertices[original];
+      mesh.vertices.push_back(copy);
     }
-
-    float const inverseDeterminant = 1.0f / determinant;
-    glm::vec3 const tangent =
-        (edge1 * deltaUv2.y - edge2 * deltaUv1.y) * inverseDeterminant;
-    glm::vec3 const bitangent =
-        (edge2 * deltaUv1.x - edge1 * deltaUv2.x) * inverseDeterminant;
-    tangents[i0] += tangent;
-    tangents[i1] += tangent;
-    tangents[i2] += tangent;
-    bitangents[i0] += bitangent;
-    bitangents[i1] += bitangent;
-    bitangents[i2] += bitangent;
-  }
-
-  for (std::size_t index = 0; index < mesh.vertices.size(); ++index) {
-    Vertex &vertex = mesh.vertices[index];
-    glm::vec3 normal = vertex.normal;
-    if (glm::length(normal) <= 0.0001f) {
-      normal = {0.0f, 0.0f, 1.0f};
-    } else {
-      normal = glm::normalize(normal);
-    }
-
-    glm::vec3 tangent =
-        tangents[index] - normal * glm::dot(normal, tangents[index]);
-    if (glm::length(tangent) <= 0.0001f) {
-      tangent = fallbackTangent(normal);
-    } else {
-      tangent = glm::normalize(tangent);
-    }
-
-    float const handedness =
-        glm::dot(glm::cross(normal, tangent), bitangents[index]) < 0.0f ? -1.0f
-                                                                        : 1.0f;
-    vertex.tangent = glm::vec4{tangent, handedness};
+    assigned[original] = true;
+    mesh.vertices[index].tangent = t;
+    remap.emplace(key, index);
+    mesh.indices[corner] = index;
   }
 }

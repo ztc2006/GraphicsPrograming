@@ -13,10 +13,12 @@
 Device::Device(vk::raii::Instance const &instance,
                vk::raii::SurfaceKHR const &surface,
                std::vector<char const *> requiredDeviceExtensions,
-               std::string preferredGpu, bool debugUtils)
+               std::string preferredGpu, bool debugUtils,
+               PresentationInstanceSupport presentationInstance, PresentationPolicy presentationPolicy)
     : instance_(instance), surface_(surface),
       requiredDeviceExtensions_(std::move(requiredDeviceExtensions)),
-      preferredGpu_(std::move(preferredGpu)), debugUtils_(debugUtils), gpuAllocator_(*this) {
+      preferredGpu_(std::move(preferredGpu)), debugUtils_(debugUtils),
+      presentationInstance_(presentationInstance), presentationPolicy_(presentationPolicy), gpuAllocator_(*this) {
   pickPhysicalDevice();
   createLogicalDevice();
   if (debugUtils_) {
@@ -188,11 +190,41 @@ void Device::createLogicalDevice() {
   auto supported = physicalDevice_.getFeatures2<vk::PhysicalDeviceFeatures2,
       vk::PhysicalDeviceVulkan12Features>();
   timelineSemaphoreSupported_ = supported.get<vk::PhysicalDeviceVulkan12Features>().timelineSemaphore;
+  bool anisotropy =
+      supported.get<vk::PhysicalDeviceFeatures2>().features.samplerAnisotropy;
+  maxSamplerAnisotropy_ =
+      anisotropy ? physicalDevice_.getProperties().limits.maxSamplerAnisotropy
+                 : 1.0f;
+  auto extensions = physicalDevice_.enumerateDeviceExtensionProperties();
+  auto has = [&](char const *name) {
+    return std::ranges::any_of(extensions, [&](auto const &e) { return std::strcmp(e.extensionName, name) == 0; });
+  };
+  PresentationDeviceSupport present{has(vk::KHRSwapchainMaintenance1ExtensionName),
+                                    has(vk::EXTSwapchainMaintenance1ExtensionName), false};
+  if (presentationPolicy_ != PresentationPolicy::Legacy &&
+      ((presentationInstance_.khr && present.khr) || (presentationInstance_.ext && present.ext))) {
+    auto features = physicalDevice_.getFeatures2<vk::PhysicalDeviceFeatures2,
+        vk::PhysicalDeviceSwapchainMaintenance1FeaturesKHR>();
+    present.feature = features.get<vk::PhysicalDeviceSwapchainMaintenance1FeaturesKHR>().swapchainMaintenance1;
+  }
+  presentationSupport_ = choosePresentationSupport(presentationInstance_, present, presentationPolicy_);
+  if (presentationSupport_.fencesEnabled()) {
+    auto name = presentationSupport_.backend == PresentationBackend::KhrFence
+        ? vk::KHRSwapchainMaintenance1ExtensionName : vk::EXTSwapchainMaintenance1ExtensionName;
+    if (std::ranges::none_of(requiredDeviceExtensions_, [&](auto p) { return std::strcmp(p, name) == 0; }))
+      requiredDeviceExtensions_.push_back(name);
+  }
   vk::StructureChain<vk::PhysicalDeviceFeatures2,
                      vk::PhysicalDeviceVulkan12Features,
-                     vk::PhysicalDeviceVulkan13Features> featureChain = {
+                     vk::PhysicalDeviceVulkan13Features,
+                     vk::PhysicalDeviceSwapchainMaintenance1FeaturesKHR> featureChain = {
       {}, {.timelineSemaphore = timelineSemaphoreSupported_},
-      {.synchronization2 = true, .dynamicRendering = true}};
+      {.synchronization2 = true, .dynamicRendering = true},
+      {.swapchainMaintenance1 = presentationSupport_.fencesEnabled()}};
+  if (!presentationSupport_.fencesEnabled())
+    featureChain.unlink<vk::PhysicalDeviceSwapchainMaintenance1FeaturesKHR>();
+  featureChain.get<vk::PhysicalDeviceFeatures2>().features.samplerAnisotropy =
+      anisotropy;
 
   float queuePriority = 1.0f;
   std::set<std::uint32_t> uniqueQueueFamilies = {

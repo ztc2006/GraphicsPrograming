@@ -27,8 +27,11 @@ layout(location = 5) in vec2 inNormalUv;
 layout(location = 6) in vec2 inMetallicRoughnessUv;
 layout(location = 7) in vec2 inOcclusionUv;
 layout(location = 8) in vec2 inEmissiveUv;
+layout(location = 9) in float inAlpha;
+layout(location = 10) in vec2 inSpecularUv;
+layout(location = 11) in vec2 inSpecularColorUv;
 
-layout(location = 0) out vec3 outColor;
+layout(location = 0) out vec4 outColor;
 layout(location = 1) out vec2 outUv;
 layout(location = 2) out vec3 outWorldPos;
 layout(location = 3) out vec3 outWorldNormal;
@@ -38,6 +41,8 @@ layout(location = 6) out vec2 outNormalUv;
 layout(location = 7) out vec2 outMetallicRoughnessUv;
 layout(location = 8) out vec2 outOcclusionUv;
 layout(location = 9) out vec2 outEmissiveUv;
+layout(location = 10) out vec2 outSpecularUv;
+layout(location = 11) out vec2 outSpecularColorUv;
 
 void main()
 {
@@ -45,12 +50,14 @@ void main()
   mat3 normalMatrix = transpose(inverse(mat3(pushConstants.transform)));
 
   gl_Position = ubo.viewProj * worldPos;
-  outColor = inColor;
+  outColor = vec4(inColor, inAlpha);
   outUv = inUv;
   outNormalUv = inNormalUv;
   outMetallicRoughnessUv = inMetallicRoughnessUv;
   outOcclusionUv = inOcclusionUv;
   outEmissiveUv = inEmissiveUv;
+  outSpecularUv = inSpecularUv;
+  outSpecularColorUv = inSpecularColorUv;
   outWorldPos = worldPos.xyz;
   outWorldNormal = normalize(normalMatrix * inNormal);
   outLightClipPos = ubo.lightViewProj * worldPos;

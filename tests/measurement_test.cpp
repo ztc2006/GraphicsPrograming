@@ -38,8 +38,15 @@ int main() {
                      {"--warmup", "nan"},
                      {"--duration", "-1"},
                      {"--gpu"},
+                     {"--frames-in-flight"},
+                     {"--frames-in-flight", "0"},
+                     {"--frames-in-flight", "3"},
+                     {"--frames-in-flight", "1.5"},
+                     {"--frames-in-flight", "nan"},
                      {"--camera-path", "bad"},
                      {"--present", "bad"},
+                     {"--present-sync"},
+                     {"--present-sync", "bad"},
                      {"--benchmark", "out"},
                      {"a.glb", "b.glb"}}) {
       bool rejected = false;
@@ -50,6 +57,9 @@ int main() {
       }
       require(rejected, "Invalid CLI input accepted");
     }
+    require(parseViewerOptions(std::vector<std::string_view>{"--frames-in-flight", "2"}).framesInFlight == 2, "Two frame CLI rejected");
+    require(parseViewerOptions(std::vector<std::string_view>{"--present-sync", "fence"}).presentSync == "fence", "Fence policy rejected");
+    require(parseViewerOptions({}).framesInFlight == 1, "Default frame count changed");
     auto dir =
         std::filesystem::temp_directory_path() /
         ("vulkan-measurement-test-" +
@@ -70,11 +80,18 @@ int main() {
                 report.find("\"hardware_target_accepted\": false") !=
                     std::string::npos,
             "Unknown GPU data or software target acceptance");
-    require(report.find("\"schema\": 3") != std::string::npos &&
+    require(report.find("\"schema\": 4") != std::string::npos &&
                 report.find("\"allocated_bytes\":8192") != std::string::npos &&
                 report.find("\"suballocated_bytes\":1024") != std::string::npos &&
                 report.find("\"allocator_blocks\":") != std::string::npos,
             "Report lost the backing/suballocation distinction");
+    require(report.find("\"frames_in_flight\": 1") != std::string::npos &&
+                report.find("shared_hdr_depth_shadow") != std::string::npos,
+            "Report lost frame configuration");
+    require(report.find("\"presentation_release_proven\": false") != std::string::npos &&
+                report.find("legacy_wait_idle") != std::string::npos &&
+                report.find("\"pending_present_fences\": 0") != std::string::npos,
+            "Report lost presentation fallback diagnostics");
     require(report.find("\"gpu_output_ms\":") != std::string::npos &&
                 report.find("\"exposure_ev\":") != std::string::npos &&
                 report.find("R16G16B16A16_SFLOAT") != std::string::npos,

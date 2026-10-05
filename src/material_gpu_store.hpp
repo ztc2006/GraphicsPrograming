@@ -16,16 +16,22 @@ public:
   struct MaterialUniformBufferObject {
     glm::vec4 pbrParams{0.0f, 1.0f, 1.0f, 0.0f};
     glm::vec4 emissiveFactor{0.0f};
+    glm::vec4 specularColorAndWeight{1.0f};
   };
+  static_assert(sizeof(MaterialUniformBufferObject) == 48 &&
+                offsetof(MaterialUniformBufferObject, specularColorAndWeight) ==
+                    32);
 
   struct MaterialGpuResources {
     TextureResources albedoTexture;
+    TextureResources baseAlbedoTexture, baseAlphaTexture;
     std::optional<TextureResources> normalTexture;
     std::optional<TextureResources> heightTexture;
     std::optional<TextureResources> alphaTexture;
     std::optional<TextureResources> metallicRoughnessTexture;
     std::optional<TextureResources> occlusionTexture;
     std::optional<TextureResources> emissiveTexture;
+    std::optional<TextureResources> specularTexture, specularColorTexture;
     Device::BufferResources uniform;
     vk::DescriptorSet descriptorSet = nullptr;
     glm::vec4 tint{1.0f};
@@ -33,14 +39,17 @@ public:
     glm::vec4 alphaParams{0.0f, 0.5f, 0.0f, 0.0f};
     AlphaMode alphaMode = AlphaMode::Opaque;
     bool doubleSided = false;
+    bool hasCoverageMips = false;
+    float coverageCutoff = 0.5f, coverageFactor = 1.0f;
   };
 
   // The renderer owns the stable layout; this store owns one scene's resources.
   static vk::raii::DescriptorSetLayout
   createDescriptorSetLayout(Device const &device);
   MaterialGpuStore(Device const &device, vk::DescriptorSetLayout layout,
-                   std::vector<Material> const &materials, TextureCache &textures,
-                   UploadBatch &uploads, ResourceLedger::Scope scope);
+                   std::vector<Material> const &materials,
+                   TextureCache &textures, UploadBatch &uploads,
+                   ResourceLedger::Scope scope);
   void setMaterialTint(MaterialId materialId, glm::vec4 const &tint);
   void setMaterialSurfaceParams(MaterialId materialId, float normalScale,
                                 float parallaxScale);
@@ -49,6 +58,7 @@ public:
   MaterialGpuResources const &material(MaterialId materialId) const;
 
 private:
+  static void updateCoverageState(MaterialGpuResources &);
   std::vector<MaterialGpuResources>
   createMaterialResources(std::vector<Material> const &materials,
                           TextureCache &textures, UploadBatch &uploads) const;

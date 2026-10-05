@@ -1,6 +1,6 @@
 # 现代渲染器路线
 
-日期：2026-10-03。状态：Q1–Q16 已确认，路线正式生效。M1 与 M2-A 线性 HDR 软件回归已交付，当前入口为 M2-B 最小 Render Graph；M0 硬件验收按用户要求延后。下列渲染功能按阶段推进。
+日期：2026-10-04。状态：Q1–Q16 已确认，路线正式生效。M1、M2-A 线性 HDR 与 M2-B 最小图的软件回归已交付，M2-C1 帧上下文与 M2-C2 扩展呈现生命周期的软件增量已交付，M3-A1 typed mip/过滤已接入，M3-A2 coverage/切线空间的软件增量已交付，M3-B GGX 预过滤/BRDF LUT/SH 校准和缓存已交付软件增量，M3-C1 必要 specular 扩展的软件增量已交付，下一入口为 M3-C2 法线方差/镜面抗锯齿；M0 硬件验收按用户要求延后。下列渲染功能按阶段推进。
 
 目标是可靠加载静态 glTF/GLB 室内外场景、在移动中保持画质稳定的 Linux Vulkan 场景渲染器。保留已验证模块，重做资源与绘制接口；每 1–2 周验收一个可运行增量。较大阶段拆成多个增量，不承诺每个完整算法都在两周内完成。
 
@@ -91,13 +91,13 @@ flowchart TD
 
 ### M2：HDR 输出与最小 Render Graph
 
-增量 A（已交付软件实现）：主场景/天空/透明写入统一 RGBA16F HDR，移除材质/天空末端 tone mapping，加入独立显示输出与全场景 EV 曝光、环境强度分离及 output 时间区间。四格式离屏回读、实际透明合成/天空、失败回收/resize、10 项 CTest 与四合院 1080p 烟测通过。见 [实施合同](docs/M2_A_HDR_Implementation.md)。增量 B（下一项）：迁移现有阴影、主场景、输出和 UI 到最小图。增量 C：完善资源退休和 frame context，测量一帧/两帧方案。
+增量 A（已交付软件实现）：主场景/天空/透明写入统一 RGBA16F HDR，移除材质/天空末端 tone mapping，加入独立显示输出与全场景 EV 曝光、环境强度分离及 output 时间区间。四格式离屏回读、实际透明合成/天空、失败回收/resize、10 项 CTest 与四合院 1080p 烟测通过。见 [实施合同](docs/M2_A_HDR_Implementation.md)。增量 B（已交付软件实现）：阴影、主场景、输出、独立 LOAD/STORE UI 迁移到最小单队列图；主深度保留并导出可读状态，Application 只提交 draw list，统一资源状态与依赖检查并提供实际 dump。11 项 CTest 通过；原生 iconify 未被当前窗口管理器确认，显式 restore/recreation 已验收。见 [图实施合同](docs/M2_B_Graph_Implementation.md)。增量 C1：启动时一帧/两帧配置、独立 mutable frame resources、成功提交 ID、逐帧完成交付和场景/UI 退休验证，见 [帧上下文合同](docs/M2_C_Frames_Implementation.md)。增量 C2（已交付扩展路径）：KHR/EXT maintenance 能力协商、SwapChain 持有每图像 semaphore/fence、入队错误记账、重建/退出 drain 与显式 legacy 退路。软件呈现环境 17 项测试通过；本隔离会话原生 MIT-SHM/DRI3 fence 导入的顺序故障保留，见 [呈现合同](docs/M2_C2_Presentation_Implementation.md)。legacy 的普通 WaitIdle 仍不提供完整释放证明，报告明确标为 false。真实吞吐/延迟比较、原生驱动与 4060 Ti 验收等用户换机通知。
 
 验收：超过 1 的高光与 emissive 在 HDR 中可见；透明混合在色调映射前完成；sRGB 编码恰好一次；UI 不随曝光改变；resize、最小化、恢复和场景切换没有陈旧资源或历史。提供 resource/pass 可视化。单队列正确同步先行，不要求别名或异步队列。
 
 ### M3：材质和完整 IBL
 
-增量 A：glTF sampler、typed mip、各向异性能力处理、alpha coverage 与原始 tangent/法线空间验收。增量 B：GGX cubemap 预过滤、BRDF LUT 与环境烘焙缓存，保留 SH。增量 C：`KHR_materials_specular` 等必要扩展、材质球对照与镜面抗锯齿。
+增量 A1 已实现：glTF sampler、CPU typed mip、全链上传/view 与各向异性能力处理。A2 已完成单来源 alpha coverage、编辑/复合/vertex/POM 回退、顶点 alpha、Mikk seam 和法线/负缩放合同，19/19 CPU/软件 Vulkan 回归通过。见 [A2 实施](docs/M3_A2_Material_Implementation.md)。增量 B 已完成：GGX cubemap 预过滤、BRDF LUT、准确 SH 投影与环境烘焙缓存，20/20 CPU/软件 Vulkan 回归通过，见 [IBL 实施](docs/M3_B_IBL_Implementation.md)。增量 C1 已完成：四合院 `KHR_materials_specular` 的因子、线性 A/sRGB RGB 贴图、独立 UV/sampler、直接光/IBL、UI debug 和参考材质；20/20 软件回归、sanitizer/SPIR-V、四合院一/两帧报告通过，见 [specular 实施](docs/M3_C1_Specular_Implementation.md)。增量 C2：法线方差过滤/镜面抗锯齿；运动画质/成本等 4060 Ti 验收。
 
 验收：金属/电介质、粗糙度 0→1、HDR 高频灯、不同 UV 集、多种 sampler 和双面/负缩放场景；相同输入下直接光与 IBL 的材质参数一致。局部灯、emissive 与环境都经过同一相机曝光；固定曝光比较参考结果，避免自动曝光掩盖能量错误。
 
@@ -183,4 +183,4 @@ RTR4 第 4–9 章作为变换、采样、阴影与 PBR 的稳定基础，第 11
 
 2026-10-02 用户调整：目标硬件为 RTX 4060 Ti；移动硬盘系统暂不处理当前设备访问问题。M0 的 pass timing、固定相机路径与材质基准已落地，硬件性能/显存/画质验收保持待办，直到用户通知已换回 4060 Ti。该待办不再阻塞后续开发。
 
-M1-A 已实现持久 Renderer 与候选场景资产集合：准备成功后提交，只替换网格/材质/描述符，旧帧完成后移除预览并释放旧资产。M1-B 的共享图像/sampler 与批量 staging 上传已实现：相同编码内容和颜色空间复用，sampler 独立缓存，单场景单提交/fence。后台准备、主线程单次上传与就绪轮询、取消后的上传保活和按完成帧退休预览已交付。精确资源/staging 账本也已交付：区分 payload、实际分配与独立 driver heap 采样，按生命周期分类并记录真实并存峰值，共享对象仅计一次。M1-C 已完成成熟库比较与 cgltf 导入迁移：补 sparse/normalized、交错属性、原始 tangent、独立 UV 变换、默认材质和扩展诊断；10 项回归与 sanitizer 检查通过。VMA buffer/staging 已迁移：项目映射接口、唯一 backing/suballocation 账本、上传与常驻生命周期隔离，以及取消/退休/归零回归。Texture/HDR 和 depth/shadow image 已迁移至公共 GpuAllocator：独立 view/sampler、混合 granularity、浮点回读、真实 resize 与最后 image/完整 shutdown 归零通过；10 项 CTest、报告与四合院烟测通过。M2-A 已实现线性 RGBA16F 场景/天空/透明合成与公共 EV/filmic/sRGB 输出：环境强度和曝光分离，数据 debug 绕过显示曲线，UI 后绘制；数值回读、10 项 CTest、24 帧报告和四合院烟测通过。当前下一项为 M2-B 最小单队列 Render Graph，随后 M2-C frame context。必要材质扩展的 shader 语义仍在 M3。
+M1-A 已实现持久 Renderer 与候选场景资产集合：准备成功后提交，只替换网格/材质/描述符，旧帧完成后移除预览并释放旧资产。M1-B 的共享图像/sampler 与批量 staging 上传已实现：相同编码内容和颜色空间复用，sampler 独立缓存，单场景单提交/fence。后台准备、主线程单次上传与就绪轮询、取消后的上传保活和按完成帧退休预览已交付。精确资源/staging 账本也已交付：区分 payload、实际分配与独立 driver heap 采样，按生命周期分类并记录真实并存峰值，共享对象仅计一次。M1-C 已完成成熟库比较与 cgltf 导入迁移：补 sparse/normalized、交错属性、原始 tangent、独立 UV 变换、默认材质和扩展诊断；10 项回归与 sanitizer 检查通过。VMA buffer/staging 已迁移：项目映射接口、唯一 backing/suballocation 账本、上传与常驻生命周期隔离，以及取消/退休/归零回归。Texture/HDR 和 depth/shadow image 已迁移至公共 GpuAllocator：独立 view/sampler、混合 granularity、浮点回读、真实 resize 与最后 image/完整 shutdown 归零通过；10 项 CTest、报告与四合院烟测通过。M2-A 已实现线性 RGBA16F 场景/天空/透明合成与公共 EV/filmic/sRGB 输出：环境强度和曝光分离，数据 debug 绕过显示曲线，UI 后绘制；数值回读、10 项 CTest、24 帧报告和四合院烟测通过。M2-B 最小单队列 Render Graph 已接管通道、资源状态与 attachment 合同；可采样主深度、UI 保留、阴影初次初始化与开关、失败/resize/归零回归通过，共 11 项 CTest。原生 iconify/零尺寸等待与硬件验收仍待补，显式恢复和图目标重建可运行。M2-C1 一/两帧上下文与完成交付、M2-C2 KHR/EXT 呈现资源所有权与 drain 已接入，软件 WSI 环境 17 项通过；legacy 释放证明及当前原生 MIT-SHM/DRI3 顺序故障保留为开放边界。M3-A1 已接入 CPU typed mip、全链单批上传/view、六种 min 模式与受 feature/limit 限制的各向异性；M3-A2 已接入单来源 coverage mip、共享 LOD 0 编辑回退、vertex alpha、Mikk seam 与 normal/负缩放剔除，19/19 CPU/软件 Vulkan 回归通过。M3-B GGX prefilter/BRDF LUT/SH 校准与缓存、20/20 软件回归已交付。M3-C1 必要 specular 扩展 shader、参考材质、UI 与 20/20 软件回归已交付。下一项 M3-C2 法线方差/镜面抗锯齿；硬件参考验收保留。

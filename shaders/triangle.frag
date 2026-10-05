@@ -10,7 +10,12 @@ layout(set = 1, binding = 6) uniform sampler2D emissiveTexture;
 layout(set = 1, binding = 7) uniform MaterialUbo {
   vec4 pbrParams;
   vec4 emissiveFactor;
+  vec4 specularColorAndWeight;
 } material;
+layout(set = 1, binding = 8) uniform sampler2D baseAlbedoTexture;
+layout(set = 1, binding = 9) uniform sampler2D baseAlphaMaskTexture;
+layout(set = 1, binding = 10) uniform sampler2D specularTexture;
+layout(set = 1, binding = 11) uniform sampler2D specularColorTexture;
 
 layout(push_constant) uniform PushConstants {
   mat4 transform;
@@ -37,9 +42,10 @@ ubo;
 
 layout(set = 0, binding = 1) uniform sampler2DShadow shadowMap;
 layout(set = 0, binding = 2) uniform sampler2D shadowDebugMap;
-layout(set = 0, binding = 3) uniform sampler2D environmentTexture;
+layout(set = 0, binding = 4) uniform samplerCube environmentPrefilter;
+layout(set = 0, binding = 5) uniform sampler2D environmentBrdfLut;
 
-layout(location = 0) in vec3 inColor;
+layout(location = 0) in vec4 inColor;
 layout(location = 1) in vec2 inUv;
 layout(location = 2) in vec3 inWorldPos;
 layout(location = 3) in vec3 inWorldNormal;
@@ -49,10 +55,11 @@ layout(location = 6) in vec2 inNormalUv;
 layout(location = 7) in vec2 inMetallicRoughnessUv;
 layout(location = 8) in vec2 inOcclusionUv;
 layout(location = 9) in vec2 inEmissiveUv;
+layout(location = 10) in vec2 inSpecularUv;
+layout(location = 11) in vec2 inSpecularColorUv;
 layout(location = 0) out vec4 outFragColor;
 
 const float PI = 3.14159265359;
-const vec2 INV_ATAN = vec2(0.15915494309, 0.31830988618);
 
 float distributionGGX(vec3 N, vec3 H, float roughness) {
   float alpha = roughness * roughness;
@@ -74,8 +81,8 @@ float geometrySmith(vec3 N, vec3 V, vec3 L, float roughness) {
          geometrySchlickGGX(max(dot(N, L), 0.0), roughness);
 }
 
-vec3 fresnelSchlick(float cosTheta, vec3 F0) {
-  return F0 + (1.0 - F0) *
+vec3 fresnelSchlick(float cosTheta, vec3 F0, float F90) {
+  return F0 + (F90 - F0) *
                   pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
 }
 
@@ -90,11 +97,6 @@ vec3 rotateEnvironmentDirection(vec3 direction) {
   float sine = sin(rotation);
   direction.xz = mat2(cosine, -sine, sine, cosine) * direction.xz;
   return direction;
-}
-
-vec2 directionToEquirectangularUv(vec3 direction) {
-  vec2 uv = vec2(atan(direction.z, direction.x), asin(direction.y));
-  return uv * INV_ATAN + 0.5;
 }
 
 vec3 evaluateIrradianceSh(vec3 direction) {
@@ -136,9 +138,9 @@ vec3 safeNormalize(vec3 value, vec3 fallback) {
   return value * inversesqrt(lengthSquared);
 }
 
-float alphaMaskValue(vec4 alphaTexel) {
-  return max(max(alphaTexel.r, alphaTexel.g),
-             max(alphaTexel.b, alphaTexel.a));
+vec3 fallbackTangent(vec3 N) {
+  vec3 axis = abs(N.y) < 0.999 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+  return normalize(cross(axis, N));
 }
 
 vec2 parallaxOcclusionUv(vec2 uv, vec3 tangentViewDirection) {
@@ -249,18 +251,16 @@ float shadowVisibility(vec4 lightClipPos, vec3 N, vec3 L) {
 
 void main() {
   vec3 N = safeNormalize(inWorldNormal, vec3(0.0, 0.0, 1.0));
-  if (!gl_FrontFacing) {
+  vec3 T = safeNormalize(inWorldTangent.xyz - N * dot(N, inWorldTangent.xyz),
+                         fallbackTangent(N));
+  vec3 B = cross(N, T) * inWorldTangent.w;
+  // A reflected model reverses winding, but retains its authored front side.
+  bool mirrored = determinant(mat3(pushConstants.transform)) < 0.0;
+  if (gl_FrontFacing == mirrored) {
+    T = -T;
+    B = -B;
     N = -N;
   }
-  vec3 T = safeNormalize(inWorldTangent.xyz, vec3(1.0, 0.0, 0.0));
-  T = safeNormalize(T - N * dot(N, T), vec3(1.0, 0.0, 0.0));
-  vec3 B = cross(N, T);
-  if (dot(B, B) <= 0.000001) {
-    B = vec3(0.0, 1.0, 0.0);
-  } else {
-    B = normalize(B);
-  }
-  B *= inWorldTangent.w;
   mat3 tangentToWorld = mat3(T, B, N);
 
   vec3 L = normalize(ubo.lightDirection.xyz);
@@ -268,11 +268,14 @@ void main() {
   vec3 tangentViewDirection = normalize(transpose(tangentToWorld) * V);
   vec2 uv = parallaxOcclusionUv(inUv, tangentViewDirection);
 
-  vec4 texel = texture(albedoTexture, uv);
-  vec4 alphaTexel = texture(alphaMaskTexture, uv);
-  float alpha =
-      texel.a * alphaMaskValue(alphaTexel) * pushConstants.materialTint.a;
   int alphaMode = int(round(pushConstants.alphaParams.x));
+  bool useBase = pushConstants.alphaParams.z > 1.5 ||
+                 (alphaMode == 1 && (pushConstants.alphaParams.z != 1.0 ||
+                                     pushConstants.alphaParams.w < 0.5));
+  vec4 texel = useBase ? texture(baseAlbedoTexture, uv) : texture(albedoTexture, uv);
+  vec4 alphaTexel = useBase ? texture(baseAlphaMaskTexture, uv) : texture(alphaMaskTexture, uv);
+  float alpha =
+      texel.a * alphaTexel.r * pushConstants.materialTint.a * inColor.a;
   if (alphaMode == 1 && alpha < pushConstants.alphaParams.y) {
     discard;
   }
@@ -280,11 +283,11 @@ void main() {
     alpha = 1.0;
   }
 
-  vec3 albedo = texel.rgb * inColor * pushConstants.materialTint.rgb;
+  vec3 albedo = texel.rgb * inColor.rgb * pushConstants.materialTint.rgb;
   if (pushConstants.surfaceParams.z > 0.5) {
     vec3 tangentNormal = texture(normalTexture, inNormalUv + (uv - inUv)).xyz * 2.0 - 1.0;
     tangentNormal.xy *= pushConstants.surfaceParams.x;
-    N = normalize(tangentToWorld * normalize(tangentNormal));
+    N = safeNormalize(tangentToWorld * safeNormalize(tangentNormal, vec3(0.0, 0.0, 1.0)), N);
   } else if (pushConstants.surfaceParams.w > 0.5) {
     N = normalize(tangentToWorld * normalFromHeight(uv));
   }
@@ -299,34 +302,41 @@ void main() {
   vec3 H = safeNormalize(L + V, N);
   float nDotL = max(dot(N, L), 0.0);
   float nDotV = max(dot(N, V), 0.0);
-  vec3 F0 = mix(vec3(0.04), albedo, metallic);
+  float specularWeight = clamp(material.specularColorAndWeight.a *
+      texture(specularTexture, inSpecularUv + (uv - inUv)).a, 0.0, 1.0);
+  vec3 specularColor = material.specularColorAndWeight.rgb *
+      texture(specularColorTexture, inSpecularColorUv + (uv - inUv)).rgb;
+  // Clamp the reflectance product before weighting; author color may exceed 1.
+  vec3 dielectricF0 = min(vec3(0.04) * specularColor, vec3(1.0));
+  vec3 F0 = mix(dielectricF0 * specularWeight, albedo, metallic);
+  float F90 = mix(specularWeight, 1.0, metallic);
   float D = distributionGGX(N, H, roughness);
   float G = geometrySmith(N, V, L, roughness);
-  vec3 F = fresnelSchlick(max(dot(H, V), 0.0), F0);
+  float vDotH = max(dot(H, V), 0.0);
+  vec3 F = fresnelSchlick(vDotH, F0, F90);
+  vec3 dielectricF = fresnelSchlick(vDotH, dielectricF0 * specularWeight,
+                                    specularWeight);
   vec3 specular = D * G * F / max(4.0 * nDotV * nDotL, 0.0001);
-  vec3 diffuseWeight = (vec3(1.0) - F) * (1.0 - metallic);
+  float diffuseWeight = (1.0 - max(max(dielectricF.r, dielectricF.g), dielectricF.b)) *
+                        (1.0 - metallic);
   vec3 diffuse = diffuseWeight * albedo / PI;
 
   vec3 environmentNormal = rotateEnvironmentDirection(N);
   vec3 irradiance = evaluateIrradianceSh(environmentNormal);
   vec3 environmentFresnel =
-      fresnelSchlickRoughness(nDotV, F0, roughness);
-  vec3 environmentDiffuseWeight =
-      (vec3(1.0) - environmentFresnel) * (1.0 - metallic);
+      specularWeight * fresnelSchlickRoughness(nDotV, dielectricF0, roughness);
+  float environmentDiffuseWeight =
+      (1.0 - max(max(environmentFresnel.r, environmentFresnel.g), environmentFresnel.b)) *
+      (1.0 - metallic);
   vec3 diffuseIbl = environmentDiffuseWeight * albedo * irradiance / PI;
 
   vec3 reflectionDirection = reflect(-V, N);
   vec3 environmentReflection =
       rotateEnvironmentDirection(reflectionDirection);
-  vec3 reflectedRadiance =
-      texture(environmentTexture,
-              directionToEquirectangularUv(environmentReflection)).rgb;
-  // Temporary roughness approximation until GGX prefiltering and the split-sum
-  // BRDF LUT replace this first environment-lighting slice.
-  vec3 lowFrequencyRadiance = evaluateIrradianceSh(environmentReflection) / PI;
-  vec3 prefilteredRadiance =
-      mix(reflectedRadiance, lowFrequencyRadiance, roughness * roughness);
-  vec3 specularIbl = prefilteredRadiance * environmentFresnel;
+  float environmentLod = roughness * float(textureQueryLevels(environmentPrefilter) - 1);
+  vec3 prefilteredRadiance = textureLod(environmentPrefilter, environmentReflection, environmentLod).rgb;
+  vec2 environmentBrdf = textureLod(environmentBrdfLut, vec2(nDotV, roughness), 0.0).rg;
+  vec3 specularIbl = prefilteredRadiance * (F0 * environmentBrdf.x + F90 * environmentBrdf.y);
 
   diffuseIbl *= ubo.environmentParams.x * ubo.environmentParams.z * ao;
   specularIbl *= ubo.environmentParams.x * ubo.environmentParams.w * ao;
@@ -384,6 +394,15 @@ void main() {
   }
   if (pbrDebugMode == 8) {
     outFragColor = vec4(specularIbl, alpha);
+    return;
+  }
+
+  if (pbrDebugMode == 9) {
+    outFragColor = vec4(vec3(specularWeight), alpha);
+    return;
+  }
+  if (pbrDebugMode == 10) {
+    outFragColor = vec4(dielectricF0 * specularWeight, alpha);
     return;
   }
 

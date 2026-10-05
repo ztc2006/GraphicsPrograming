@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.30)
 
-project(vulkan LANGUAGES CXX)
+project(vulkan LANGUAGES C CXX)
 
 include(CTest)
 
@@ -24,6 +24,8 @@ add_subdirectory(${CMAKE_SOURCE_DIR}/deps/tinyobjloader)
 # Pinned offline dependency; only the importer adapter consumes its types.
 add_library(cgltf STATIC deps/cgltf/cgltf.cpp)
 target_include_directories(cgltf SYSTEM PUBLIC deps/cgltf)
+add_library(mikktspace STATIC deps/mikktspace/mikktspace.c)
+target_include_directories(mikktspace SYSTEM PUBLIC deps/mikktspace)
 add_library(vma STATIC deps/vma/vma.cpp)
 target_include_directories(vma SYSTEM PUBLIC deps/vma)
 target_link_libraries(vma PUBLIC Vulkan::Vulkan)
@@ -40,7 +42,7 @@ file(GLOB SHADER_SOURCE_FILES CONFIGURE_DEPENDS
 # Fingerprint the actual project code used for an A/B measurement. Reconfigure
 # when code changes so incremental builds cannot keep a stale fingerprint.
 file(GLOB_RECURSE BASELINE_INPUTS CONFIGURE_DEPENDS "src/*.cpp" "src/*.hpp" "shaders/*.vert" "shaders/*.frag")
-list(APPEND BASELINE_INPUTS "${CMAKE_SOURCE_DIR}/deps/cgltf/cgltf.h" "${CMAKE_SOURCE_DIR}/deps/cgltf/cgltf.cpp" "${CMAKE_SOURCE_DIR}/deps/vma/vk_mem_alloc.h" "${CMAKE_SOURCE_DIR}/deps/vma/vma.cpp")
+list(APPEND BASELINE_INPUTS "${CMAKE_SOURCE_DIR}/deps/cgltf/cgltf.h" "${CMAKE_SOURCE_DIR}/deps/cgltf/cgltf.cpp" "${CMAKE_SOURCE_DIR}/deps/vma/vk_mem_alloc.h" "${CMAKE_SOURCE_DIR}/deps/vma/vma.cpp" "${CMAKE_SOURCE_DIR}/deps/mikktspace/mikktspace.c" "${CMAKE_SOURCE_DIR}/deps/mikktspace/mikktspace.h")
 list(SORT BASELINE_INPUTS)
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${BASELINE_INPUTS})
 set(BASELINE_HASH_INPUT "")
@@ -87,24 +89,34 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
   glm
   tinyobjloader
   cgltf
+  mikktspace
   vma
 )
 
 if(BUILD_TESTING)
+  add_executable(texture_mip_test tests/texture_mip_test.cpp src/texture_mip.cpp)
+  target_include_directories(texture_mip_test PRIVATE src)
+  add_test(NAME texture_mip COMMAND texture_mip_test)
+  add_executable(tangent_space_test tests/tangent_space_test.cpp src/mesh.cpp)
+  target_include_directories(tangent_space_test PRIVATE src)
+  target_compile_definitions(tangent_space_test PRIVATE VULKAN_HPP_NO_CONSTRUCTORS)
+  target_link_libraries(tangent_space_test PRIVATE Vulkan::Vulkan glm mikktspace)
+  add_test(NAME tangent_space COMMAND tangent_space_test)
   # Optional real Vulkan regression. Keep display requirements out of CPU CTest.
   option(VULKAN_GPU_TESTS "Build graphical scene transaction regression" OFF)
   if(VULKAN_GPU_TESTS)
     add_executable(gpu_scene_transaction_test
-      tests/gpu_scene_transaction_test.cpp tests/hdr_output_regression.cpp
-      src/resource_ledger.cpp src/gpu_allocator.cpp src/device.cpp src/swap_chain.cpp src/renderer.cpp src/hdr_output.cpp src/material_gpu_store.cpp
-      src/texture.cpp src/texture_cache.cpp src/upload_batch.cpp src/hdr_image.cpp src/hdr_ibl.cpp src/stb_image.cpp
+      tests/gpu_scene_transaction_test.cpp tests/hdr_output_regression.cpp tests/frame_context_regression.cpp tests/presentation_regression.cpp tests/texture_mip_regression.cpp
+      src/resource_ledger.cpp src/gpu_allocator.cpp src/device.cpp src/presentation.cpp src/swap_chain.cpp src/renderer.cpp src/renderer_frame_graph.cpp src/render_graph.cpp src/hdr_output.cpp src/material_gpu_store.cpp
+      src/texture.cpp src/texture_cache.cpp src/texture_mip.cpp src/upload_batch.cpp src/hdr_image.cpp src/hdr_ibl.cpp src/hdr_ibl_cache.cpp src/stb_image.cpp
       src/mesh.cpp src/gltf_loader.cpp)
     target_include_directories(gpu_scene_transaction_test PRIVATE src deps/stb)
     target_compile_definitions(gpu_scene_transaction_test PRIVATE
       VULKAN_HPP_NO_CONSTRUCTORS
       TEST_FIXTURE="${CMAKE_SOURCE_DIR}/tests/fixtures/uv_transform.gltf")
     target_precompile_headers(gpu_scene_transaction_test PRIVATE src/pch.hpp)
-    target_link_libraries(gpu_scene_transaction_test PRIVATE Vulkan::Vulkan glfw glm cgltf vma)
+    target_link_libraries(gpu_scene_transaction_test PRIVATE Vulkan::Vulkan glfw glm cgltf mikktspace vma)
+    list(APPEND SHADER_SOURCE_FILES "${CMAKE_SOURCE_DIR}/tests/shaders/texture_mip_probe.frag")
     # Exercise the actual Application loading/preview lifecycle with a real backend.
     get_target_property(VIEWER_TEST_SOURCES ${PROJECT_NAME} SOURCES)
     list(FILTER VIEWER_TEST_SOURCES EXCLUDE REGEX "(^|/)main\\.cpp$")
@@ -121,17 +133,33 @@ if(BUILD_TESTING)
     target_link_libraries(viewer_async_scene_test PRIVATE ${VIEWER_TEST_LIBRARIES})
     target_precompile_headers(viewer_async_scene_test PRIVATE src/pch.hpp)
     add_test(NAME viewer_async_scene COMMAND viewer_async_scene_test)
-    set_tests_properties(viewer_async_scene PROPERTIES
+    add_test(NAME viewer_async_scene_two_frames COMMAND viewer_async_scene_test 2)
+    add_test(NAME viewer_async_scene_legacy COMMAND viewer_async_scene_test 2 legacy)
+    set_tests_properties(viewer_async_scene viewer_async_scene_two_frames viewer_async_scene_legacy PROPERTIES
       LABELS gpu SKIP_RETURN_CODE 77 TIMEOUT 90
       WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
     add_test(NAME gpu_scene_transaction COMMAND gpu_scene_transaction_test)
-    set_tests_properties(gpu_scene_transaction PROPERTIES
+    add_test(NAME gpu_scene_transaction_two_frames COMMAND gpu_scene_transaction_test 2)
+    add_test(NAME gpu_scene_transaction_legacy COMMAND gpu_scene_transaction_test 2 legacy)
+    add_test(NAME gpu_scene_transaction_ext COMMAND gpu_scene_transaction_test 2 auto ext)
+    set_tests_properties(gpu_scene_transaction gpu_scene_transaction_two_frames gpu_scene_transaction_legacy gpu_scene_transaction_ext PROPERTIES
       LABELS gpu SKIP_RETURN_CODE 77 TIMEOUT 60
       WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
   endif()
+  add_executable(presentation_test tests/presentation_test.cpp src/presentation.cpp)
+  target_include_directories(presentation_test PRIVATE src)
+  target_compile_definitions(presentation_test PRIVATE VULKAN_HPP_NO_CONSTRUCTORS)
+  target_link_libraries(presentation_test PRIVATE Vulkan::Vulkan)
+  add_test(NAME presentation_contract COMMAND presentation_test)
   add_executable(resource_ledger_test tests/resource_ledger_test.cpp src/resource_ledger.cpp)
   target_include_directories(resource_ledger_test PRIVATE src)
   add_test(NAME resource_ledger COMMAND resource_ledger_test)
+
+  add_executable(render_graph_test tests/render_graph_test.cpp src/render_graph.cpp)
+  target_include_directories(render_graph_test PRIVATE src)
+  target_compile_definitions(render_graph_test PRIVATE VULKAN_HPP_NO_CONSTRUCTORS)
+  target_link_libraries(render_graph_test PRIVATE Vulkan::Vulkan)
+  add_test(NAME render_graph COMMAND render_graph_test)
 
   add_executable(measurement_test tests/measurement_test.cpp src/viewer_options.cpp src/benchmark_report.cpp src/resource_ledger.cpp)
   target_include_directories(measurement_test PRIVATE src)
@@ -143,14 +171,14 @@ if(BUILD_TESTING)
   add_executable(gltf_geometry_regression_test tests/gltf_geometry_regression_test.cpp src/gltf_loader.cpp src/mesh.cpp)
   target_include_directories(gltf_geometry_regression_test PRIVATE src)
   target_compile_definitions(gltf_geometry_regression_test PRIVATE VULKAN_HPP_NO_CONSTRUCTORS TEST_FIXTURE="${CMAKE_SOURCE_DIR}/tests/fixtures/uv_transform.gltf")
-  target_link_libraries(gltf_geometry_regression_test PRIVATE Vulkan::Vulkan glm cgltf)
+  target_link_libraries(gltf_geometry_regression_test PRIVATE Vulkan::Vulkan glm cgltf mikktspace)
   add_test(NAME gltf_geometry_regression COMMAND gltf_geometry_regression_test)
 
   add_executable(gltf_adapter_test tests/gltf_adapter_test.cpp src/gltf_loader.cpp src/mesh.cpp)
   target_include_directories(gltf_adapter_test PRIVATE src)
   target_compile_definitions(gltf_adapter_test PRIVATE VULKAN_HPP_NO_CONSTRUCTORS
     TEST_ADAPTER_FIXTURES="${CMAKE_SOURCE_DIR}/tests/fixtures/cgltf")
-  target_link_libraries(gltf_adapter_test PRIVATE Vulkan::Vulkan glm cgltf)
+  target_link_libraries(gltf_adapter_test PRIVATE Vulkan::Vulkan glm cgltf mikktspace)
   add_test(NAME gltf_adapter COMMAND gltf_adapter_test)
 
   add_executable(gltf_material_semantics_test
@@ -168,6 +196,7 @@ if(BUILD_TESTING)
     Vulkan::Vulkan
     glm
     cgltf
+    mikktspace
   )
   add_test(NAME gltf_material_semantics COMMAND gltf_material_semantics_test)
 
@@ -185,10 +214,15 @@ if(BUILD_TESTING)
   add_executable(hdr_ibl_test
     tests/hdr_ibl_test.cpp
     src/hdr_ibl.cpp
+    src/hdr_ibl_cache.cpp
   )
   target_include_directories(hdr_ibl_test PRIVATE src)
   target_link_libraries(hdr_ibl_test PRIVATE glm)
   add_test(NAME hdr_ibl COMMAND hdr_ibl_test)
+  add_executable(hdr_ibl_bake_test tests/hdr_ibl_bake_test.cpp src/hdr_ibl.cpp src/hdr_ibl_cache.cpp)
+  target_include_directories(hdr_ibl_bake_test PRIVATE src)
+  target_link_libraries(hdr_ibl_bake_test PRIVATE glm)
+  add_test(NAME hdr_ibl_bake COMMAND hdr_ibl_bake_test)
 endif()
 
 set(SHADER_OUTPUT_FILES)

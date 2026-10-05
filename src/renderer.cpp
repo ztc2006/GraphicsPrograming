@@ -3,6 +3,7 @@
 #include "renderer.hpp"
 
 #include "hdr_image.hpp"
+#include "hdr_ibl_cache.hpp"
 #include "material_pipeline.hpp"
 
 #include <algorithm>
@@ -10,6 +11,7 @@
 #include <cmath>
 #include <cstring>
 #include <fstream>
+#include <iostream>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -88,10 +90,14 @@ Mesh makeUnitAabbLineMesh() {
 }
 } // namespace
 
-Renderer::Renderer(Device const &device)
-    : device_(device),
-      materialDescriptorSetLayout_(
-          MaterialGpuStore::createDescriptorSetLayout(device)),
+Renderer::Renderer(Device const &device, unsigned framesInFlight)
+    : framesInFlight_([&] {
+        if (framesInFlight != 1 && framesInFlight != 2)
+          throw std::invalid_argument("Frames in flight must be 1 or 2");
+        return framesInFlight;
+      }()),
+      device_(device), materialDescriptorSetLayout_(
+                           MaterialGpuStore::createDescriptorSetLayout(device)),
       textureCache_(device) {
   createPersistentResources();
 }
@@ -102,6 +108,11 @@ void Renderer::recreateForSwapChain(SwapChain const &swapChain) {
                              "while a frame is in progress.");
   }
 
+  collectCompletedWork();
+  for (auto const &frame : frames_)
+    if (frame.submitted)
+      throw std::runtime_error(
+          "Drain submitted frames before replacing swapchain resources");
   validateSwapChainCandidate(swapChain);
 
   vk::PushConstantRange pushConstantRange{
@@ -142,21 +153,26 @@ void Renderer::recreateForSwapChain(SwapChain const &swapChain) {
       newPipelineLayout, rasterizerDebugSettings_.cullMode);
   vk::raii::Pipeline newDoubleSidedShadowPipeline =
       createShadowPipeline(newPipelineLayout, vk::CullModeFlagBits::eNone);
+  auto mirroredCull =
+      rasterizerDebugSettings_.cullMode == vk::CullModeFlagBits::eBack
+          ? vk::CullModeFlagBits::eFront
+      : rasterizerDebugSettings_.cullMode == vk::CullModeFlagBits::eFront
+          ? vk::CullModeFlagBits::eBack
+          : rasterizerDebugSettings_.cullMode;
+  auto newMirroredGraphicsPipeline =
+      createGraphicsPipeline(swapChain, newPipelineLayout, mirroredCull);
+  auto newMirroredTransparentPipeline =
+      createTransparentPipeline(swapChain, newPipelineLayout, mirroredCull);
+  auto newMirroredShadowPipeline =
+      createShadowPipeline(newPipelineLayout, mirroredCull);
 
-  std::vector<vk::raii::Semaphore> newRenderFinishedSemaphores;
-  newRenderFinishedSemaphores.reserve(swapChain.images().size());
-  for (std::size_t index = 0; index < swapChain.images().size(); ++index) {
-    newRenderFinishedSemaphores.emplace_back(device_.logicalDevice(),
-                                             vk::SemaphoreCreateInfo{});
-  }
-
-  std::vector<vk::ImageLayout> newSwapChainImageLayouts(
-      swapChain.images().size(), vk::ImageLayout::eUndefined);
+  std::vector<RenderGraph::State> newOutputStates(swapChain.images().size());
   std::vector<vk::Fence> newImagesInFlight(swapChain.images().size(),
                                            vk::Fence{});
   SwapChain const *newSwapChain = &swapChain;
   DepthResources newDepthResource = createDepthResources(swapChain);
-  auto newHdrOutput = std::make_unique<HdrOutput>(device_, swapChain.extent(), swapChain.imageFormat());
+  auto newHdrOutput = std::make_unique<HdrOutput>(device_, swapChain.extent(),
+                                                  swapChain.imageFormat());
 
   using std::swap;
   swap(pipelineLayout_, newPipelineLayout);
@@ -168,38 +184,69 @@ void Renderer::recreateForSwapChain(SwapChain const &swapChain) {
   swap(environmentPipeline_, newEnvironmentPipeline);
   swap(shadowPipeline_, newShadowPipeline);
   swap(doubleSidedShadowPipeline_, newDoubleSidedShadowPipeline);
-  swap(renderFinishedSemaphores_, newRenderFinishedSemaphores);
-  swap(swapChainImageLayouts_, newSwapChainImageLayouts);
+  swap(mirroredGraphicsPipeline_, newMirroredGraphicsPipeline);
+  swap(mirroredTransparentPipeline_, newMirroredTransparentPipeline);
+  swap(mirroredShadowPipeline_, newMirroredShadowPipeline);
+  swap(imageStates_.output, newOutputStates);
   swap(imagesInFlight_, newImagesInFlight);
   swap(swapChain_, newSwapChain);
   swap(depthResources_, newDepthResource);
   swap(hdrOutput_, newHdrOutput);
+  imageStates_.depth = {};
+  imageStates_.hdr = {};
+  activeGraph_.reset();
   currentFrame_ = 0;
   activeFrame_.reset();
   activePass_ = ActivePass::eNone;
-  resourceStatistics_.pipelineBuilds += 9;
+  resourceStatistics_.pipelineBuilds += 12;
 }
 
 void Renderer::createPersistentResources() {
   createCommandPool();
   createFrameResources();
   UploadBatch debugUpload(device_);
-  debugAabbLineResources_ = createGeometryResources(makeUnitAabbLineMesh(), debugUpload);
+  debugAabbLineResources_ =
+      createGeometryResources(makeUnitAabbLineMesh(), debugUpload);
   debugUpload.finish();
   shadowResources_ = createShadowResources();
   HdrImage const environment =
       loadHdrImage("assets/environments/environment.hdr");
-  environmentSh_ = projectEquirectangularToSh(environment);
-  environmentTexture_ = TextureLoader(device_, device_.resourceLedger().scope(
-      ResourceLedger::Domain::Persistent)).createFromHdrPixels(
-      environment.rgba, environment.width, environment.height);
+  auto bake = loadOrBakeEnvironment(environment, {}, ".cache/ibl");
+  environmentSh_ = bake.data.sh;
+  TextureLoader environmentLoader(
+      device_,
+      device_.resourceLedger().scope(ResourceLedger::Domain::Persistent));
+  UploadBatch environmentUpload(device_);
+  environmentTexture_ = environmentLoader.createFromHdrPixels(
+      environment.rgba, environment.width, environment.height,
+      environmentUpload);
+  environmentPrefilter_ = environmentLoader.createFromHdrCube(
+      bake.data.cubeRgba, bake.data.levels.front().size, environmentUpload);
+  environmentBrdfLut_ = environmentLoader.createFromHdrPixels(
+      bake.data.brdfLut.rgba, bake.data.brdfLut.width, bake.data.brdfLut.height,
+      environmentUpload, TextureWrap::ClampToEdge);
+  auto uploadStats = environmentUpload.finish(); // Cold startup only.
+  std::clog << "IBL cache="
+            << (bake.cacheHit
+                    ? "hit"
+                    : (bake.cacheStored ? "baked/stored" : "baked/uncached"))
+            << " cube=" << bake.data.levels.front().size
+            << " mips=" << bake.data.levels.size()
+            << " LUT=" << bake.data.brdfLut.width
+            << " image copies=" << uploadStats.imageCopies
+            << " submissions=" << uploadStats.submissions
+            << " cold fence waits=" << uploadStats.fenceWaits << '\n';
   ++resourceStatistics_.environmentUploads;
   createFrameDescriptorSetLayout();
   createFrameDescriptorPool();
   allocateAndWriteFrameDescriptorSets();
   createCommandBuffers();
-  device_.nameObject(*shadowResources_.storage.image, "Directional shadow depth");
+  device_.nameObject(*shadowResources_.storage.image,
+                     "Directional shadow depth");
   device_.nameObject(environmentTexture_.image(), "HDR environment");
+  device_.nameObject(environmentPrefilter_.image(),
+                     "GGX environment prefilter");
+  device_.nameObject(environmentBrdfLut_.image(), "Environment BRDF A/B LUT");
   for (auto const &command : commandBuffers_)
     device_.nameObject(*command, "Frame command buffer");
 }
@@ -212,9 +259,9 @@ void Renderer::createFrameResources() {
           .getQueueFamilyProperties()[device_.graphicsQueueFamilyIndex()]
           .timestampValidBits;
   frames_.clear();
-  frames_.reserve(kFramesInFlight);
+  frames_.reserve(framesInFlight_);
 
-  for (std::uint32_t index = 0; index < kFramesInFlight; ++index) {
+  for (std::uint32_t index = 0; index < framesInFlight_; ++index) {
     FrameContext frame{};
     if (timestampBits_) {
       frame.timestamps = vk::raii::QueryPool(
@@ -229,33 +276,48 @@ void Renderer::createFrameResources() {
         device_.logicalDevice(),
         vk::FenceCreateInfo{.flags = vk::FenceCreateFlagBits::eSignaled});
 
-    frame.uniform = device_.createBuffer(
-        sizeof(FrameUniformBufferObject), vk::BufferUsageFlagBits::eUniformBuffer,
-        vk::MemoryPropertyFlagBits::eHostVisible);
+    frame.uniform =
+        device_.createBuffer(sizeof(FrameUniformBufferObject),
+                             vk::BufferUsageFlagBits::eUniformBuffer,
+                             vk::MemoryPropertyFlagBits::eHostVisible);
     frames_.push_back(std::move(frame));
   }
 }
 
-Renderer::MeshGpuResources Renderer::createGeometryResources(
-    Mesh const &mesh, UploadBatch &uploads, ResourceLedger::Scope scope) {
-  auto upload = [this, &uploads, &scope]<typename T>(std::vector<T> const &data,
-                                                   vk::BufferUsageFlags usage) {
+Renderer::MeshGpuResources
+Renderer::createGeometryResources(Mesh const &mesh, UploadBatch &uploads,
+                                  ResourceLedger::Scope scope) {
+  auto upload = [this, &uploads, &scope]<typename T>(
+                    std::vector<T> const &data, vk::BufferUsageFlags usage) {
     auto bytes = std::as_bytes(std::span(data));
-    auto resources = device_.createBuffer(bytes.size_bytes(),
-        vk::BufferUsageFlagBits::eTransferDst | usage,
+    auto resources = device_.createBuffer(
+        bytes.size_bytes(), vk::BufferUsageFlagBits::eTransferDst | usage,
         vk::MemoryPropertyFlagBits::eDeviceLocal, scope);
     uploads.copyBuffer(bytes, *resources.buffer, usage);
     return resources;
   };
   MeshGpuResources resources;
-  resources.vertex = upload(mesh.vertices, vk::BufferUsageFlagBits::eVertexBuffer);
+  resources.vertex =
+      upload(mesh.vertices, vk::BufferUsageFlagBits::eVertexBuffer);
   resources.index = upload(mesh.indices, vk::BufferUsageFlagBits::eIndexBuffer);
   resources.indexCount = static_cast<std::uint32_t>(mesh.indices.size());
+  resources.unitVertexAlpha = std::ranges::all_of(
+      mesh.vertices, [](Vertex const &v) { return v.alpha == 1.0f; });
   return resources;
 }
 
 Renderer::DepthResources
 Renderer::createDepthResources(SwapChain const &swapChain) const {
+  auto required = vk::FormatFeatureFlagBits::eDepthStencilAttachment |
+                  vk::FormatFeatureFlagBits::eSampledImage |
+                  vk::FormatFeatureFlagBits::eTransferSrc;
+  if ((device_.physicalDevice()
+           .getFormatProperties(kDepthFormat)
+           .optimalTilingFeatures &
+       required) != required)
+    throw std::runtime_error(
+        "D32 depth attachment/sampling/readback is unsupported");
+
   vk::ImageCreateInfo imageCreateInfo{
       .imageType = vk::ImageType::e2D,
       .format = kDepthFormat,
@@ -269,14 +331,18 @@ Renderer::createDepthResources(SwapChain const &swapChain) const {
       .arrayLayers = 1,
       .samples = vk::SampleCountFlagBits::e1,
       .tiling = vk::ImageTiling::eOptimal,
-      .usage = vk::ImageUsageFlagBits::eDepthStencilAttachment,
+      .usage = vk::ImageUsageFlagBits::eDepthStencilAttachment |
+               vk::ImageUsageFlagBits::eSampled |
+               vk::ImageUsageFlagBits::eTransferSrc,
       .sharingMode = vk::SharingMode::eExclusive,
       .initialLayout = vk::ImageLayout::eUndefined,
   };
 
   DepthResources resources;
-  resources.storage = device_.createImage(imageCreateInfo,
-      std::uint64_t(swapChain.extent().width) * swapChain.extent().height * 4, vk::MemoryPropertyFlagBits::eDeviceLocal);
+  resources.storage = device_.createImage(
+      imageCreateInfo,
+      std::uint64_t(swapChain.extent().width) * swapChain.extent().height * 4,
+      vk::MemoryPropertyFlagBits::eDeviceLocal);
 
   vk::ImageViewCreateInfo imageViewCreateInfo{
       .image = *resources.storage.image,
@@ -293,9 +359,9 @@ Renderer::createDepthResources(SwapChain const &swapChain) const {
   };
   resources.imageView =
       vk::raii::ImageView(device_.logicalDevice(), imageViewCreateInfo);
-  resources.accounting = device_.resourceLedger().scope(
-      ResourceLedger::Domain::Persistent).track({.imageViews = 1});
-  resources.layout = vk::ImageLayout::eUndefined;
+  resources.accounting = device_.resourceLedger()
+                             .scope(ResourceLedger::Domain::Persistent)
+                             .track({.imageViews = 1});
   return resources;
 }
 
@@ -314,14 +380,16 @@ Renderer::ShadowResources Renderer::createShadowResources() const {
       .samples = vk::SampleCountFlagBits::e1,
       .tiling = vk::ImageTiling::eOptimal,
       .usage = vk::ImageUsageFlagBits::eDepthStencilAttachment |
-               vk::ImageUsageFlagBits::eSampled,
+               vk::ImageUsageFlagBits::eSampled |
+               vk::ImageUsageFlagBits::eTransferSrc,
       .sharingMode = vk::SharingMode::eExclusive,
       .initialLayout = vk::ImageLayout::eUndefined,
   };
 
   ShadowResources resources;
-  resources.storage = device_.createImage(imageCreateInfo,
-      std::uint64_t(kShadowMapSize) * kShadowMapSize * 4, vk::MemoryPropertyFlagBits::eDeviceLocal);
+  resources.storage = device_.createImage(
+      imageCreateInfo, std::uint64_t(kShadowMapSize) * kShadowMapSize * 4,
+      vk::MemoryPropertyFlagBits::eDeviceLocal);
 
   vk::ImageViewCreateInfo imageViewCreateInfo{
       .image = *resources.storage.image,
@@ -363,9 +431,9 @@ Renderer::ShadowResources Renderer::createShadowResources() const {
       vk::raii::Sampler(device_.logicalDevice(), samplerCreateInfo);
   resources.debugSampler =
       vk::raii::Sampler(device_.logicalDevice(), debugSamplerCreateInfo);
-  resources.accounting = device_.resourceLedger().scope(
-      ResourceLedger::Domain::Persistent).track({.imageViews = 1, .samplers = 2});
-  resources.layout = vk::ImageLayout::eUndefined;
+  resources.accounting = device_.resourceLedger()
+                             .scope(ResourceLedger::Domain::Persistent)
+                             .track({.imageViews = 1, .samplers = 2});
   return resources;
 }
 
@@ -388,20 +456,25 @@ Renderer::PreparedScene Renderer::prepareScene(AssetLibrary const &assets) {
   candidate->uploads_ = std::make_unique<UploadBatch>(device_);
   auto &uploads = *candidate->uploads_;
   candidate->owner_ = this;
-  candidate->resourceScope_ = device_.resourceLedger().scope(ResourceLedger::Domain::PreparedScene);
+  candidate->resourceScope_ =
+      device_.resourceLedger().scope(ResourceLedger::Domain::PreparedScene);
   candidate->meshes_.reserve(assets.meshes.size());
   for (auto const &mesh : assets.meshes)
-    candidate->meshes_.push_back(createGeometryResources(mesh, uploads, candidate->resourceScope_));
+    candidate->meshes_.push_back(
+        createGeometryResources(mesh, uploads, candidate->resourceScope_));
   candidate->materials_ = std::make_unique<MaterialGpuStore>(
-      device_, *materialDescriptorSetLayout_, assets.materials, textureCache_, uploads, candidate->resourceScope_);
+      device_, *materialDescriptorSetLayout_, assets.materials, textureCache_,
+      uploads, candidate->resourceScope_);
   return candidate;
 }
 
 void Renderer::validateSceneCandidate(PreparedScene const &candidate) const {
   if (activeFrame_)
-    throw std::runtime_error("Cannot submit or commit a scene while recording a frame.");
+    throw std::runtime_error(
+        "Cannot submit or commit a scene while recording a frame.");
   if (!candidate || candidate->owner_ != this || candidate == sceneAssets_)
-    throw std::runtime_error("Scene candidate is invalid or belongs to a different renderer.");
+    throw std::runtime_error(
+        "Scene candidate is invalid or belongs to a different renderer.");
 }
 
 void Renderer::submitSceneUpload(PreparedScene const &candidate) {
@@ -446,9 +519,11 @@ bool Renderer::commitScene(PreparedScene &candidate,
   // Allocate the retirement entry before changing live state. The callback owns
   // a snapshot of old preview descriptors, not references to new UI containers.
   if (sceneAssets_ || retireSceneUi)
-    retiredScenes_.push_back(RetiredScene{submittedFrameId_, sceneAssets_, std::move(retireSceneUi)});
+    retiredScenes_.push_back(RetiredScene{submittedFrameId_, sceneAssets_,
+                                          std::move(retireSceneUi)});
   if (sceneAssets_)
-    sceneAssets_->resourceScope_.setDomain(ResourceLedger::Domain::RetiredScene);
+    sceneAssets_->resourceScope_.setDomain(
+        ResourceLedger::Domain::RetiredScene);
   candidate->resourceScope_.setDomain(ResourceLedger::Domain::LiveScene);
   sceneAssets_.swap(candidate);
   candidate.reset();
@@ -497,6 +572,8 @@ Renderer::materialAlphaTexture(MaterialId materialId) const {
 
 void Renderer::setUiDrawCallback(
     std::function<void(vk::CommandBuffer)> callback) {
+  if (activeFrame_)
+    throw std::runtime_error("Cannot change UI callback during a frame");
   uiDrawCallback_ = std::move(callback);
 }
 
@@ -539,6 +616,16 @@ void Renderer::createFrameDescriptorSetLayout() {
           .descriptorCount = 1,
           .stageFlags = vk::ShaderStageFlagBits::eFragment,
       },
+      vk::DescriptorSetLayoutBinding{
+          .binding = 4,
+          .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+          .descriptorCount = 1,
+          .stageFlags = vk::ShaderStageFlagBits::eFragment},
+      vk::DescriptorSetLayoutBinding{
+          .binding = 5,
+          .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+          .descriptorCount = 1,
+          .stageFlags = vk::ShaderStageFlagBits::eFragment},
   };
 
   vk::DescriptorSetLayoutCreateInfo createInfo{
@@ -553,16 +640,16 @@ void Renderer::createFrameDescriptorPool() {
   std::array poolSizes = {
       vk::DescriptorPoolSize{
           .type = vk::DescriptorType::eUniformBuffer,
-          .descriptorCount = kFramesInFlight,
+          .descriptorCount = framesInFlight_,
       },
       vk::DescriptorPoolSize{
           .type = vk::DescriptorType::eCombinedImageSampler,
-          .descriptorCount = kFramesInFlight * 3,
+          .descriptorCount = framesInFlight_ * 5,
       },
   };
 
   vk::DescriptorPoolCreateInfo createInfo{
-      .maxSets = kFramesInFlight,
+      .maxSets = framesInFlight_,
       .poolSizeCount = static_cast<std::uint32_t>(poolSizes.size()),
       .pPoolSizes = poolSizes.data(),
   };
@@ -581,9 +668,11 @@ void Renderer::allocateAndWriteFrameDescriptorSets() {
 
   auto descriptorSets =
       (*device_.logicalDevice()).allocateDescriptorSets(allocateInfo);
-  frameDescriptorAccounting_ = device_.resourceLedger().scope(
-      ResourceLedger::Domain::Persistent).track(
-          {.descriptorPools = 1, .descriptorSets = descriptorSets.size()});
+  frameDescriptorAccounting_ =
+      device_.resourceLedger()
+          .scope(ResourceLedger::Domain::Persistent)
+          .track(
+              {.descriptorPools = 1, .descriptorSets = descriptorSets.size()});
 
   for (std::size_t index = 0; index < frames_.size(); ++index) {
     frames_[index].descriptorSet = descriptorSets[index];
@@ -610,6 +699,15 @@ void Renderer::allocateAndWriteFrameDescriptorSets() {
         .imageView = environmentTexture_.imageView(),
         .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
     };
+
+    vk::DescriptorImageInfo prefilterImageInfo{
+        .sampler = environmentPrefilter_.sampler(),
+        .imageView = environmentPrefilter_.imageView(),
+        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal};
+    vk::DescriptorImageInfo brdfImageInfo{
+        .sampler = environmentBrdfLut_.sampler(),
+        .imageView = environmentBrdfLut_.imageView(),
+        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal};
 
     std::array writes = {
         vk::WriteDescriptorSet{
@@ -640,6 +738,18 @@ void Renderer::allocateAndWriteFrameDescriptorSets() {
             .descriptorType = vk::DescriptorType::eCombinedImageSampler,
             .pImageInfo = &environmentImageInfo,
         },
+        vk::WriteDescriptorSet{.dstSet = frames_[index].descriptorSet,
+                               .dstBinding = 4,
+                               .descriptorCount = 1,
+                               .descriptorType =
+                                   vk::DescriptorType::eCombinedImageSampler,
+                               .pImageInfo = &prefilterImageInfo},
+        vk::WriteDescriptorSet{.dstSet = frames_[index].descriptorSet,
+                               .dstBinding = 5,
+                               .descriptorCount = 1,
+                               .descriptorType =
+                                   vk::DescriptorType::eCombinedImageSampler,
+                               .pImageInfo = &brdfImageInfo},
     };
 
     device_.logicalDevice().updateDescriptorSets(writes, {});
@@ -654,8 +764,12 @@ Renderer::FrameResult Renderer::beginFrame(glm::mat4 const &viewProjMatrix,
                                  .toneMap = lighting.toneMappingEnabled};
   validateDisplaySettings(display);
   bool dataDebug = (lighting.pbrDebugMode >= 1 && lighting.pbrDebugMode <= 5) ||
-                   lighting.shadowDebugMode == 2 || lighting.shadowDebugMode == 3;
-  if (dataDebug) { display.exposureEv = 0; display.toneMap = false; }
+                   (shadowPassEnabled && (lighting.shadowDebugMode == 2 ||
+                                          lighting.shadowDebugMode == 3));
+  if (dataDebug) {
+    display.exposureEv = 0;
+    display.toneMap = false;
+  }
   validateSwapChainState();
 
   if (activeFrame_.has_value()) {
@@ -700,7 +814,7 @@ Renderer::FrameResult Renderer::beginFrame(glm::mat4 const &viewProjMatrix,
     throw std::runtime_error("Failed to acquire swapchain image.");
   }
 
-  if (imageIndex >= renderFinishedSemaphores_.size()) {
+  if (imageIndex >= swapChain_->images().size()) {
     throw std::runtime_error("Acquire swapchain image index is out of range");
   }
 
@@ -710,47 +824,37 @@ Renderer::FrameResult Renderer::beginFrame(glm::mat4 const &viewProjMatrix,
         std::numeric_limits<std::uint64_t>::max());
   }
 
-  imagesInFlight_[imageIndex] = *frame.inFlightFence;
-
-  device_.logicalDevice().resetFences({*frame.inFlightFence});
-
   commandBuffer.reset();
-  updateFrameUniformBuffer(frame, viewProjMatrix, cameraPosition, lighting);
+  auto effectiveLighting = lighting;
+  if (!shadowPassEnabled)
+    effectiveLighting.shadowDebugMode = 0;
+  updateFrameUniformBuffer(frame, viewProjMatrix, cameraPosition,
+                           effectiveLighting);
 
   commandBuffer.begin(vk::CommandBufferBeginInfo{
       .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
   });
 
-  frame.frameId = ++submittedFrameId_;
-  frame.shadowEnabled = shadowPassEnabled;
-  frame.uiEnabled = static_cast<bool>(uiDrawCallback_);
+  activeGraph_ = buildFrameGraph(imageIndex, shadowPassEnabled);
+  lastGraphDump_ = activeGraph_->plan.dump();
+  queuedObjects_.clear();
+  queuedCasters_.clear();
+  queuedBoxes_.clear();
+  queuedSky_ = false;
+  requestedShadows_ = shadowPassEnabled;
+  drawStatistics_ = {};
+  frame.shadowEnabled = activeGraph_->shadowPass.has_value();
+  frame.uiEnabled = activeGraph_->uiPass.has_value();
   if (*frame.timestamps)
     commandBuffer.resetQueryPool(*frame.timestamps, 0, 10);
-  activeFrame_ = ActiveFrameState{
-      .frameIndex = frameIndex,
-      .imageIndex = imageIndex,
-      .acquireResult = acquireResult,
-  };
-  device_.beginLabel(*commandBuffer, "Frame");
-  timestamp(commandBuffer, 0);
-  timestamp(commandBuffer, 1);
-  if (shadowPassEnabled)
-    device_.beginLabel(*commandBuffer, "Shadow");
-  else
-    timestamp(commandBuffer, 2);
-  if (shadowPassEnabled) {
-    beginShadowPass(commandBuffer, frame);
-    activePass_ = ActivePass::eShadow;
-  } else {
-    beginMainPass(commandBuffer, frame, imageIndex, false);
-    activePass_ = ActivePass::eMain;
-  }
+  activeFrame_ = ActiveFrameState{frameIndex, imageIndex, acquireResult};
+  activePass_ = ActivePass::eNone;
 
   return FrameResult::eSuccess;
 }
 
-void Renderer::drawObject(MeshId meshId, MaterialId materialId,
-                          glm::mat4 const &modelMatrix) {
+void Renderer::recordObject(MeshId meshId, MaterialId materialId,
+                            glm::mat4 const &modelMatrix) {
   if (!activeFrame_.has_value()) {
     throw std::runtime_error("Cannot draw without an active frame.");
   }
@@ -771,6 +875,7 @@ void Renderer::drawObject(MeshId meshId, MaterialId materialId,
                                 vk::IndexType::eUint32);
 
   auto const &materialResource = materials().material(materialId);
+  bool mirrored = glm::determinant(glm::mat3(modelMatrix)) < 0;
   PushConstants pushConstants{
       .transform = modelMatrix,
       .materialTint = materialResource.tint,
@@ -783,6 +888,12 @@ void Renderer::drawObject(MeshId meshId, MaterialId materialId,
   if (!parallaxEnabled_) {
     pushConstants.surfaceParams.w = 0.0f;
   }
+  pushConstants.alphaParams.w =
+      meshResources.unitVertexAlpha &&
+              !(pushConstants.surfaceParams.w > 0.5f &&
+                pushConstants.surfaceParams.y > 0.0001f)
+          ? 1.0f
+          : 0.0f;
 
   if (activePass_ == ActivePass::eShadow) {
     if (materialResource.alphaMode == AlphaMode::Blend) {
@@ -795,7 +906,8 @@ void Renderer::drawObject(MeshId meshId, MaterialId materialId,
     vk::raii::Pipeline const &pipeline =
         variant == MaterialPipelineVariant::ShadowDoubleSided
             ? doubleSidedShadowPipeline_
-            : shadowPipeline_;
+        : mirrored ? mirroredShadowPipeline_
+                   : shadowPipeline_;
     commandBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics, *pipeline);
     commandBuffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics,
                                      *pipelineLayout_, 1,
@@ -818,13 +930,13 @@ void Renderer::drawObject(MeshId meshId, MaterialId materialId,
   vk::raii::Pipeline const *pipeline = nullptr;
   switch (variant) {
   case MaterialPipelineVariant::OpaqueSingleSided:
-    pipeline = &graphicsPipeline_;
+    pipeline = mirrored ? &mirroredGraphicsPipeline_ : &graphicsPipeline_;
     break;
   case MaterialPipelineVariant::OpaqueDoubleSided:
     pipeline = &doubleSidedGraphicsPipeline_;
     break;
   case MaterialPipelineVariant::TransparentSingleSided:
-    pipeline = &transparentPipeline_;
+    pipeline = mirrored ? &mirroredTransparentPipeline_ : &transparentPipeline_;
     break;
   case MaterialPipelineVariant::TransparentDoubleSided:
     pipeline = &doubleSidedTransparentPipeline_;
@@ -846,7 +958,7 @@ void Renderer::drawObject(MeshId meshId, MaterialId materialId,
   commandBuffer.drawIndexed(meshResources.indexCount, 1, 0, 0, 0);
 }
 
-void Renderer::drawEnvironment() {
+void Renderer::recordEnvironment() {
   if (!activeFrame_.has_value() || activePass_ != ActivePass::eMain) {
     throw std::runtime_error(
         "Environment draw requires an active main rendering pass.");
@@ -862,7 +974,7 @@ void Renderer::drawEnvironment() {
   commandBuffer.draw(3, 1, 0, 0);
 }
 
-void Renderer::drawAabb(Aabb const &bounds, glm::vec4 const &color) {
+void Renderer::recordAabb(Aabb const &bounds, glm::vec4 const &color) {
   if (!bounds.valid) {
     return;
   }
@@ -905,28 +1017,24 @@ void Renderer::drawAabb(Aabb const &bounds, glm::vec4 const &color) {
   commandBuffer.drawIndexed(debugAabbLineResources_.indexCount, 1, 0, 0, 0);
 }
 
-Renderer::FrameResult Renderer::endFrame() {
+Renderer::FrameResult Renderer::finishFrame(SceneDrawList const &scene) {
   if (!activeFrame_.has_value()) {
     throw std::runtime_error(
         "Cannot end a frame when no frame is in progress.");
-  }
-
-  if (activePass_ != ActivePass::eMain) {
-    throw std::runtime_error("Cannot end a frame before the main pass.");
   }
 
   ActiveFrameState const frameState = *activeFrame_;
   auto &frame = frames_[frameState.frameIndex];
   auto &commandBuffer = commandBuffers_[frameState.frameIndex];
 
-  endCommandBuffer(commandBuffer, frameState.imageIndex);
+  recordGraph(scene);
 
   vk::Semaphore waitSemaphore = *frame.imageAvailableSemaphore;
   vk::PipelineStageFlags waitStage =
       vk::PipelineStageFlagBits::eColorAttachmentOutput;
   vk::CommandBuffer rawCommandBuffer = *commandBuffer;
   vk::Semaphore signalSemaphore =
-      *renderFinishedSemaphores_[frameState.imageIndex];
+      swapChain_->renderFinishedSemaphore(frameState.imageIndex);
 
   vk::SubmitInfo submitInfo{
       .waitSemaphoreCount = 1,
@@ -939,32 +1047,29 @@ Renderer::FrameResult Renderer::endFrame() {
   };
 
   auto submitStart = std::chrono::steady_clock::now();
+  device_.logicalDevice().resetFences({*frame.inFlightFence});
   device_.graphicsQueue().submit({submitInfo}, *frame.inFlightFence);
-  frame.submitted = true;
+  auto const &graph = *activeGraph_;
+  imageStates_.shadow = graph.plan.finalState(graph.shadow);
+  imageStates_.depth = graph.plan.finalState(graph.depth);
+  imageStates_.hdr = graph.plan.finalState(graph.hdr);
+  imageStates_.output[frameState.imageIndex] =
+      graph.plan.finalState(graph.output);
+  onFrameSubmitted(frame);
+  imagesInFlight_[frameState.imageIndex] = *frame.inFlightFence;
   cpuSyncTimes_.submitMs = std::chrono::duration<double, std::milli>(
                                std::chrono::steady_clock::now() - submitStart)
                                .count();
 
-  vk::SwapchainKHR swapChainHandle = *swapChain_->handle();
-  vk::PresentInfoKHR presentInfo{
-      .waitSemaphoreCount = 1,
-      .pWaitSemaphores = &signalSemaphore,
-      .swapchainCount = 1,
-      .pSwapchains = &swapChainHandle,
-      .pImageIndices = &frameState.imageIndex,
-  };
-
   auto advanceFrame = [this]() {
-    currentFrame_ = (currentFrame_ + 1) % kFramesInFlight;
+    currentFrame_ = (currentFrame_ + 1) % framesInFlight_;
   };
-
   auto presentStart = std::chrono::steady_clock::now();
-  vk::Result presentResult = vk::Result::eSuccess;
-  try {
-    presentResult = device_.presentQueue().presentKHR(presentInfo);
-  } catch (vk::OutOfDateKHRError const &) {
-    activeFrame_.reset();
-    activePass_ = ActivePass::eNone;
+  auto presentResult = swapChain_->present(frameState.imageIndex);
+  activeFrame_.reset();
+  activeGraph_.reset();
+  activePass_ = ActivePass::eNone;
+  if (presentResult == vk::Result::eErrorOutOfDateKHR) {
     advanceFrame();
     return FrameResult::eSwapChainOutOfDate;
   }
@@ -974,11 +1079,9 @@ Renderer::FrameResult Renderer::endFrame() {
                                 .count();
   if (presentResult != vk::Result::eSuccess &&
       presentResult != vk::Result::eSuboptimalKHR) {
-    throw std::runtime_error("Failed to present swapchain image.");
+    throw std::runtime_error("Failed to present swapchain image: " +
+                             vk::to_string(presentResult));
   }
-
-  activeFrame_.reset();
-  activePass_ = ActivePass::eNone;
 
   if (frameState.acquireResult == vk::Result::eSuboptimalKHR ||
       presentResult == vk::Result::eSuboptimalKHR) {
@@ -1001,8 +1104,6 @@ Renderer::FrameResult Renderer::drawFrame(MeshId meshId, MaterialId materialId,
     return beginResult;
   }
 
-  drawObject(meshId, materialId, modelMatrix);
-  beginMainPass();
   drawObject(meshId, materialId, modelMatrix);
   return endFrame();
 }
@@ -1049,11 +1150,11 @@ void Renderer::validateSwapChainState() const {
     throw std::runtime_error("Renderer is not initialized with a swapchain.");
   }
 
-  if (frames_.size() != kFramesInFlight) {
+  if (frames_.size() != framesInFlight_) {
     throw std::runtime_error("Renderer frame resource count is invalid.");
   }
 
-  if (commandBuffers_.size() != kFramesInFlight) {
+  if (commandBuffers_.size() != framesInFlight_) {
     throw std::runtime_error("Renderer command buffer count is invalid.");
   }
 
@@ -1081,17 +1182,19 @@ void Renderer::validateSwapChainState() const {
     throw std::runtime_error("Renderer pipeline layout is not initialized.");
   }
 
-  if (graphicsPipeline_ == nullptr || doubleSidedGraphicsPipeline_ == nullptr) {
+  if (graphicsPipeline_ == nullptr || doubleSidedGraphicsPipeline_ == nullptr ||
+      mirroredGraphicsPipeline_ == nullptr) {
     throw std::runtime_error("Renderer graphics pipeline is not initialized.");
   }
 
   if (transparentPipeline_ == nullptr ||
-      doubleSidedTransparentPipeline_ == nullptr) {
+      doubleSidedTransparentPipeline_ == nullptr || mirroredTransparentPipeline_ == nullptr) {
     throw std::runtime_error(
         "Renderer transparent pipeline is not initialized.");
   }
 
-  if (shadowPipeline_ == nullptr || doubleSidedShadowPipeline_ == nullptr) {
+  if (shadowPipeline_ == nullptr || doubleSidedShadowPipeline_ == nullptr ||
+      mirroredShadowPipeline_ == nullptr) {
     throw std::runtime_error("Renderer shadow pipeline is not initialized.");
   }
 
@@ -1105,16 +1208,14 @@ void Renderer::validateSwapChainState() const {
         "Renderer swapchain image view count does not match image count.");
   }
 
-  if (renderFinishedSemaphores_.size() != imageCount ||
-      imagesInFlight_.size() != imageCount ||
-      swapChainImageLayouts_.size() != imageCount) {
+  if (imagesInFlight_.size() != imageCount ||
+      imageStates_.output.size() != imageCount) {
     throw std::runtime_error(
         "Renderer swapchain-dependent resource counts are inconsistent.");
   }
 
   for (auto const &frame : frames_) {
-    if (frame.uniform.buffer == nullptr ||
-        !frame.uniform.valid() ||
+    if (frame.uniform.buffer == nullptr || !frame.uniform.valid() ||
         frame.descriptorSet == nullptr) {
       throw std::runtime_error(
           "Renderer frame uniform resources are not initialized.");
@@ -1138,8 +1239,7 @@ void Renderer::validateSwapChainState() const {
       if (meshResources.vertex.buffer == nullptr ||
           !meshResources.vertex.valid() ||
           meshResources.index.buffer == nullptr ||
-          !meshResources.index.valid() ||
-          meshResources.indexCount == 0) {
+          !meshResources.index.valid() || meshResources.indexCount == 0) {
         throw std::runtime_error(
             "Renderer mesh GPU resources are not initialized.");
       }
@@ -1742,7 +1842,7 @@ void Renderer::createCommandBuffers() {
   vk::CommandBufferAllocateInfo allocateInfo{
       .commandPool = *commandPool_,
       .level = vk::CommandBufferLevel::ePrimary,
-      .commandBufferCount = kFramesInFlight,
+      .commandBufferCount = framesInFlight_,
   };
   commandBuffers_ =
       vk::raii::CommandBuffers(device_.logicalDevice(), allocateInfo);
@@ -1783,312 +1883,6 @@ void Renderer::updateFrameUniformBuffer(
   frame.uniform.write(std::as_bytes(std::span{&ubo, 1}));
 }
 
-void Renderer::beginShadowPass(vk::raii::CommandBuffer const &commandBuffer,
-                               FrameContext const &frame) {
-  vk::ClearValue depthClearValue{
-      .depthStencil =
-          vk::ClearDepthStencilValue{
-              .depth = 1.0f,
-              .stencil = 0,
-          },
-  };
-
-  transitionShadowImage(commandBuffer, vk::ImageLayout::eDepthAttachmentOptimal,
-                        vk::PipelineStageFlagBits2::eFragmentShader,
-                        vk::AccessFlagBits2::eShaderSampledRead,
-                        vk::PipelineStageFlagBits2::eEarlyFragmentTests |
-                            vk::PipelineStageFlagBits2::eLateFragmentTests,
-                        vk::AccessFlagBits2::eDepthStencilAttachmentRead |
-                            vk::AccessFlagBits2::eDepthStencilAttachmentWrite);
-
-  vk::RenderingAttachmentInfo depthAttachment{
-      .imageView = *shadowResources_.imageView,
-      .imageLayout = vk::ImageLayout::eDepthAttachmentOptimal,
-      .loadOp = vk::AttachmentLoadOp::eClear,
-      .storeOp = vk::AttachmentStoreOp::eStore,
-      .clearValue = depthClearValue,
-  };
-
-  vk::RenderingInfo renderingInfo{
-      .renderArea =
-          {
-              .offset = {0, 0},
-              .extent = {kShadowMapSize, kShadowMapSize},
-          },
-      .layerCount = 1,
-      .colorAttachmentCount = 0,
-      .pDepthAttachment = &depthAttachment,
-  };
-
-  commandBuffer.beginRendering(renderingInfo);
-
-  commandBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics,
-                             *shadowPipeline_);
-  commandBuffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics,
-                                   *pipelineLayout_, 0, {frame.descriptorSet},
-                                   {});
-
-  vk::Viewport viewport{
-      .x = 0.0f,
-      .y = 0.0f,
-      .width = static_cast<float>(kShadowMapSize),
-      .height = static_cast<float>(kShadowMapSize),
-      .minDepth = 0.0f,
-      .maxDepth = 1.0f,
-  };
-  vk::Rect2D scissor{
-      .offset = {0, 0},
-      .extent = {kShadowMapSize, kShadowMapSize},
-  };
-  commandBuffer.setViewport(0, {viewport});
-  commandBuffer.setScissor(0, {scissor});
-}
-
-void Renderer::beginMainPass() {
-  if (!activeFrame_.has_value()) {
-    throw std::runtime_error("Cannot begin main pass without an active frame.");
-  }
-
-  if (activePass_ != ActivePass::eShadow) {
-    throw std::runtime_error("Cannot begin main pass before shadow pass.");
-  }
-
-  ActiveFrameState const frameState = *activeFrame_;
-  beginMainPass(commandBuffers_[frameState.frameIndex],
-                frames_[frameState.frameIndex], frameState.imageIndex, true);
-  activePass_ = ActivePass::eMain;
-}
-
-void Renderer::beginMainPass(vk::raii::CommandBuffer const &commandBuffer,
-                             FrameContext const &frame,
-                             std::uint32_t imageIndex, bool shadowPassEnabled) {
-  if (shadowPassEnabled) {
-    commandBuffer.endRendering();
-    timestamp(commandBuffer, 2);
-    device_.endLabel(*commandBuffer);
-
-    transitionShadowImage(commandBuffer, vk::ImageLayout::eDepthReadOnlyOptimal,
-                          vk::PipelineStageFlagBits2::eLateFragmentTests,
-                          vk::AccessFlagBits2::eDepthStencilAttachmentWrite,
-                          vk::PipelineStageFlagBits2::eFragmentShader,
-                          vk::AccessFlagBits2::eShaderSampledRead);
-  }
-
-  hdrOutput_->prepareScene(*commandBuffer);
-
-  vk::ClearValue clearValue{
-      .color =
-          vk::ClearColorValue(std::array<float, 4>{0.05f, 0.07f, 0.10f, 1.0f}),
-  };
-
-  vk::ClearValue depthClearValue{
-      .depthStencil =
-          vk::ClearDepthStencilValue{
-              .depth = 1.0f,
-              .stencil = 0,
-          },
-  };
-
-  transitionDepthImage(commandBuffer, vk::ImageLayout::eDepthAttachmentOptimal,
-                       vk::PipelineStageFlagBits2::eEarlyFragmentTests |
-                           vk::PipelineStageFlagBits2::eLateFragmentTests,
-                       {},
-                       vk::PipelineStageFlagBits2::eEarlyFragmentTests |
-                           vk::PipelineStageFlagBits2::eLateFragmentTests,
-                       vk::AccessFlagBits2::eDepthStencilAttachmentRead |
-                           vk::AccessFlagBits2::eDepthStencilAttachmentWrite);
-
-  vk::RenderingAttachmentInfo depthAttachment{
-      .imageView = *depthResources_.imageView,
-      .imageLayout = vk::ImageLayout::eDepthAttachmentOptimal,
-      .loadOp = vk::AttachmentLoadOp::eClear,
-      .storeOp = vk::AttachmentStoreOp::eDontCare,
-      .clearValue = depthClearValue,
-  };
-
-  vk::RenderingAttachmentInfo colorAttachment{
-      .imageView = hdrOutput_->sceneView(),
-      .imageLayout = vk::ImageLayout::eColorAttachmentOptimal,
-      .loadOp = vk::AttachmentLoadOp::eClear,
-      .storeOp = vk::AttachmentStoreOp::eStore,
-      .clearValue = clearValue,
-  };
-  vk::RenderingInfo renderingInfo{
-      .renderArea =
-          {
-              .offset = {0, 0},
-              .extent = swapChain_->extent(),
-          },
-      .layerCount = 1,
-      .colorAttachmentCount = 1,
-      .pColorAttachments = &colorAttachment,
-      .pDepthAttachment = &depthAttachment,
-  };
-
-  timestamp(commandBuffer, 3);
-  device_.beginLabel(*commandBuffer,
-                     "Main scene (sky + opaque + mask + blend + debug)");
-  commandBuffer.beginRendering(renderingInfo);
-
-  commandBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics,
-                             *graphicsPipeline_);
-  commandBuffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics,
-                                   *pipelineLayout_, 0, {frame.descriptorSet},
-                                   {});
-
-  vk::Viewport viewport{
-      .x = 0.0f,
-      .y = 0.0f,
-      .width = static_cast<float>(swapChain_->extent().width),
-      .height = static_cast<float>(swapChain_->extent().height),
-      .minDepth = 0.0f,
-      .maxDepth = 1.0f,
-  };
-  vk::Rect2D scissor{
-      .offset = {0, 0},
-      .extent = swapChain_->extent(),
-  };
-  commandBuffer.setViewport(0, {viewport});
-  commandBuffer.setScissor(0, {scissor});
-}
-
-void Renderer::endCommandBuffer(vk::raii::CommandBuffer const &commandBuffer,
-                                std::uint32_t imageIndex) {
-  commandBuffer.endRendering();
-  timestamp(commandBuffer, 4);
-  device_.endLabel(*commandBuffer);
-  device_.beginLabel(*commandBuffer, "Display output (exposure + filmic + sRGB)");
-  timestamp(commandBuffer, 5);
-  transitionSwapChainImage(commandBuffer, imageIndex,
-                           vk::ImageLayout::eColorAttachmentOptimal,
-                           vk::PipelineStageFlagBits2::eAllCommands,
-                           vk::AccessFlagBits2::eMemoryRead,
-                           vk::PipelineStageFlagBits2::eColorAttachmentOutput,
-                           vk::AccessFlagBits2::eColorAttachmentWrite);
-  hdrOutput_->drawDisplay(*commandBuffer, *swapChain_->imageViews()[imageIndex], displaySettings_);
-  timestamp(commandBuffer, 6);
-  device_.endLabel(*commandBuffer);
-  device_.beginLabel(*commandBuffer, "UI");
-  timestamp(commandBuffer, 7);
-  if (uiDrawCallback_) uiDrawCallback_(*commandBuffer);
-  timestamp(commandBuffer, 8);
-  device_.endLabel(*commandBuffer);
-  commandBuffer.endRendering();
-
-  transitionSwapChainImage(commandBuffer, imageIndex,
-                           vk::ImageLayout::ePresentSrcKHR,
-                           vk::PipelineStageFlagBits2::eColorAttachmentOutput,
-                           vk::AccessFlagBits2::eColorAttachmentWrite,
-                           vk::PipelineStageFlagBits2::eAllCommands,
-                           vk::AccessFlagBits2::eMemoryRead);
-
-  timestamp(commandBuffer, 9);
-  device_.endLabel(*commandBuffer);
-  commandBuffer.end();
-}
-
-void Renderer::transitionSwapChainImage(
-    vk::raii::CommandBuffer const &commandBuffer, std::uint32_t imageIndex,
-    vk::ImageLayout newLayout, vk::PipelineStageFlags2 srcStageMask,
-    vk::AccessFlags2 srcAccessMask, vk::PipelineStageFlags2 dstStageMask,
-    vk::AccessFlags2 dstAccessMask) {
-  vk::ImageMemoryBarrier2 barrier{
-      .srcStageMask = srcStageMask,
-      .srcAccessMask = srcAccessMask,
-      .dstStageMask = dstStageMask,
-      .dstAccessMask = dstAccessMask,
-      .oldLayout = swapChainImageLayouts_[imageIndex],
-      .newLayout = newLayout,
-      .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-      .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-      .image = swapChain_->images()[imageIndex],
-      .subresourceRange =
-          {
-              .aspectMask = vk::ImageAspectFlagBits::eColor,
-              .baseMipLevel = 0,
-              .levelCount = 1,
-              .baseArrayLayer = 0,
-              .layerCount = 1,
-          },
-  };
-  vk::DependencyInfo dependencyInfo{
-      .imageMemoryBarrierCount = 1,
-      .pImageMemoryBarriers = &barrier,
-  };
-
-  commandBuffer.pipelineBarrier2(dependencyInfo);
-  swapChainImageLayouts_[imageIndex] = newLayout;
-}
-
-void Renderer::transitionDepthImage(
-    vk::raii::CommandBuffer const &commanderBuffer, vk::ImageLayout newLayout,
-    vk::PipelineStageFlags2 srcStageMask, vk::AccessFlags2 srcAccessMask,
-    vk::PipelineStageFlags2 dstStageMask, vk::AccessFlags2 dstAccessMask) {
-  vk::ImageMemoryBarrier2 barrier{
-      .srcStageMask = srcStageMask,
-      .srcAccessMask = srcAccessMask,
-      .dstStageMask = dstStageMask,
-      .dstAccessMask = dstAccessMask,
-      .oldLayout = depthResources_.layout,
-      .newLayout = newLayout,
-      .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-      .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-      .image = *depthResources_.storage.image,
-      .subresourceRange =
-          {
-              .aspectMask = vk::ImageAspectFlagBits::eDepth,
-              .baseMipLevel = 0,
-              .levelCount = 1,
-              .baseArrayLayer = 0,
-              .layerCount = 1,
-          },
-  };
-  vk::DependencyInfo dependencyInfo{
-      .imageMemoryBarrierCount = 1,
-      .pImageMemoryBarriers = &barrier,
-  };
-
-  commanderBuffer.pipelineBarrier2(dependencyInfo);
-  depthResources_.layout = newLayout;
-}
-
-void Renderer::transitionShadowImage(
-    vk::raii::CommandBuffer const &commandBuffer, vk::ImageLayout newLayout,
-    vk::PipelineStageFlags2 srcStage, vk::AccessFlags2 srcAccess,
-    vk::PipelineStageFlags2 dstStage, vk::AccessFlags2 dstAccess) {
-  if (shadowResources_.layout == vk::ImageLayout::eUndefined) {
-    srcStage = vk::PipelineStageFlagBits2::eNone;
-    srcAccess = {};
-  }
-
-  vk::ImageMemoryBarrier2 barrier{
-      .srcStageMask = srcStage,
-      .srcAccessMask = srcAccess,
-      .dstStageMask = dstStage,
-      .dstAccessMask = dstAccess,
-      .oldLayout = shadowResources_.layout,
-      .newLayout = newLayout,
-      .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-      .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-      .image = *shadowResources_.storage.image,
-      .subresourceRange =
-          {
-              .aspectMask = vk::ImageAspectFlagBits::eDepth,
-              .baseMipLevel = 0,
-              .levelCount = 1,
-              .baseArrayLayer = 0,
-              .layerCount = 1,
-          },
-  };
-  vk::DependencyInfo dependencyInfo{
-      .imageMemoryBarrierCount = 1,
-      .pImageMemoryBarriers = &barrier,
-  };
-
-  commandBuffer.pipelineBarrier2(dependencyInfo);
-  shadowResources_.layout = newLayout;
-}
-
 void Renderer::timestamp(vk::raii::CommandBuffer const &command,
                          std::uint32_t query) {
   if (!timestampBits_ || !activeFrame_)
@@ -2096,11 +1890,20 @@ void Renderer::timestamp(vk::raii::CommandBuffer const &command,
   command.writeTimestamp2(vk::PipelineStageFlagBits2::eBottomOfPipe,
                           *frames_[activeFrame_->frameIndex].timestamps, query);
 }
+void Renderer::setGpuTimingCallback(
+    std::function<void(GpuTimings const &)> callback) {
+  if (activeFrame_)
+    throw std::runtime_error(
+        "Cannot change timing callback during frame recording");
+  gpuTimingCallback_ = std::move(callback);
+}
+void Renderer::onFrameSubmitted(FrameContext &frame) {
+  frame.frameId = ++submittedFrameId_;
+  frame.submitted = true;
+}
 void Renderer::collectFrameTimings(FrameContext &frame) {
   if (!frame.submitted)
     return;
-  resourceStatistics_.completedFrameId =
-      std::max(resourceStatistics_.completedFrameId, frame.frameId);
   GpuTimings result{.frameId = frame.frameId};
   if (*frame.timestamps) {
     std::array<std::uint64_t, 20> values{};
@@ -2115,7 +1918,8 @@ void Renderer::collectFrameTimings(FrameContext &frame) {
     for (unsigned i = 0; i < 10; ++i)
       ready = ready && values[2 * i + 1] != 0;
     if (!ready)
-      return;
+      throw std::runtime_error(
+          "Completed frame has unavailable timestamps; refusing slot reuse");
     auto elapsed = [&](unsigned a, unsigned b) {
       return timestampMilliseconds(values[2 * a], values[2 * b], timestampBits_,
                                    timestampPeriod_);
@@ -2127,10 +1931,21 @@ void Renderer::collectFrameTimings(FrameContext &frame) {
     result.outputMs = elapsed(5, 6);
     result.uiMs = frame.uiEnabled ? elapsed(7, 8) : 0;
   }
-  gpuTimings_ = result;
+  resourceStatistics_.completedFrameId =
+      std::max(resourceStatistics_.completedFrameId, frame.frameId);
+  // A fence handle belongs to a slot, not permanently to an acquired image.
+  for (auto &fence : imagesInFlight_)
+    if (fence == *frame.inFlightFence)
+      fence = nullptr;
+  if (result.frameId > gpuTimings_.frameId)
+    gpuTimings_ = result;
   frame.submitted = false;
+  if (gpuTimingCallback_)
+    gpuTimingCallback_(result);
 }
 void Renderer::collectCompletedWork() {
+  if (swapChain_)
+    swapChain_->collectPresentationCompletions();
   for (auto &frame : frames_) {
     if (frame.submitted &&
         frame.inFlightFence.getStatus() == vk::Result::eSuccess)

@@ -39,14 +39,7 @@ constexpr bool kEnableValidationLayers = false;
 constexpr bool kEnableValidationLayers = true;
 #endif
 
-struct RenderQueueItem {
-  std::size_t objectIndex = 0;
-  MeshId meshId = 0;
-  MaterialId materialId = 0;
-  glm::mat4 modelMatrix{1.0f};
-  Aabb worldBounds{};
-  float sortDepthSq = 0.0f;
-};
+using RenderQueueItem = Renderer::DrawItem;
 
 struct Frustum {
   std::array<glm::vec4, 6> planes{};
@@ -366,10 +359,10 @@ void Application::initVulkan() {
   requiredDeviceExtensions_ = {vk::KHRSwapchainExtensionName};
   device_ =
       std::make_unique<Device>(instance_, surface_, requiredDeviceExtensions_,
-                               options_.gpu, debugUtilsEnabled_);
+                               options_.gpu, debugUtilsEnabled_, presentationInstance_, parsePresentationPolicy(options_.presentSync));
   swapChain_ = std::make_unique<SwapChain>(*device_, surface_, window_, nullptr,
                                            options_.present);
-  renderer_ = std::make_unique<Renderer>(*device_);
+  renderer_ = std::make_unique<Renderer>(*device_, options_.framesInFlight);
   renderer_->recreateForSwapChain(*swapChain_);
   auto loadStart = std::chrono::steady_clock::now();
   if (startupScenePath_) {
@@ -388,6 +381,9 @@ void Application::initVulkan() {
             << VK_VERSION_MINOR(props.apiVersion)
             << ", GPU timestamps: " << renderer_->gpuTimingSupported()
             << ", validation: " << validationLayersEnabled_ << '\n';
+  auto const &presentation = device_->presentationSupport();
+  std::cout << "Presentation synchronization: " << presentationBackendName(presentation.backend)
+            << " (" << presentation.reason << ")\n";
   if (options_.benchmarkDirectory) {
     if (std::filesystem::exists(*options_.benchmarkDirectory /
                                 "summary.json") ||
@@ -414,6 +410,12 @@ void Application::initVulkan() {
     m.scene = loadedScenePath_.string();
     m.cameraPath = options_.cameraPath;
     m.presentMode = vk::to_string(swapChain_->presentMode());
+    m.framesInFlight = renderer_->framesInFlight();
+    m.swapchainImageCount = swapChain_->images().size();
+    m.presentSyncBackend = presentationBackendName(presentation.backend);
+    m.presentSyncReason = presentation.reason;
+    m.presentFencesEnabled = presentation.fencesEnabled();
+    renderer_->setGpuTimingCallback([this](GpuTimings const &gpu) { recordBenchmarkTiming(gpu); });
     m.buildType = VULKAN_BUILD_TYPE;
     m.width = swapChain_->extent().width;
     m.height = swapChain_->extent().height;
@@ -542,74 +544,29 @@ void Application::mainLoop() {
 
     LightingSettings frameLighting = scene_.lighting;
     bool const shadowPassEnabled = shadowDebugEnabled_;
-    if (!shadowPassEnabled) {
-      frameLighting.shadowDebugMode = 0;
-    }
 
     auto prepareEnd = std::chrono::steady_clock::now();
-    auto beginResult = renderer_->beginFrame(viewProjMatrix, camera.position,
-                                             frameLighting, shadowPassEnabled);
-    if (beginResult != Renderer::FrameResult::eSuccess) {
+    auto frameResult = renderer_->renderFrame(
+        Renderer::SceneDrawList{
+            .opaque = visibleRenderQueues.opaque,
+            .mask = visibleRenderQueues.mask,
+            .transparent = visibleRenderQueues.transparent,
+            .allOpaque = renderQueues.opaque,
+            .allMask = renderQueues.mask,
+            .sky = true, .bounds = showAabbDebug_},
+        viewProjMatrix, camera.position, frameLighting, shadowPassEnabled);
+    auto const &draws = renderer_->drawStatistics();
+    shadowDrawCalls_ = draws.shadow;
+    mainDrawCalls_ = draws.main;
+    debugDrawCalls_ = draws.debug;
+    frameDrawCalls_ = draws.shadow + draws.main + draws.debug;
+    if (frameResult == Renderer::FrameResult::eSwapChainOutOfDate) {
       if (options_.benchmarkDirectory)
-        throw std::runtime_error("Benchmark interrupted during image "
-                                 "acquisition; rerun at fixed resolution");
+        throw std::runtime_error("Benchmark interrupted by swapchain change; rerun at fixed resolution");
       recreateSwapChain();
       continue;
     }
 
-    harvestBenchmarkTimings();
-    if (shadowPassEnabled) {
-      for (RenderQueueItem const &item : renderQueues.opaque) {
-        renderer_->drawObject(item.meshId, item.materialId, item.modelMatrix);
-        ++frameDrawCalls_;
-        ++shadowDrawCalls_;
-      }
-      for (RenderQueueItem const &item : renderQueues.mask) {
-        renderer_->drawObject(item.meshId, item.materialId, item.modelMatrix);
-        ++frameDrawCalls_;
-        ++shadowDrawCalls_;
-      }
-
-      renderer_->beginMainPass();
-    }
-
-    renderer_->drawEnvironment();
-
-    for (RenderQueueItem const &item : visibleRenderQueues.opaque) {
-      renderer_->drawObject(item.meshId, item.materialId, item.modelMatrix);
-      ++frameDrawCalls_;
-      ++mainDrawCalls_;
-    }
-    for (RenderQueueItem const &item : visibleRenderQueues.mask) {
-      renderer_->drawObject(item.meshId, item.materialId, item.modelMatrix);
-      ++frameDrawCalls_;
-      ++mainDrawCalls_;
-    }
-    for (RenderQueueItem const &item : visibleRenderQueues.transparent) {
-      renderer_->drawObject(item.meshId, item.materialId, item.modelMatrix);
-      ++frameDrawCalls_;
-      ++mainDrawCalls_;
-    }
-
-    if (showAabbDebug_) {
-      for (RenderQueueItem const &item : visibleRenderQueues.opaque) {
-        renderer_->drawAabb(item.worldBounds, {0.1f, 0.95f, 0.65f, 0.95f});
-        ++frameDrawCalls_;
-        ++debugDrawCalls_;
-      }
-      for (RenderQueueItem const &item : visibleRenderQueues.mask) {
-        renderer_->drawAabb(item.worldBounds, {0.1f, 0.95f, 0.65f, 0.95f});
-        ++frameDrawCalls_;
-        ++debugDrawCalls_;
-      }
-      for (RenderQueueItem const &item : visibleRenderQueues.transparent) {
-        renderer_->drawAabb(item.worldBounds, {0.1f, 0.95f, 0.65f, 0.95f});
-        ++frameDrawCalls_;
-        ++debugDrawCalls_;
-      }
-    }
-
-    auto frameResult = renderer_->endFrame();
     if (options_.benchmarkDirectory && elapsed >= options_.warmupSeconds) {
       auto const &sync = renderer_->cpuSyncTimes();
       BenchmarkFrame sample{
@@ -643,9 +600,14 @@ void Application::cleanup() {
   // Join the one preparation task before its borrowed Renderer/Device die.
   sceneLoad_.reset();
   if (device_) {
-    device_->logicalDevice().waitIdle();
-    if (renderer_)
-      renderer_->collectCompletedWork(); // Release retired previews before ImGui shutdown.
+    try {
+      if (swapChain_) swapChain_->drainPresentations();
+      else device_->logicalDevice().waitIdle();
+      if (renderer_ && (!swapChain_ || !swapChain_->presentationDeviceLost()))
+        renderer_->collectCompletedWork(); // Release retired previews before ImGui shutdown.
+    } catch (vk::DeviceLostError const &) {
+      std::cerr << "Device lost during shutdown; skipping completion waits\n";
+    }
   }
 
   cleanupImGui();
@@ -688,10 +650,11 @@ void Application::recreateSwapChain() {
   glfwGetFramebufferSize(window_, &width, &height);
 
   while (width == 0 || height == 0) {
+    if (glfwWindowShouldClose(window_)) return;
     glfwWaitEvents();
     glfwGetFramebufferSize(window_, &width, &height);
   }
-  device_->logicalDevice().waitIdle();
+  swapChain_->drainPresentations();
 
   vk::SwapchainKHR oldSwapChainHandle = *swapChain_->handle();
   auto newSwapChain = std::make_unique<SwapChain>(
@@ -816,7 +779,8 @@ void Application::drawImGui() {
                        4.0f);
     char const *pbrDebugModes[] = {"Final",     "Base Color",  "Metallic",
                                    "Roughness", "Normal",      "AO",
-                                   "Emissive",  "Diffuse IBL", "Specular IBL"};
+                                   "Emissive",  "Diffuse IBL", "Specular IBL",
+                                   "Specular Weight", "Dielectric F0"};
     ImGui::Combo("PBR Debug", &scene_.lighting.pbrDebugMode, pbrDebugModes,
                  static_cast<int>(std::size(pbrDebugModes)));
     ImGui::SliderFloat("Environment Intensity",
@@ -898,6 +862,14 @@ void Application::drawImGui() {
           textureLabel(material.emissivePath, material.emissiveBytes));
       ImGui::Text("Metallic: %.3f", material.metallicFactor);
       ImGui::Text("Roughness: %.3f", material.roughnessFactor);
+      ImGui::Text("Specular Factor: %.3f", material.specularFactor);
+      ImGui::Text("Specular Color Factor: %.3f, %.3f, %.3f",
+                  material.specularColorFactor.x, material.specularColorFactor.y,
+                  material.specularColorFactor.z);
+      ImGui::TextWrapped("Specular Strength (UV %d): %s", material.specularTexCoord,
+                         textureLabel(material.specularPath, material.specularBytes));
+      ImGui::TextWrapped("Specular Color (UV %d): %s", material.specularColorTexCoord,
+                         textureLabel(material.specularColorPath, material.specularColorBytes));
       ImGui::Text("AO Strength: %.3f", material.occlusionStrength);
       ImGui::Text("Emissive Factor: %.3f, %.3f, %.3f",
                   material.emissiveFactor.x, material.emissiveFactor.y,
@@ -967,6 +939,14 @@ void Application::drawImGui() {
     Renderer::RasterizerDebugSettings settings =
         renderer_->rasterizerDebugSettings();
 
+    auto const &presentation = device_->presentationSupport();
+    auto presentStats = swapChain_->presentationStatistics();
+    ImGui::Text("Present sync: %s", presentationBackendName(presentation.backend));
+    ImGui::Text("Present requests / release fences: %llu / %llu (%zu pending)",
+        static_cast<unsigned long long>(presentStats.queued),
+        static_cast<unsigned long long>(presentStats.completed), presentStats.pendingFences);
+    if (!presentation.fencesEnabled()) ImGui::TextWrapped("%s; legacy idle release is unproven", presentation.reason.c_str());
+    ImGui::Text("Frames in flight: %u (shared HDR/depth/shadow)", renderer_->framesInFlight());
     ImGui::Text("FPS: %.1f", framesPerSecond_);
     ImGui::Text("CPU loop cadence: %.2f ms", frameTimeMs_);
     auto const &gpu = renderer_->gpuTimings();
@@ -982,6 +962,8 @@ void Application::drawImGui() {
                 sync.fenceMs, sync.acquireMs, sync.presentMs);
     ImGui::Text("Device: %s",
                 device_->physicalDevice().getProperties().deviceName.data());
+    if (ImGui::CollapsingHeader("Render Graph"))
+      ImGui::TextUnformatted(renderer_->renderGraphDump().c_str());
     ImGui::Separator();
     ImGui::Checkbox("Shadows", &shadowDebugEnabled_);
     ImGui::Checkbox("Normal/Bump Mapping", &normalMapDebugEnabled_);
@@ -1628,6 +1610,8 @@ std::vector<char const *> Application::getRequiredInstanceExtensions() {
   });
   if (debugUtilsEnabled_)
     extensions.push_back(vk::EXTDebugUtilsExtensionName);
+  presentationInstance_ = enablePresentationInstanceExtensions(available, extensions,
+      parsePresentationPolicy(options_.presentSync));
 
   return extensions;
 }
@@ -1651,10 +1635,7 @@ VKAPI_ATTR vk::Bool32 VKAPI_CALL Application::debugCallback(
   return vk::False;
 }
 
-void Application::harvestBenchmarkTimings() {
-  if (!options_.benchmarkDirectory)
-    return;
-  auto const &gpu = renderer_->gpuTimings();
+void Application::recordBenchmarkTiming(GpuTimings const &gpu) {
   auto it = benchmarkFrameIndices_.find(gpu.frameId);
   if (it != benchmarkFrameIndices_.end())
     benchmarkFrames_[it->second].gpu = gpu;
@@ -1667,9 +1648,15 @@ void Application::finishBenchmark() {
                         std::chrono::steady_clock::now() - benchmarkStart_)
                             .count() -
                         options_.warmupSeconds);
-  device_->logicalDevice().waitIdle();
+  swapChain_->drainPresentations();
   renderer_->collectCompletedWork();
-  harvestBenchmarkTimings();
+  auto const present = swapChain_->presentationStatistics();
+  benchmarkMetadata_.presentationReleaseProven = swapChain_->presentationReleaseProven();
+  benchmarkMetadata_.presentQueued = present.queued;
+  benchmarkMetadata_.presentCompleted = present.completed;
+  benchmarkMetadata_.pendingPresentFences = present.pendingFences;
+  benchmarkMetadata_.presentFenceWaits = present.fenceWaits;
+  benchmarkMetadata_.legacyPresentDrains = present.legacyDrains;
   auto [usage, budget] = device_->memoryUsageBudget();
   benchmarkMetadata_.sampledPeakHeapUsage =
       std::max(benchmarkMetadata_.sampledPeakHeapUsage, usage);

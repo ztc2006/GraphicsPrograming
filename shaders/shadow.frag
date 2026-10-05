@@ -2,6 +2,8 @@
 
 layout(set = 1, binding = 0) uniform sampler2D albedoTexture;
 layout(set = 1, binding = 3) uniform sampler2D alphaMaskTexture;
+layout(set = 1, binding = 8) uniform sampler2D baseAlbedoTexture;
+layout(set = 1, binding = 9) uniform sampler2D baseAlphaMaskTexture;
 
 layout(push_constant) uniform PushConstants {
   mat4 transform;
@@ -11,11 +13,7 @@ layout(push_constant) uniform PushConstants {
 } pushConstants;
 
 layout(location = 0) in vec2 inUv;
-
-float alphaMaskValue(vec4 alphaTexel) {
-  return max(max(alphaTexel.r, alphaTexel.g),
-             max(alphaTexel.b, alphaTexel.a));
-}
+layout(location = 1) in float inAlpha;
 
 void main() {
   int alphaMode = int(round(pushConstants.alphaParams.x));
@@ -23,10 +21,14 @@ void main() {
     return;
   }
 
-  vec4 texel = texture(albedoTexture, inUv);
-  vec4 alphaTexel = texture(alphaMaskTexture, inUv);
+  bool useBase = pushConstants.alphaParams.z != 1.0 ||
+                 pushConstants.alphaParams.w < 0.5;
+  vec4 texel = useBase ? texture(baseAlbedoTexture, inUv)
+                      : texture(albedoTexture, inUv);
+  vec4 alphaTexel = useBase ? texture(baseAlphaMaskTexture, inUv)
+                           : texture(alphaMaskTexture, inUv);
   float alpha =
-      texel.a * alphaMaskValue(alphaTexel) * pushConstants.materialTint.a;
+      texel.a * alphaTexel.r * pushConstants.materialTint.a * inAlpha;
   if (alpha < pushConstants.alphaParams.y) {
     discard;
   }

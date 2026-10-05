@@ -8,14 +8,29 @@ import sys
 import tempfile
 
 binary, scene = (str(Path(p).resolve()) for p in sys.argv[1:3])
+frames = sys.argv[3] if len(sys.argv) > 3 else "1"
+sync = sys.argv[4] if len(sys.argv) > 4 else "auto"
 with tempfile.TemporaryDirectory(prefix='vulkan-benchmark-smoke-') as temporary:
-    result = subprocess.run([binary, '--benchmark', temporary, '--warmup', '0', '--duration', '1', '--size', '800x600', '--no-ui', scene], capture_output=True, text=True, timeout=45)
+    result = subprocess.run([binary, '--benchmark', temporary, '--warmup', '0', '--duration', '1', '--size', '800x600', '--no-ui', '--frames-in-flight', frames, '--present-sync', sync, scene], capture_output=True, text=True, timeout=45)
     print(result.stdout + result.stderr)
     assert result.returncode == 0, f'Viewer shutdown/report failed: {result.returncode}'
     summary = json.loads((Path(temporary)/'summary.json').read_text())
     rows = list(csv.DictReader((Path(temporary)/'frames.csv').open()))
-    assert summary['schema'] == 3
+    assert summary['schema'] == 4
+    assert summary['frames_in_flight'] == int(frames)
+    assert summary['swapchain_image_count'] >= 2
+    assert summary['frame_target_policy'] == 'shared_hdr_depth_shadow'
     assert summary['completed'] and len(rows) > 0
+    assert summary['pending_present_fences'] == 0
+    assert summary['present_queued_count'] == len(rows)
+    if summary['present_fences_enabled']:
+        assert summary['presentation_release_proven']
+        assert summary['present_fence_completed_count'] == len(rows)
+        assert summary['present_sync_backend'] in ('KHR_present_fence', 'EXT_present_fence')
+    else:
+        assert not summary['presentation_release_proven']
+        assert summary['present_sync_backend'] == 'legacy_wait_idle'
+        assert summary['legacy_present_drain_count'] > 0
     assert len(rows) == summary['frame_count']
     assert len({row['frame_id'] for row in rows}) == len(rows)
     assert summary['gpu_sample_count'] == len(rows), 'Completed frames must have GPU queries'

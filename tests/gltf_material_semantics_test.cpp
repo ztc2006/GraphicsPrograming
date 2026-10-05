@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <cmath>
 #include <filesystem>
 #include <iostream>
 
@@ -87,6 +88,20 @@ int main() {
       siheyuan.materials.at(9).normalTexCoord != 5 ||
       siheyuan.materials.at(9).metallicRoughnessTexCoord != 5) {
     std::cerr << "siheyuan material TEXCOORD_5 selection was lost\n";
+    return 1;
+  }
+  if (!siheyuan.warnings.empty() ||
+      siheyuan.materials[7].specularColorBytes.empty() ||
+      siheyuan.materials[8].specularColorBytes.empty() ||
+      siheyuan.materials[7].specularFactor != 1 ||
+      std::abs(siheyuan.materials[7].specularColorFactor.r - 1.13513517f) >
+          1e-6f ||
+      std::abs(siheyuan.materials[7].specularColorFactor.g - 1.15929198f) >
+          1e-6f ||
+      std::abs(siheyuan.materials[8].specularColorFactor.r - 1.11764705f) >
+          1e-6f ||
+      siheyuan.materials[0].specularColorFactor != glm::vec3(1)) {
+    std::cerr << "Courtyard specular extension/defaults/embedded image lost\n";
     return 1;
   }
   std::size_t const packedMaterialCount = std::count_if(

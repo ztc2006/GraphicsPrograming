@@ -40,10 +40,18 @@ struct Material {
   std::vector<std::byte> occlusionBytes;
   std::string emissivePath;
   std::vector<std::byte> emissiveBytes;
+  std::string specularPath, specularColorPath;
+  std::vector<std::byte> specularBytes, specularColorBytes;
+  TextureSamplerDescription specularSampler, specularColorSampler;
+  int specularTexCoord = 0, specularColorTexCoord = 0;
+  float specularFactor = 1.0f;
+  glm::vec3 specularColorFactor{1.0f};
   std::string heightPath;
   std::string alphaPath;
-  TextureSamplerDescription albedoSampler, normalSampler, metallicRoughnessSampler;
-  TextureSamplerDescription occlusionSampler, emissiveSampler, heightSampler, alphaSampler;
+  TextureSamplerDescription albedoSampler, normalSampler,
+      metallicRoughnessSampler;
+  TextureSamplerDescription occlusionSampler, emissiveSampler, heightSampler,
+      alphaSampler;
   int albedoTexCoord = 0;
   int normalTexCoord = 0;
   int metallicRoughnessTexCoord = 0;

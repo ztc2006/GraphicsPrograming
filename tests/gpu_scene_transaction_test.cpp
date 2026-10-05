@@ -1,6 +1,9 @@
+#include "frame_context_regression.hpp"
 #include "gltf_loader.hpp"
-#include "renderer.hpp"
 #include "hdr_output_regression.hpp"
+#include "presentation_regression.hpp"
+#include "renderer.hpp"
+#include "texture_mip_regression.hpp"
 
 #include <GLFW/glfw3.h>
 #include <chrono>
@@ -37,53 +40,80 @@ void checkAllocationStatistics(Device const &device) {
 
 void exerciseGpuAllocator(Device const &device) {
   auto ledger = device.resourceLedger();
-  require(ledger.snapshot().current == ResourceLedger::Footprint{}, "Allocator test baseline is not empty");
+  require(ledger.snapshot().current == ResourceLedger::Footprint{},
+          "Allocator test baseline is not empty");
   {
     auto scene = ledger.scope(ResourceLedger::Domain::PreparedScene);
     auto staging = ledger.scope(ResourceLedger::Domain::Staging);
-    auto first = device.createBuffer(4096, vk::BufferUsageFlagBits::eTransferSrc,
-                                    vk::MemoryPropertyFlagBits::eHostVisible, scene);
-    auto second = device.createBuffer(4096, vk::BufferUsageFlagBits::eTransferDst,
-                                     vk::MemoryPropertyFlagBits::eHostVisible, staging);
+    auto first =
+        device.createBuffer(4096, vk::BufferUsageFlagBits::eTransferSrc,
+                            vk::MemoryPropertyFlagBits::eHostVisible, scene);
+    auto second =
+        device.createBuffer(4096, vk::BufferUsageFlagBits::eTransferDst,
+                            vk::MemoryPropertyFlagBits::eHostVisible, staging);
     auto a = first.memoryInfo(), b = second.memoryInfo();
     require(a.block == b.block && a.offset + a.suballocationBytes <= b.offset,
-            "Small compatible buffers did not share a block with independent ranges");
+            "Small compatible buffers did not share a block with independent "
+            "ranges");
     auto initial = ledger.snapshot();
-    require(initial.current.buffers == 2 && initial.current.payloadBytes == 8192 &&
-                initial.current.allocations == 1 && initial.current.suballocations == 2 &&
-                initial.current.allocatedBytes > initial.current.suballocatedBytes,
-            "Shared block was counted per resource or confused with suballocation bytes");
+    require(
+        initial.current.buffers == 2 && initial.current.payloadBytes == 8192 &&
+            initial.current.allocations == 1 &&
+            initial.current.suballocations == 2 &&
+            initial.current.allocatedBytes > initial.current.suballocatedBytes,
+        "Shared block was counted per resource or confused with suballocation "
+        "bytes");
     checkAllocationStatistics(device);
     scene.setDomain(ResourceLedger::Domain::LiveScene);
     require(ledger.snapshot().current == initial.current &&
-                ledger.snapshot().at(ResourceLedger::Domain::LiveScene).suballocatedBytes == a.suballocationBytes,
-            "Resource transfer reclassified or duplicated its shared backing block");
+                ledger.snapshot()
+                        .at(ResourceLedger::Domain::LiveScene)
+                        .suballocatedBytes == a.suballocationBytes,
+            "Resource transfer reclassified or duplicated its shared backing "
+            "block");
     std::array<std::byte, 4096> bytesA, bytesB, downloaded;
-    bytesA.fill(std::byte{17}); bytesB.fill(std::byte{51});
-    first.write(bytesA); second.write(bytesB);
-    std::array<std::byte, 7> partial; partial.fill(std::byte{93});
+    bytesA.fill(std::byte{17});
+    bytesB.fill(std::byte{51});
+    first.write(bytesA);
+    second.write(bytesB);
+    std::array<std::byte, 7> partial;
+    partial.fill(std::byte{93});
     first.write(partial, 3);
     std::copy(partial.begin(), partial.end(), bytesA.begin() + 3);
     first.read(downloaded);
-    require(downloaded == bytesA, "Allocation-relative unaligned write changed neighboring bytes");
+    require(downloaded == bytesA,
+            "Allocation-relative unaligned write changed neighboring bytes");
     second.read(downloaded);
-    require(downloaded == bytesB, "Mapping an adjacent suballocation corrupted shared memory");
+    require(downloaded == bytesB,
+            "Mapping an adjacent suballocation corrupted shared memory");
     std::array<std::byte, 7> slice;
     first.read(slice, 3);
-    require(slice == partial, "Allocation-relative invalidate/read range failed");
-    expectFailure([&] { first.write(partial, 4095); }, "Out-of-bounds write accepted");
-    expectFailure([&] { first.read(slice, UINT64_MAX); }, "Overflow read range accepted");
-    expectFailure([&] { (void)device.createBuffer(0, vk::BufferUsageFlagBits::eTransferSrc, {}); }, "Zero-size buffer accepted");
-    auto replacement = device.createBuffer(512, vk::BufferUsageFlagBits::eTransferSrc,
-                                           vk::MemoryPropertyFlagBits::eHostVisible);
+    require(slice == partial,
+            "Allocation-relative invalidate/read range failed");
+    expectFailure([&] { first.write(partial, 4095); },
+                  "Out-of-bounds write accepted");
+    expectFailure([&] { first.read(slice, UINT64_MAX); },
+                  "Overflow read range accepted");
+    expectFailure(
+        [&] {
+          (void)device.createBuffer(0, vk::BufferUsageFlagBits::eTransferSrc,
+                                    {});
+        },
+        "Zero-size buffer accepted");
+    auto replacement =
+        device.createBuffer(512, vk::BufferUsageFlagBits::eTransferSrc,
+                            vk::MemoryPropertyFlagBits::eHostVisible);
     replacement = std::move(first);
-    require(!first.valid() && replacement.valid(), "Buffer move assignment left duplicate ownership");
-    expectFailure([&] { first.read(slice); }, "Moved buffer still exposes an allocation");
+    require(!first.valid() && replacement.valid(),
+            "Buffer move assignment left duplicate ownership");
+    expectFailure([&] { first.read(slice); },
+                  "Moved buffer still exposes an allocation");
     replacement.read(downloaded);
     require(downloaded == bytesA && ledger.snapshot().current.buffers == 2,
             "Move assignment freed the source or leaked the destination");
     checkAllocationStatistics(device);
-    auto residentBacking = ledger.snapshot().at(ResourceLedger::Domain::AllocatorBlocks);
+    auto residentBacking =
+        ledger.snapshot().at(ResourceLedger::Domain::AllocatorBlocks);
     {
       auto upload = device.createUploadBuffer(1024);
       require(upload.memoryInfo().block != replacement.memoryInfo().block,
@@ -93,40 +123,52 @@ void exerciseGpuAllocator(Device const &device) {
       require(slice == partial, "Upload allocator mapping failed");
       checkAllocationStatistics(device);
     }
-    require(ledger.snapshot().at(ResourceLedger::Domain::AllocatorBlocks) == residentBacking,
-            "Completed upload retained memory blocks behind live resident buffers");
+    require(
+        ledger.snapshot().at(ResourceLedger::Domain::AllocatorBlocks) ==
+            residentBacking,
+        "Completed upload retained memory blocks behind live resident buffers");
     checkAllocationStatistics(device);
-    std::cout << "PASS upload lifetime isolation: resident buffers remain, upload backing fully reclaimed\n";
+    std::cout << "PASS upload lifetime isolation: resident buffers remain, "
+                 "upload backing fully reclaimed\n";
     auto concurrent = ledger.scope(ResourceLedger::Domain::PreparedScene);
     auto worker = [&] {
       std::vector<Device::BufferResources> held;
       for (int i = 0; i < 16; ++i) {
-        auto resource = device.createBuffer(1024, vk::BufferUsageFlagBits::eTransferSrc,
-                                           vk::MemoryPropertyFlagBits::eHostVisible, concurrent);
+        auto resource = device.createBuffer(
+            1024, vk::BufferUsageFlagBits::eTransferSrc,
+            vk::MemoryPropertyFlagBits::eHostVisible, concurrent);
         resource.write(partial, 5);
         held.push_back(std::move(resource));
       }
       return held;
     };
-    auto x = std::async(std::launch::async, worker), y = std::async(std::launch::async, worker);
+    auto x = std::async(std::launch::async, worker),
+         y = std::async(std::launch::async, worker);
     auto heldX = x.get(), heldY = y.get();
-    require(ledger.snapshot().at(ResourceLedger::Domain::PreparedScene).buffers == 32,
-            "Concurrent allocator registration lost resources");
+    require(
+        ledger.snapshot().at(ResourceLedger::Domain::PreparedScene).buffers ==
+            32,
+        "Concurrent allocator registration lost resources");
     checkAllocationStatistics(device);
     for (auto const &resource : heldY) {
       resource.read(slice, 5);
       require(slice == partial, "Concurrent mapping mixed allocation offsets");
     }
-    std::cout << "PASS buffer allocator: shared block=" << initial.current.allocatedBytes
-              << " bytes, 2 suballocations=" << initial.current.suballocatedBytes
-              << " bytes; offset mapping, bounds, moves, 32 concurrent buffers, VMA statistics\n";
+    std::cout << "PASS buffer allocator: shared block="
+              << initial.current.allocatedBytes << " bytes, 2 suballocations="
+              << initial.current.suballocatedBytes
+              << " bytes; offset mapping, bounds, moves, 32 concurrent "
+                 "buffers, VMA statistics\n";
     if (a.properties & vk::MemoryPropertyFlagBits::eHostCoherent)
-      std::cout << "NOTE buffer mapping used coherent memory; noncoherent hardware coverage remains open\n";
+      std::cout << "NOTE buffer mapping used coherent memory; noncoherent "
+                   "hardware coverage remains open\n";
   }
-  require(device.gpuAllocationStatistics().blocks == 0 &&
-              ledger.snapshot().current == ResourceLedger::Footprint{},
-          "Last buffer did not release allocator backing blocks and accounting");
-  std::cout << "PASS allocator lifetime: last buffer destroys allocator; backing and suballocation counters return to zero\n";
+  require(
+      device.gpuAllocationStatistics().blocks == 0 &&
+          ledger.snapshot().current == ResourceLedger::Footprint{},
+      "Last buffer did not release allocator backing blocks and accounting");
+  std::cout << "PASS allocator lifetime: last buffer destroys allocator; "
+               "backing and suballocation counters return to zero\n";
 }
 
 void exerciseImageAllocator(Device const &device) {
@@ -254,16 +296,18 @@ void exerciseImageAllocator(Device const &device) {
 void verifyUploadedTexel(Device const &device, TextureResources const &texture,
                          std::span<std::byte const> expected) {
   auto before = device.resourceLedger().snapshot().current;
-  auto readback =
-      device.createBuffer(expected.size(), vk::BufferUsageFlagBits::eTransferDst,
-                          vk::MemoryPropertyFlagBits::eHostVisible |
-                              vk::MemoryPropertyFlagBits::eHostCoherent);
+  auto readback = device.createBuffer(
+      expected.size(), vk::BufferUsageFlagBits::eTransferDst,
+      vk::MemoryPropertyFlagBits::eHostVisible |
+          vk::MemoryPropertyFlagBits::eHostCoherent);
   auto now = device.resourceLedger().snapshot().current;
   auto requirement = readback.buffer.getMemoryRequirements();
   auto info = readback.memoryInfo();
-  require(now.suballocatedBytes == before.suballocatedBytes + info.suballocationBytes &&
+  require(now.suballocatedBytes ==
+                  before.suballocatedBytes + info.suballocationBytes &&
               now.payloadBytes == before.payloadBytes + expected.size() &&
-              now.buffers == before.buffers + 1 && now.suballocations == before.suballocations + 1 &&
+              now.buffers == before.buffers + 1 &&
+              now.suballocations == before.suballocations + 1 &&
               info.suballocationBytes >= requirement.size,
           "Ledger confused buffer payload, suballocation and backing size");
   vk::raii::CommandPool pool(
@@ -390,21 +434,27 @@ void exerciseTextureCache(Device const &device) {
   write();
   {
     UploadBatch uploads(device);
-    auto beforeShared = device.resourceLedger().snapshot().at(ResourceLedger::Domain::SharedTextures);
+    auto beforeShared = device.resourceLedger().snapshot().at(
+        ResourceLedger::Domain::SharedTextures);
     auto srgb =
         cache.encoded(bytes, "embedded", TextureColorSpace::Srgb, {}, uploads);
     VkMemoryRequirements imageRequirements{};
     vkGetImageMemoryRequirements(static_cast<VkDevice>(device.deviceHandle()),
-                                static_cast<VkImage>(srgb.image()), &imageRequirements);
-    auto imageLedger = device.resourceLedger().snapshot().at(ResourceLedger::Domain::SharedTextures);
+                                 static_cast<VkImage>(srgb.image()),
+                                 &imageRequirements);
+    auto imageLedger = device.resourceLedger().snapshot().at(
+        ResourceLedger::Domain::SharedTextures);
     require(imageLedger.allocatedBytes == 0 &&
-                imageLedger.suballocatedBytes >= beforeShared.suballocatedBytes + imageRequirements.size &&
+                imageLedger.suballocatedBytes >=
+                    beforeShared.suballocatedBytes + imageRequirements.size &&
                 imageLedger.suballocations == beforeShared.suballocations + 1 &&
                 imageLedger.payloadBytes == beforeShared.payloadBytes + 4 &&
                 imageLedger.images == beforeShared.images + 1 &&
                 imageLedger.imageViews == beforeShared.imageViews + 1,
-            "Ledger confused decoded texel bytes with actual image allocation size");
-    std::cout << "PASS: 1x1 image payload=4 bytes, Vulkan required range=" << imageRequirements.size << " bytes\n";
+            "Ledger confused decoded texel bytes with actual image allocation "
+            "size");
+    std::cout << "PASS: 1x1 image payload=4 bytes, Vulkan required range="
+              << imageRequirements.size << " bytes\n";
 
     auto duplicate = cache.encoded(bytes, "another material",
                                    TextureColorSpace::Srgb, {}, uploads);
@@ -497,7 +547,8 @@ void exerciseCanceledUpload(Renderer &renderer, Device const &device,
     return;
   }
   device.logicalDevice().waitIdle(); // Isolate this deterministic test gate.
-  renderer.collectCompletedWork(); // Drain old timestamp readback before gating.
+  renderer
+      .collectCompletedWork(); // Drain old timestamp readback before gating.
   auto ledgerBaseline = renderer.resourceSnapshot();
   auto candidate = renderer.prepareScene(assets);
   std::weak_ptr<Renderer::SceneAssets> canceled = candidate;
@@ -536,7 +587,8 @@ void exerciseCanceledUpload(Renderer &renderer, Device const &device,
                 renderer.resourceStatistics().sceneUploadFenceWaits == 0,
             "Cancellation changed live assets or waited for upload completion");
     auto held = renderer.resourceSnapshot();
-    require(held.at(ResourceLedger::Domain::PreparedScene).buffers == assets.meshes.size() * 2 + assets.materials.size() &&
+    require(held.at(ResourceLedger::Domain::PreparedScene).buffers ==
+                    assets.meshes.size() * 2 + assets.materials.size() &&
                 held.at(ResourceLedger::Domain::Staging).suballocatedBytes > 0,
             "Canceled pending upload vanished from the resource ledger");
     release();
@@ -551,8 +603,9 @@ void exerciseCanceledUpload(Renderer &renderer, Device const &device,
   auto reclaimed = renderer.resourceSnapshot();
   for (std::size_t i = 0; i < ResourceLedger::domainCount; ++i)
     if (i != static_cast<std::size_t>(ResourceLedger::Domain::AllocatorBlocks))
-      require(reclaimed.domains[i] == ledgerBaseline.domains[i],
-              "Canceled upload did not restore resource/suballocation baseline");
+      require(
+          reclaimed.domains[i] == ledgerBaseline.domains[i],
+          "Canceled upload did not restore resource/suballocation baseline");
   std::cout << "PASS: unsignaled timeline gate, nonblocking "
                "polling/cancellation, safe upload reclamation\n";
 }
@@ -560,7 +613,7 @@ void exerciseCanceledUpload(Renderer &renderer, Device const &device,
 void exercise(Renderer &renderer, Device const &device,
               AssetLibrary const &assets) {
   auto initial = renderer.resourceStatistics();
-  require(initial.environmentUploads == 1 && initial.pipelineBuilds == 9,
+  require(initial.environmentUploads == 1 && initial.pipelineBuilds == 12,
           "Initial environment and material pipelines are missing");
   unsigned uiCalls = 0, releases = 0;
   renderer.setUiDrawCallback([&](vk::CommandBuffer) { ++uiCalls; });
@@ -601,16 +654,24 @@ void exercise(Renderer &renderer, Device const &device,
   };
   std::uint64_t geometryBytes = 0;
   for (auto const &mesh : assets.meshes)
-    geometryBytes += mesh.vertices.size() * sizeof(Vertex) + mesh.indices.size() * sizeof(std::uint32_t);
-  auto privateBytes = geometryBytes + assets.materials.size() * sizeof(MaterialGpuStore::MaterialUniformBufferObject);
+    geometryBytes += mesh.vertices.size() * sizeof(Vertex) +
+                     mesh.indices.size() * sizeof(std::uint32_t);
+  auto privateBytes =
+      geometryBytes + assets.materials.size() *
+                          sizeof(MaterialGpuStore::MaterialUniformBufferObject);
   auto candidate = renderer.prepareScene(assets);
   auto preparedLedger = renderer.resourceSnapshot();
-  auto const &prepared = preparedLedger.at(ResourceLedger::Domain::PreparedScene);
-  require(prepared.payloadBytes == privateBytes && prepared.suballocatedBytes >= privateBytes &&
-              prepared.buffers == assets.meshes.size() * 2 + assets.materials.size() &&
-              prepared.descriptorPools == 1 && prepared.descriptorSets == assets.materials.size(),
+  auto const &prepared =
+      preparedLedger.at(ResourceLedger::Domain::PreparedScene);
+  require(prepared.payloadBytes == privateBytes &&
+              prepared.suballocatedBytes >= privateBytes &&
+              prepared.buffers ==
+                  assets.meshes.size() * 2 + assets.materials.size() &&
+              prepared.descriptorPools == 1 &&
+              prepared.descriptorSets == assets.materials.size(),
           "Prepared geometry/UBO/descriptors do not match physical resources");
-  require(preparedLedger.at(ResourceLedger::Domain::Staging).payloadBytes >= geometryBytes,
+  require(preparedLedger.at(ResourceLedger::Domain::Staging).payloadBytes >=
+              geometryBytes,
           "Recorded staging bytes disappeared before submission");
   std::weak_ptr<Renderer::SceneAssets> live = candidate;
   require(renderer.resourceStatistics().sceneUploadSubmissions == 0,
@@ -619,15 +680,22 @@ void exercise(Renderer &renderer, Device const &device,
           "Initial upload bypassed pending state");
   commitWhenReady(candidate);
   auto firstUpload = renderer.resourceStatistics().lastSceneUpload;
-  require(firstUpload.submissions == 1 && firstUpload.fenceWaits == 0 &&
-              firstUpload.imageCopies == 6,
+  require(firstUpload.submissions == 1 && firstUpload.fenceWaits == 0,
           "Initial scene waited instead of polling its upload fence");
+  // The fixture reuses one encoded image for normal and packed data: their mip
+  // semantics now require independent storage, in addition to sRGB storage.
+  require(firstUpload.imageCopies == 7,
+          "Initial scene lost typed texture identity or uploaded duplicates");
   draw();
   auto settledLedger = renderer.resourceSnapshot();
-  require(settledLedger.at(ResourceLedger::Domain::LiveScene).payloadBytes == privateBytes &&
-              settledLedger.at(ResourceLedger::Domain::PreparedScene).suballocatedBytes == 0 &&
-              settledLedger.at(ResourceLedger::Domain::Staging).suballocatedBytes == 0,
-          "Initial commit left staging or private candidate allocations behind");
+  require(
+      settledLedger.at(ResourceLedger::Domain::LiveScene).payloadBytes ==
+              privateBytes &&
+          settledLedger.at(ResourceLedger::Domain::PreparedScene)
+                  .suballocatedBytes == 0 &&
+          settledLedger.at(ResourceLedger::Domain::Staging).suballocatedBytes ==
+              0,
+      "Initial commit left staging or private candidate allocations behind");
   auto oldImage = renderer.materialAlbedoTexture(0).image();
   auto beforeFailure = renderer.resourceStatistics().sceneUploadSubmissions;
   auto broken = assets;
@@ -679,7 +747,8 @@ void exercise(Renderer &renderer, Device const &device,
                 settledLedger.at(ResourceLedger::Domain::SharedTextures),
             "Shared images/samplers were double-counted across candidates");
     auto oldPrivate = beforeCommitLedger.at(ResourceLedger::Domain::LiveScene);
-    auto newPrivate = beforeCommitLedger.at(ResourceLedger::Domain::PreparedScene);
+    auto newPrivate =
+        beforeCommitLedger.at(ResourceLedger::Domain::PreparedScene);
     auto nextLive = std::weak_ptr<Renderer::SceneAssets>(candidate);
     auto oldLive = live;
     unsigned const priorReleases = releases;
@@ -700,11 +769,16 @@ void exercise(Renderer &renderer, Device const &device,
     require(renderer.materialAlbedoTexture(0).image() == oldImage,
             "Same-content reload uploaded a duplicate image");
     auto committedLedger = renderer.resourceSnapshot();
-    require(committedLedger.at(ResourceLedger::Domain::RetiredScene) == oldPrivate &&
-                committedLedger.at(ResourceLedger::Domain::LiveScene) == newPrivate &&
-                committedLedger.at(ResourceLedger::Domain::Staging).suballocatedBytes == 0 &&
-                committedLedger.peak.allocatedBytes >= beforeCommitLedger.current.allocatedBytes &&
-                committedLedger.peak.suballocatedBytes >= beforeCommitLedger.current.suballocatedBytes,
+    require(committedLedger.at(ResourceLedger::Domain::RetiredScene) ==
+                    oldPrivate &&
+                committedLedger.at(ResourceLedger::Domain::LiveScene) ==
+                    newPrivate &&
+                committedLedger.at(ResourceLedger::Domain::Staging)
+                        .suballocatedBytes == 0 &&
+                committedLedger.peak.allocatedBytes >=
+                    beforeCommitLedger.current.allocatedBytes &&
+                committedLedger.peak.suballocatedBytes >=
+                    beforeCommitLedger.current.suballocatedBytes,
             "Commit lost old/new coexistence or staging peak accounting");
     auto upload = renderer.resourceStatistics().lastSceneUpload;
     require(upload.imageCopies == 0 &&
@@ -716,7 +790,9 @@ void exercise(Renderer &renderer, Device const &device,
     renderer.collectCompletedWork();
     require(oldLive.expired() && releases == priorReleases + 1,
             "Completed old assets/previews were not reclaimed");
-    require(renderer.resourceSnapshot().at(ResourceLedger::Domain::RetiredScene).suballocatedBytes == 0,
+    require(renderer.resourceSnapshot()
+                    .at(ResourceLedger::Domain::RetiredScene)
+                    .suballocatedBytes == 0,
             "Retired resources remained in the ledger after reclamation");
     live = nextLive;
     draw(1);
@@ -724,10 +800,12 @@ void exercise(Renderer &renderer, Device const &device,
   device.logicalDevice().waitIdle();
   renderer.collectCompletedWork();
   auto finalLedger = renderer.resourceSnapshot();
-  require(finalLedger.at(ResourceLedger::Domain::SharedTextures) == settledLedger.at(ResourceLedger::Domain::SharedTextures) &&
+  require(finalLedger.at(ResourceLedger::Domain::SharedTextures) ==
+                  settledLedger.at(ResourceLedger::Domain::SharedTextures) &&
               finalLedger.at(ResourceLedger::Domain::Staging).buffers == 0,
           "Repeated scene replacement grew shared storage or leaked staging");
-  std::cout << "PASS: exact payload/allocation ledger; shared dedup, rollback, cancellation, retirement and coexistence peak\n";
+  std::cout << "PASS: exact payload/allocation ledger; shared dedup, rollback, "
+               "cancellation, retirement and coexistence peak\n";
   auto final = renderer.resourceStatistics();
   require(final.sceneCommits == 4 && releases == 3 && uiCalls == frameId,
           "Commit/release/UI frame counts changed unexpectedly");
@@ -747,7 +825,7 @@ void exercise(Renderer &renderer, Device const &device,
 }
 } // namespace
 
-int main() {
+int main(int argc, char **argv) {
   if (glfwInit() != GLFW_TRUE) {
     char const *message = nullptr;
     glfwGetError(&message);
@@ -763,33 +841,67 @@ int main() {
     glfwTerminate();
     return 77;
   }
+  // Complete initial native window events before borrowing it for a surface.
+  glfwPollEvents();
   int status = 1;
   try {
     vk::raii::Context context;
     unsigned extensionCount = 0;
-    auto extensions = glfwGetRequiredInstanceExtensions(&extensionCount);
-    require(extensions && extensionCount, "No Vulkan window-system extensions");
+    auto glfwExtensions = glfwGetRequiredInstanceExtensions(&extensionCount);
+    require(glfwExtensions && extensionCount,
+            "No Vulkan window-system extensions");
+    std::vector<char const *> extensions(glfwExtensions,
+                                         glfwExtensions + extensionCount);
+    auto policy = parsePresentationPolicy(argc > 2 ? argv[2] : "auto");
+    auto presentationInstance = enablePresentationInstanceExtensions(
+        context.enumerateInstanceExtensionProperties(), extensions, policy);
+    bool extOnly = argc > 3 && std::string_view(argv[3]) == "ext";
+    if (extOnly) {
+      presentationInstance.khr = false;
+      std::erase_if(extensions, [](auto name) {
+        return std::strcmp(name, vk::KHRSurfaceMaintenance1ExtensionName) == 0;
+      });
+    }
     vk::ApplicationInfo info{.pApplicationName = "Scene transaction regression",
                              .apiVersion = vk::ApiVersion13};
     vk::raii::Instance instance(
-        context, vk::InstanceCreateInfo{.pApplicationInfo = &info,
-                                        .enabledExtensionCount = extensionCount,
-                                        .ppEnabledExtensionNames = extensions});
+        context,
+        vk::InstanceCreateInfo{.pApplicationInfo = &info,
+                               .enabledExtensionCount =
+                                   static_cast<unsigned>(extensions.size()),
+                               .ppEnabledExtensionNames = extensions.data()});
     VkSurfaceKHR rawSurface{};
     require(glfwCreateWindowSurface(static_cast<VkInstance>(*instance), window,
                                     nullptr, &rawSurface) == VK_SUCCESS,
             "Surface creation failed");
     vk::raii::SurfaceKHR surface(instance, rawSurface);
-    Device device(instance, surface, {vk::KHRSwapchainExtensionName});
+    Device device(instance, surface, {vk::KHRSwapchainExtensionName}, {}, false,
+                  presentationInstance, policy);
+    if (extOnly &&
+        device.presentationSupport().backend != PresentationBackend::ExtFence) {
+      status = 77;
+      throw std::runtime_error("SKIP EXT backend: matching instance/device "
+                               "extension or feature unavailable");
+    }
+    std::cout << "Presentation backend: "
+              << presentationBackendName(device.presentationSupport().backend)
+              << " (" << device.presentationSupport().reason << ")\n";
     exerciseGpuAllocator(device);
     exerciseImageAllocator(device);
     exerciseHdrAllocation(device);
+    exerciseTextureMips(device);
     exerciseHdrOutput(device);
     SwapChain swapchain(device, surface, window);
-    exerciseHdrScene(device, swapchain);
+    unsigned framesInFlight = argc > 1 ? std::stoul(argv[1]) : 1;
+    exercisePresentation(device, swapchain, framesInFlight);
+    exerciseHdrScene(device, swapchain, framesInFlight);
+    exerciseMaterialContract(device, swapchain, framesInFlight);
+    exerciseEnvironmentIbl(device, swapchain, framesInFlight);
+    exerciseSpecularExtension(device, swapchain, framesInFlight);
+    exerciseFrameContexts(device, swapchain);
     {
       std::unique_ptr<SwapChain> resized;
-      Renderer renderer(device);
+      Renderer renderer(device, framesInFlight);
       renderer.recreateForSwapChain(swapchain);
       auto imported = loadStaticGltfScene(TEST_FIXTURE, {});
       AssetLibrary assets{.meshes = std::move(imported.meshes),
@@ -797,6 +909,7 @@ int main() {
       try {
         exerciseTextureCache(device);
         exercise(renderer, device, assets);
+        verifyDrainedFrameContexts(renderer);
         renderer.setUiDrawCallback({});
         auto baseline = renderer.resourceSnapshot();
         auto sceneStats = renderer.resourceStatistics();
@@ -816,6 +929,19 @@ int main() {
             if (width != int(size.width) || height != int(size.height))
               std::this_thread::sleep_for(std::chrono::milliseconds(1));
           } while (width != int(size.width) || height != int(size.height));
+          auto const beforeResizeFrame = renderer.submittedFrameId();
+          auto beforeResizeResult = renderer.renderFrame(
+              {.sky = true}, glm::mat4(1), {0, 0, 2}, {}, false);
+          std::cout << "Resize old-generation acquire/present result: "
+                    << int(beforeResizeResult) << ", submitted delta="
+                    << (renderer.submittedFrameId() - beforeResizeFrame)
+                    << '\n';
+          auto &old = resized ? *resized : swapchain;
+          old.drainPresentations();
+          require(old.presentationStatistics().pendingFences == 0 &&
+                      old.presentationReleaseProven() ==
+                          device.presentationSupport().fencesEnabled(),
+                  "Old generation was not drained before replacement");
           auto candidate = std::make_unique<SwapChain>(
               device, surface, window,
               resized ? *resized->handle() : *swapchain.handle());

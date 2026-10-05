@@ -22,6 +22,11 @@ int main() {
                 vertices[2].position.y == 1,
             "Sparse POSITION without a base bufferView was lost");
     auto const &v = vertices.at(0);
+    require(v.alpha == 1, "VEC3 color must default alpha to one");
+    auto alphaScene = fixture("vertex_alpha.gltf");
+    require(near(alphaScene.meshes[0].vertices[0].alpha, .2f) &&
+                near(alphaScene.meshes[0].vertices[2].alpha, .8f),
+            "VEC4 vertex alpha lost during import/tangent generation");
     require(near(v.normal.z, 1) && near(v.uv.x, 32768.0f / 65535.0f) &&
                 near(v.uv.y, 1),
             "Normalized signed normal/unsigned UV conversion failed");
@@ -62,11 +67,42 @@ int main() {
     require(optional.warnings.size() == 1 &&
                 optional.warnings[0].find("TEST_optional") != std::string::npos,
             "Optional unsupported extension fallback was silent");
+    auto supported = fixture("required_specular.gltf");
+    require(supported.warnings.empty(),
+            "Supported required specular extension rejected/warned");
+    auto spec = fixture("specular_semantics.gltf");
+    auto const &sm = spec.materials[0];
+    auto const &sv = spec.meshes[0].vertices[0];
+    require(spec.warnings.empty() && near(sm.specularFactor, .35f) &&
+                sm.specularColorFactor == glm::vec3(2, .5f, 30) &&
+                !sm.specularPath.empty() && !sm.specularColorPath.empty(),
+            "Specular factor/color greater than 1/texture references lost");
+    require(sm.specularTexCoord == 5 && sm.specularColorTexCoord == 5 &&
+                near(sv.specularUv.x, .1f) && near(sv.specularUv.y, .2f) &&
+                near(sv.specularColorUv.x, -.35f) &&
+                near(sv.specularColorUv.y, -.05f),
+            "Independent specular UV or transform lost during Mikk generation");
+    require(sm.specularSampler.mag == TextureFilter::Nearest &&
+                sm.specularSampler.mip == TextureMipFilter::Linear &&
+                sm.specularSampler.u == TextureWrap::ClampToEdge &&
+                sm.specularSampler.v == TextureWrap::MirroredRepeat &&
+                sm.specularColorSampler.min == TextureFilter::Nearest &&
+                sm.specularColorSampler.mip == TextureMipFilter::None,
+            "Independent specular samplers lost");
+    auto defaults = fixture("specular_defaults.gltf");
+    require(defaults.materials[0].specularFactor == 1 &&
+                defaults.materials[0].specularColorFactor == glm::vec3(1) &&
+                material.specularFactor == 1 &&
+                material.specularColorFactor == glm::vec3(1),
+            "Absent extension/extension field defaults changed core material");
     for (auto const *name :
-         {"required_extension.gltf", "required_specular.gltf",
-          "short_view.gltf", "overflow_view.gltf", "cycle.gltf",
-          "bad_sparse_index.gltf", "duplicate_sparse_index.gltf",
-          "bad_triangle_index.gltf"}) {
+         {"required_extension.gltf", "specular_bad_strength.gltf",
+          "specular_negative_color.gltf", "specular_nonfinite_color.gltf",
+          "specular_missing_uv.gltf", "specular_missing_image.gltf",
+          "specular_unlit.gltf", "specular_specgloss.gltf", "short_view.gltf",
+          "overflow_view.gltf", "cycle.gltf", "bad_sparse_index.gltf",
+          "duplicate_sparse_index.gltf", "bad_triangle_index.gltf",
+          "bad_color_alpha.gltf", "bad_color_rgb.gltf"}) {
       bool rejected = false;
       try {
         (void)fixture(name);

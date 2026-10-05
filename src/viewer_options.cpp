@@ -52,7 +52,14 @@ ViewerOptions parseViewerOptions(std::span<std::string_view const> args) {
       o.gpu = value();
     else if (!positionalOnly && arg == "--present")
       o.present = value();
-    else if (!positionalOnly && arg == "--no-ui")
+    else if (!positionalOnly && arg == "--present-sync")
+      o.presentSync = value();
+    else if (!positionalOnly && arg == "--frames-in-flight") {
+      auto count = number(value());
+      if (count != 1 && count != 2)
+        throw std::invalid_argument("Frames in flight must be 1 or 2");
+      o.framesInFlight = static_cast<unsigned>(count);
+    } else if (!positionalOnly && arg == "--no-ui")
       o.ui = false;
     else if (!positionalOnly && arg == "--validation")
       o.validation = true;
@@ -81,6 +88,8 @@ ViewerOptions parseViewerOptions(std::span<std::string_view const> args) {
       o.present != "immediate")
     throw std::invalid_argument(
         "Present mode: auto, fifo, mailbox or immediate");
+  if (o.presentSync != "auto" && o.presentSync != "fence" && o.presentSync != "legacy")
+    throw std::invalid_argument("Present synchronization: auto, fence or legacy");
   if (o.benchmarkDirectory && !sizeSet) {
     o.width = 1920;
     o.height = 1080;
@@ -98,6 +107,8 @@ std::string_view viewerUsage() {
          "  --size WIDTHxHEIGHT (benchmark default: 1920x1080)\n"
          "  --camera-path static|orbit (default static)\n"
          "  --present auto|fifo|mailbox|immediate\n"
+         "  --present-sync auto|fence|legacy (default auto)\n"
+         "  --frames-in-flight 1|2 (default 1; shared frame targets)\n"
          "  --gpu NAME         Require a matching Vulkan device name\n"
          "  --no-ui            Disable UI during measurement\n"
          "  --validation       Request validation even in Release\n";

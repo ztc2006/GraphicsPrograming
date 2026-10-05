@@ -19,6 +19,7 @@
 #include "scene_ecs.hpp"
 #include "viewer_options.hpp"
 #include "vulkan_include.hpp"
+#include "presentation.hpp"
 #include <unordered_map>
 
 class Device;
@@ -57,7 +58,7 @@ private:
   void initImGui();
   void beginImGuiFrame();
   void drawImGui();
-  void harvestBenchmarkTimings();
+  void recordBenchmarkTiming(GpuTimings const &gpu);
   void finishBenchmark();
   void cleanupImGui();
   void clearMaterialPreviewTextures();
@@ -91,6 +92,7 @@ private:
   std::vector<BenchmarkFrame> benchmarkFrames_;
   std::unordered_map<std::uint64_t, std::size_t> benchmarkFrameIndices_;
   Camera benchmarkCamera_{};
+  PresentationInstanceSupport presentationInstance_;
   bool debugUtilsEnabled_ = false;
   unsigned validationErrors_ = 0, validationWarnings_ = 0;
   std::chrono::steady_clock::time_point benchmarkStart_{};

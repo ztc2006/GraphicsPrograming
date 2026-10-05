@@ -192,56 +192,8 @@ vk::raii::Pipeline HdrOutput::createPipeline(vk::Format displayFormat) const {
                                       .layout = *pipelineLayout_};
   return vk::raii::Pipeline(device_.logicalDevice(), nullptr, info);
 }
-void HdrOutput::transition(vk::CommandBuffer command, vk::ImageLayout layout,
-                           vk::PipelineStageFlags2 srcStage,
-                           vk::AccessFlags2 srcAccess,
-                           vk::PipelineStageFlags2 dstStage,
-                           vk::AccessFlags2 dstAccess) {
-  if (layout_ == vk::ImageLayout::eUndefined) {
-    srcStage = {};
-    srcAccess = {};
-  }
-  vk::ImageMemoryBarrier2 barrier{
-      .srcStageMask = srcStage,
-      .srcAccessMask = srcAccess,
-      .dstStageMask = dstStage,
-      .dstAccessMask = dstAccess,
-      .oldLayout = layout_,
-      .newLayout = layout,
-      .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-      .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-      .image = *scene_.image,
-      .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}};
-  command.pipelineBarrier2(vk::DependencyInfo{
-      .imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &barrier});
-  layout_ = layout;
-}
-void HdrOutput::prepareScene(vk::CommandBuffer command) {
-  transition(command, vk::ImageLayout::eColorAttachmentOptimal,
-             vk::PipelineStageFlagBits2::eFragmentShader,
-             vk::AccessFlagBits2::eShaderSampledRead,
-             vk::PipelineStageFlagBits2::eColorAttachmentOutput,
-             vk::AccessFlagBits2::eColorAttachmentWrite);
-}
-void HdrOutput::drawDisplay(vk::CommandBuffer command,
-                            vk::ImageView destination,
-                            DisplaySettings settings) {
+void HdrOutput::drawDisplay(vk::CommandBuffer command, DisplaySettings settings) {
   validateDisplaySettings(settings);
-  transition(command, vk::ImageLayout::eShaderReadOnlyOptimal,
-             vk::PipelineStageFlagBits2::eColorAttachmentOutput,
-             vk::AccessFlagBits2::eColorAttachmentWrite,
-             vk::PipelineStageFlagBits2::eFragmentShader,
-             vk::AccessFlagBits2::eShaderSampledRead);
-  vk::RenderingAttachmentInfo attachment{
-      .imageView = destination,
-      .imageLayout = vk::ImageLayout::eColorAttachmentOptimal,
-      .loadOp = vk::AttachmentLoadOp::eDontCare,
-      .storeOp = vk::AttachmentStoreOp::eStore};
-  vk::RenderingInfo rendering{.renderArea = {{0, 0}, extent_},
-                              .layerCount = 1,
-                              .colorAttachmentCount = 1,
-                              .pColorAttachments = &attachment};
-  command.beginRendering(rendering);
   command.setViewport(0, {vk::Viewport{0, 0, float(extent_.width),
                                        float(extent_.height), 0, 1}});
   command.setScissor(0, {vk::Rect2D{{0, 0}, extent_}});

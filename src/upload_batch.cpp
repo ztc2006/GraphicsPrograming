@@ -1,4 +1,5 @@
 #include "upload_batch.hpp"
+#include <algorithm>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -72,8 +73,31 @@ void UploadBatch::copyBuffer(std::span<std::byte const> data,
 }
 
 void UploadBatch::copyImage(std::span<std::byte const> data,
-                            vk::Image destination, std::uint32_t width,
-                            std::uint32_t height) {
+                            vk::Image destination,
+                            std::span<TextureMipLevel const> levels,
+                            std::size_t texelBytes, std::uint32_t arrayLayers) {
+  if (levels.empty() || (texelBytes != 4 && texelBytes != 16) ||
+      (arrayLayers != 1 && arrayLayers != 6) ||
+      (arrayLayers == 6 && levels[0].width != levels[0].height))
+    throw std::runtime_error("Image upload requires RGBA8 or RGBA32F levels.");
+  auto expected = textureMipLayout(levels[0].width, levels[0].height,
+                                   texelBytes, levels.size() > 1);
+  for (auto &level : expected) {
+    level.offset *= arrayLayers;
+    level.size *= arrayLayers;
+  }
+  if (levels.size() != expected.size() ||
+      !std::ranges::equal(levels, expected) ||
+      data.size() != expected.back().offset + expected.back().size)
+    throw std::runtime_error("Image upload mip layout does not match data.");
+  auto count = static_cast<std::uint32_t>(levels.size());
+  std::vector<vk::BufferImageCopy> regions;
+  for (std::uint32_t mip = 0; mip < count; ++mip)
+    regions.push_back(vk::BufferImageCopy{
+        .bufferOffset = levels[mip].offset,
+        .imageSubresource = {vk::ImageAspectFlagBits::eColor, mip, 0,
+                             arrayLayers},
+        .imageExtent = {levels[mip].width, levels[mip].height, 1}});
   auto staging = stage(data);
   auto &command = commands_.front();
   vk::ImageMemoryBarrier2 barrier{
@@ -85,14 +109,12 @@ void UploadBatch::copyImage(std::span<std::byte const> data,
       .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
       .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
       .image = destination,
-      .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}};
+      .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, count, 0,
+                           arrayLayers}};
   command.pipelineBarrier2(vk::DependencyInfo{
       .imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &barrier});
-  command.copyBufferToImage(
-      staging, destination, vk::ImageLayout::eTransferDstOptimal,
-      {vk::BufferImageCopy{
-          .imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
-          .imageExtent = {width, height, 1}}});
+  command.copyBufferToImage(staging, destination,
+                            vk::ImageLayout::eTransferDstOptimal, regions);
   barrier.srcStageMask = vk::PipelineStageFlagBits2::eTransfer;
   barrier.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
   barrier.dstStageMask = vk::PipelineStageFlagBits2::eFragmentShader;

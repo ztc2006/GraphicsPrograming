@@ -19,6 +19,11 @@ struct BenchmarkMetadata {
   std::string gpu, deviceType, driver, api, scene, cameraPath, presentMode,
       buildType;
   unsigned width = 0, height = 0;
+  unsigned framesInFlight = 1, swapchainImageCount = 0;
+  std::string presentSyncBackend = "legacy_wait_idle", presentSyncReason;
+  bool presentFencesEnabled = false, presentationReleaseProven = false;
+  std::uint64_t presentQueued = 0, presentCompleted = 0, pendingPresentFences = 0,
+                presentFenceWaits = 0, legacyPresentDrains = 0;
   std::array<float, 3> cameraPosition{}, cameraTarget{};
   float fovRadians = 0, nearPlane = 0, farPlane = 0, environmentIntensity = 1, exposureEv = 0;
   bool toneMappingEnabled = true;

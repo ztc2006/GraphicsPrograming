@@ -6,6 +6,7 @@
 #include <array>
 #include <cassert>
 #include <limits>
+#include <iostream>
 
 #include <GLFW/glfw3.h>
 
@@ -17,6 +18,7 @@ SwapChain::SwapChain(Device const &device, vk::raii::SurfaceKHR const &surface,
       requestedPresent_(std::move(requestedPresent)) {
   createSwapChain();
   createImageViews();
+  createPresentationResources();
 }
 
 vk::raii::SwapchainKHR const &SwapChain::handle() const { return swapChain_; }
@@ -168,4 +170,97 @@ void SwapChain::createImageViews() {
 
     imageViews_.emplace_back(device_.logicalDevice(), createInfo);
   }
+}
+
+
+void SwapChain::createPresentationResources() {
+  presentation_.reserve(images_.size());
+  for (std::size_t i = 0; i < images_.size(); ++i) {
+    PresentationResources resources;
+    resources.finished = vk::raii::Semaphore(device_.logicalDevice(), vk::SemaphoreCreateInfo{});
+    if (device_.presentationSupport().fencesEnabled())
+      resources.fence = vk::raii::Fence(device_.logicalDevice(), vk::FenceCreateInfo{});
+    device_.nameObject(*resources.finished, ("Swapchain present wait " + std::to_string(i)).c_str());
+    if (*resources.fence) device_.nameObject(*resources.fence, ("Swapchain present release " + std::to_string(i)).c_str());
+    presentation_.push_back(std::move(resources));
+  }
+}
+SwapChain::~SwapChain() {
+  if (!presentationDirty_) return;
+  try { drainPresentations(); }
+  catch (std::exception const &error) { std::cerr << "Swapchain teardown drain: " << error.what() << '\n'; }
+}
+vk::Semaphore SwapChain::renderFinishedSemaphore(std::uint32_t imageIndex) const {
+  presentationDirty_ = true;
+  return *presentation_.at(imageIndex).finished;
+}
+void SwapChain::waitPresentation(std::uint32_t imageIndex) const {
+  auto &record = presentation_.at(imageIndex);
+  if (!record.pending) return;
+  ++presentationStatistics_.fenceWaits;
+  try {
+    auto result = device_.logicalDevice().waitForFences({*record.fence}, true, UINT64_MAX);
+    if (result != vk::Result::eSuccess) throw std::runtime_error("Presentation fence wait did not complete");
+  } catch (vk::DeviceLostError const &) { deviceLost_ = true; throw; }
+  record.pending = false;
+  ++presentationStatistics_.completed;
+}
+vk::Result SwapChain::present(std::uint32_t imageIndex) const {
+  auto &record = presentation_.at(imageIndex);
+  waitPresentation(imageIndex);
+  vk::Fence fence = *record.fence;
+  if (fence) device_.logicalDevice().resetFences({fence});
+  vk::SwapchainPresentFenceInfoKHR presentFence{.swapchainCount = 1, .pFences = &fence};
+  vk::Semaphore semaphore = *record.finished;
+  vk::SwapchainKHR swapchain = *swapChain_;
+  vk::PresentInfoKHR info{.pNext = fence ? &presentFence : nullptr,
+      .waitSemaphoreCount = 1, .pWaitSemaphores = &semaphore,
+      .swapchainCount = 1, .pSwapchains = &swapchain, .pImageIndices = &imageIndex};
+  // Raw result preserves bookkeeping even for enqueued WSI errors which Vulkan-Hpp throws.
+  auto result = static_cast<vk::Result>(vkQueuePresentKHR(
+      static_cast<VkQueue>(*device_.presentQueue()), reinterpret_cast<VkPresentInfoKHR const *>(&info)));
+  recordPresentResult(imageIndex, result);
+  return result;
+}
+void SwapChain::recordPresentResult(std::uint32_t imageIndex, vk::Result result) const {
+  auto &record = presentation_.at(imageIndex);
+  presentationDirty_ = true;
+  switch (classifyPresentResult(result)) {
+  case PresentEnqueueState::Enqueued:
+    record.pending = bool(*record.fence); ++presentationStatistics_.queued; break;
+  case PresentEnqueueState::Rejected: break; // OOM leaves the unsignaled fence unsubmitted.
+  case PresentEnqueueState::DeviceLost: deviceLost_ = true; break;
+  case PresentEnqueueState::Unknown: uncertainPresent_ = true; break;
+  }
+}
+void SwapChain::collectPresentationCompletions() const {
+  if (deviceLost_) return;
+  try {
+  for (auto &record : presentation_) {
+    if (record.pending && record.fence.getStatus() == vk::Result::eSuccess) {
+      record.pending = false; ++presentationStatistics_.completed;
+    }
+  }
+  } catch (vk::DeviceLostError const &) { deviceLost_ = true; throw; }
+}
+void SwapChain::drainPresentations() const {
+  if (deviceLost_) return; // Lost device teardown must not wait an unsignalable fence.
+  try { device_.logicalDevice().waitIdle(); }
+  catch (vk::DeviceLostError const &) { deviceLost_ = true; throw; }
+  for (std::uint32_t i = 0; i < presentation_.size(); ++i) waitPresentation(i);
+  if (presentationDirty_ && (!device_.presentationSupport().fencesEnabled() || uncertainPresent_)) {
+    ++presentationStatistics_.legacyDrains;
+    std::cerr << "Presentation drain: legacy WaitIdle fallback; presentation resource release is unproven\n";
+  }
+  presentationDirty_ = false;
+}
+bool SwapChain::presentationReleaseProven() const {
+  return device_.presentationSupport().fencesEnabled() && !presentationDirty_ && !uncertainPresent_ && !deviceLost_ &&
+      std::none_of(presentation_.begin(), presentation_.end(), [](auto const &record) { return record.pending; });
+}
+SwapChain::PresentationStatistics SwapChain::presentationStatistics() const {
+  auto statistics = presentationStatistics_;
+  statistics.pendingFences = std::count_if(presentation_.begin(), presentation_.end(),
+                                         [](auto const &record) { return record.pending; });
+  return statistics;
 }

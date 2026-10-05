@@ -10,8 +10,8 @@ void validateDisplaySettings(DisplaySettings settings);
 // Only SDR sRGB-nonlinear 8-bit surfaces are currently supported.
 bool displayUsesHardwareSrgb(vk::Format format);
 
-// One native-resolution scene target and its display transform. Caller owns
-// render-pass boundaries, destination layout and GPU completion before release.
+// One native-resolution scene target and its display transform. The graph owns
+// all image states and rendering boundaries; caller ensures GPU completion.
 // Construct a replacement fully, then swap it only after old frame users
 // finish.
 class HdrOutput {
@@ -24,22 +24,15 @@ public:
   vk::Image sceneImage() const { return *scene_.image; }
   vk::ImageView sceneView() const { return *view_; }
   vk::Extent2D extent() const { return extent_; }
-  vk::ImageLayout sceneLayout() const { return layout_; }
-  void prepareScene(vk::CommandBuffer command);
-  // End scene rendering before this call. Leaves destination rendering OPEN
-  // for display-referred UI. Uses the constructor's display format and extent.
-  void drawDisplay(vk::CommandBuffer command, vk::ImageView destination,
-                   DisplaySettings settings);
+  // Called inside a graph rendering pass with its target format and extent.
+  // Scene image must already be in shader-read-only layout.
+  void drawDisplay(vk::CommandBuffer command, DisplaySettings settings);
 
 private:
-  void transition(vk::CommandBuffer command, vk::ImageLayout layout,
-                  vk::PipelineStageFlags2 srcStage, vk::AccessFlags2 srcAccess,
-                  vk::PipelineStageFlags2 dstStage, vk::AccessFlags2 dstAccess);
   vk::raii::Pipeline createPipeline(vk::Format displayFormat) const;
   Device const &device_;
   vk::Extent2D extent_;
   bool hardwareSrgb_ = true;
-  vk::ImageLayout layout_ = vk::ImageLayout::eUndefined;
   ResourceLedger::Lease accounting_;
   GpuImage scene_;
   vk::raii::ImageView view_ = nullptr;

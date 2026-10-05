@@ -9,6 +9,7 @@
 #include "vulkan_include.hpp"
 #include "resource_ledger.hpp"
 #include "gpu_allocator.hpp"
+#include "presentation.hpp"
 
 class Device {
 public:
@@ -22,7 +23,9 @@ public:
   Device(vk::raii::Instance const &instance,
          vk::raii::SurfaceKHR const &surface,
          std::vector<char const *> requiredDeviceExtensions,
-         std::string preferredGpu = {}, bool debugUtils = false);
+         std::string preferredGpu = {}, bool debugUtils = false,
+         PresentationInstanceSupport presentationInstance = {},
+         PresentationPolicy presentationPolicy = PresentationPolicy::Automatic);
 
   using BufferResources = GpuBuffer;
   BufferResources
@@ -64,8 +67,10 @@ public:
   }
   void beginLabel(vk::CommandBuffer command, char const *name) const;
   void endLabel(vk::CommandBuffer command) const;
+  PresentationSupport const &presentationSupport() const { return presentationSupport_; }
   bool memoryBudgetSupported() const;
   bool timelineSemaphoreSupported() const { return timelineSemaphoreSupported_; }
+  float maxSamplerAnisotropy() const { return maxSamplerAnisotropy_; }
   std::pair<std::uint64_t, std::uint64_t> memoryUsageBudget() const;
 
 private:
@@ -93,6 +98,10 @@ private:
   std::string preferredGpu_;
   bool debugUtils_ = false;
   bool timelineSemaphoreSupported_ = false;
+  float maxSamplerAnisotropy_ = 1.0f;
+  PresentationInstanceSupport presentationInstance_;
+  PresentationPolicy presentationPolicy_;
+  PresentationSupport presentationSupport_;
   PFN_vkSetDebugUtilsObjectNameEXT setName_ = nullptr;
   PFN_vkCmdBeginDebugUtilsLabelEXT beginLabel_ = nullptr;
   PFN_vkCmdEndDebugUtilsLabelEXT endLabel_ = nullptr;

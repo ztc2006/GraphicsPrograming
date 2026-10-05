@@ -1,6 +1,6 @@
 # M2-A：线性 HDR 与公共输出合同
 
-2026-10-03。实施前按用户要求使用 `real-time-rendering-advisor` 核对 RTR4 的透明合成、曝光与颜色基线、Vulkan 格式/混合语义、候选格式与可否证的测试。详见 [决定与依据](M2_A_HDR_Decision.md)。下一增量是 M2-B 最小单队列 Render Graph。
+2026-10-03。实施前按用户要求使用 `real-time-rendering-advisor` 核对 RTR4 的透明合成、曝光与颜色基线、Vulkan 格式/混合语义、候选格式与可否证的测试。详见 [决定与依据](M2_A_HDR_Decision.md)。当时下一增量为 M2-B；现已交付软件实现，当前图合同见 [M2-B](M2_B_Graph_Implementation.md)。
 
 ## 帧中的数据流
 
@@ -12,7 +12,7 @@ shadow depth → 主场景 RGBA16F + D32（sky/opaque/mask/blend/debug）
 
 `HdrOutput` 拥有原生分辨率 `R16G16B16A16_SFLOAT` 图像、view、独立 nearest sampler、描述符和输出 pipeline。`GpuImage` 管理 VMA resource/allocation 生命周期；格式必须支持 color attachment、blend、sampled 与诊断 transfer-src。图像每像素 8 字节；1920×1080 为 16,588,800 字节，即 15.82 MiB。
 
-场景和天空 shader 输出线性辐射值。保持现有 straight-alpha 约定、透明排序和深度策略，在浮点附件中执行 `srcAlpha / oneMinusSrcAlpha` 合成。颜色附件必须 store 供后续采样；当前主深度仍不保留，M2-B 再声明其用途与状态。一个在飞行的帧、单队列、原生分辨率保持当前约束。
+场景和天空 shader 输出线性辐射值。保持现有 straight-alpha 约定、透明排序和深度策略，在浮点附件中执行 `srcAlpha / oneMinusSrcAlpha` 合成。颜色附件必须 store 供后续采样；M2-A 当时的主深度不保留；M2-B 已增加 STORE/可采样/只读导出，当前行为以图合同为准。一个在飞行的帧、单队列、原生分辨率保持当前约束。
 
 `HdrOutput::prepareScene` 转为 color-attachment，`drawDisplay` 在结束场景 rendering 后转为 shader-read，随后开启目标 rendering 并留下给 UI。Renderer 负责 swapchain 状态、目标格式/extent、rendering 边界与资源释放前的 GPU 完成。图像状态跟随已记录帧；新图从 undefined 开始。
 

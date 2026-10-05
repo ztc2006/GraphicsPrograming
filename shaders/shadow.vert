@@ -20,11 +20,14 @@ layout(push_constant) uniform PushConstants {
 
 layout(location = 0) in vec3 inPosition;
 layout(location = 3) in vec2 inUv;
+layout(location = 9) in float inAlpha;
 
 layout(location = 0) out vec2 outUv;
+layout(location = 1) out float outAlpha;
 
 void main() {
   gl_Position = ubo.lightViewProj * pushConstants.transform *
                 vec4(inPosition, 1.0);
   outUv = inUv;
+  outAlpha = inAlpha;
 }

@@ -337,6 +337,28 @@ Material material(cgltf_material const &m, std::filesystem::path const &path) {
        result.occlusionSampler, result.occlusionTexCoord);
   bind(m.emissive_texture, result.emissivePath, result.emissiveBytes,
        result.emissiveSampler, result.emissiveTexCoord);
+  if (m.has_specular) {
+    if (m.unlit || m.has_pbr_specular_glossiness)
+      invalid("KHR_materials_specular cannot coexist with "
+              "unlit/specular-glossiness.");
+    result.specularFactor = m.specular.specular_factor;
+    std::copy_n(m.specular.specular_color_factor, 3,
+                &result.specularColorFactor.x);
+    if (!std::isfinite(result.specularFactor) || result.specularFactor < 0 ||
+        result.specularFactor > 1)
+      invalid(
+          "KHR_materials_specular specularFactor must be finite and in [0,1].");
+    for (unsigned c = 0; c < 3; ++c)
+      if (!std::isfinite(result.specularColorFactor[c]) ||
+          result.specularColorFactor[c] < 0)
+        invalid("KHR_materials_specular specularColorFactor must be finite and "
+                "nonnegative.");
+    bind(m.specular.specular_texture, result.specularPath, result.specularBytes,
+         result.specularSampler, result.specularTexCoord);
+    bind(m.specular.specular_color_texture, result.specularColorPath,
+         result.specularColorBytes, result.specularColorSampler,
+         result.specularColorTexCoord);
+  }
   return result;
 }
 Aabb emptyBounds() {
@@ -430,6 +452,8 @@ Mesh primitive(cgltf_primitive const &p) {
   auto normalUv = uv(m.normal_texture);
   auto packedUv = uv(m.pbr_metallic_roughness.metallic_roughness_texture);
   auto aoUv = uv(m.occlusion_texture), emissiveUv = uv(m.emissive_texture);
+  auto specularUv = uv(m.specular.specular_texture);
+  auto specularColorUv = uv(m.specular.specular_color_texture);
   Mesh mesh;
   mesh.localBounds = emptyBounds();
   mesh.vertices.resize(position->count);
@@ -445,9 +469,10 @@ Mesh primitive(cgltf_primitive const &p) {
     if (color) {
       auto const c = cgltf_num_components(color->type);
       v.color = {colors[c * i], colors[c * i + 1], colors[c * i + 2]};
-      if (c == 4 && colors[c * i + 3] != 1.0f)
-        invalid("vertex color alpha is not supported by the current vertex "
-                "format.");
+      v.alpha = c == 4 ? colors[c * i + 3] : 1.0f;
+      for (std::size_t channel = 0; channel < c; ++channel)
+        if (colors[c * i + channel] < 0 || colors[c * i + channel] > 1)
+          invalid("vertex color components must be in [0,1].");
     }
     if (tangent) {
       v.tangent = {tangents[4 * i], tangents[4 * i + 1], tangents[4 * i + 2],
@@ -461,6 +486,8 @@ Mesh primitive(cgltf_primitive const &p) {
     v.metallicRoughnessUv = {packedUv[2 * i], packedUv[2 * i + 1]};
     v.occlusionUv = {aoUv[2 * i], aoUv[2 * i + 1]};
     v.emissiveUv = {emissiveUv[2 * i], emissiveUv[2 * i + 1]};
+    v.specularUv = {specularUv[2 * i], specularUv[2 * i + 1]};
+    v.specularColorUv = {specularColorUv[2 * i], specularColorUv[2 * i + 1]};
     includePoint(mesh.localBounds, v.position);
   }
   if (p.indices)
@@ -509,7 +536,8 @@ ImportedScene load(std::filesystem::path const &path,
     invalid("file content does not match the requested glTF/GLB format.");
   auto supported = [](std::string_view extension) {
     return extension == "KHR_texture_transform" ||
-           extension == "KHR_mesh_quantization";
+           extension == "KHR_mesh_quantization" ||
+           extension == "KHR_materials_specular";
   };
   ImportedScene result;
   for (std::size_t i = 0; i < data->extensions_required_count; ++i)

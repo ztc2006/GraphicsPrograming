@@ -24,6 +24,9 @@ struct Vertex {
   glm::vec2 metallicRoughnessUv{0.0f};
   glm::vec2 occlusionUv{0.0f};
   glm::vec2 emissiveUv{0.0f};
+  float alpha = 1.0f;
+  glm::vec2 specularUv{0.0f};
+  glm::vec2 specularColorUv{0.0f};
 
   static vk::VertexInputBindingDescription bindingDescription() {
     return vk::VertexInputBindingDescription{
@@ -33,7 +36,7 @@ struct Vertex {
     };
   }
 
-  static std::array<vk::VertexInputAttributeDescription, 9>
+  static std::array<vk::VertexInputAttributeDescription, 12>
   attributeDescriptions() {
     return {
         vk::VertexInputAttributeDescription{
@@ -86,9 +89,26 @@ struct Vertex {
                                             .format = vk::Format::eR32G32Sfloat,
                                             .offset =
                                                 offsetof(Vertex, emissiveUv)},
+        vk::VertexInputAttributeDescription{.location = 9,
+                                            .binding = 0,
+                                            .format = vk::Format::eR32Sfloat,
+                                            .offset = offsetof(Vertex, alpha)},
+        vk::VertexInputAttributeDescription{.location = 10,
+                                            .binding = 0,
+                                            .format = vk::Format::eR32G32Sfloat,
+                                            .offset =
+                                                offsetof(Vertex, specularUv)},
+        vk::VertexInputAttributeDescription{
+            .location = 11,
+            .binding = 0,
+            .format = vk::Format::eR32G32Sfloat,
+            .offset = offsetof(Vertex, specularColorUv)},
     };
   }
 };
+static_assert(sizeof(Vertex) == 112 && offsetof(Vertex, alpha) == 92 &&
+              offsetof(Vertex, specularUv) == 96 &&
+              offsetof(Vertex, specularColorUv) == 104);
 struct Mesh {
   std::vector<Vertex> vertices;
   std::vector<std::uint32_t> indices;

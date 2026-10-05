@@ -1,5 +1,6 @@
 #pragma once
 #include "device.hpp"
+#include "texture_mip.hpp"
 #include <atomic>
 #include <memory>
 #include <span>
@@ -25,7 +26,8 @@ public:
   void copyBuffer(std::span<std::byte const> data, vk::Buffer destination,
                   vk::BufferUsageFlags finalUsage);
   void copyImage(std::span<std::byte const> data, vk::Image destination,
-                 std::uint32_t width, std::uint32_t height);
+                 std::span<TextureMipLevel const> levels,
+                 std::size_t texelBytes, std::uint32_t arrayLayers = 1);
   void submit();
   bool ready();
   bool submitted() const { return submitted_; }

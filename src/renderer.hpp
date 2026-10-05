@@ -6,6 +6,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <vector>
 
 #include "asset_ids.hpp"
@@ -16,6 +17,7 @@
 #include "material_gpu_store.hpp"
 #include "measurement.hpp"
 #include "mesh.hpp"
+#include "render_graph.hpp"
 #include "scene.hpp"
 #include "scene_object.hpp"
 #include "swap_chain.hpp"
@@ -23,9 +25,12 @@
 
 class Renderer {
   friend struct RendererHdrTestAccess;
+  friend struct RendererFrameTestAccess;
+  const unsigned framesInFlight_;
   struct MeshGpuResources {
     Device::BufferResources vertex, index;
     std::uint32_t indexCount = 0;
+    bool unitVertexAlpha = true;
   };
 
 public:
@@ -76,17 +81,42 @@ public:
     eSwapChainSuboptimal,
   };
 
-  explicit Renderer(Device const &device);
+  explicit Renderer(Device const &device, unsigned framesInFlight = 1);
+  unsigned framesInFlight() const { return framesInFlight_; }
   Renderer(Renderer const &) = delete;
   Renderer &operator=(Renderer const &) = delete;
   Renderer(Renderer &&) = delete;
   Renderer &operator=(Renderer &&) = delete;
 
+  struct DrawItem {
+    std::size_t objectIndex = 0;
+    MeshId meshId = 0;
+    MaterialId materialId = 0;
+    glm::mat4 modelMatrix{1.0f};
+    Aabb worldBounds{};
+    float sortDepthSq = 0.0f;
+  };
+  struct SceneDrawList {
+    std::span<DrawItem const> opaque, mask, transparent;
+    // Complete sets, including objects outside the camera frustum.
+    std::span<DrawItem const> allOpaque, allMask;
+    bool sky = true, bounds = false;
+  };
+  struct DrawStatistics {
+    std::uint32_t shadow = 0, main = 0, debug = 0;
+  };
+  FrameResult renderFrame(SceneDrawList const &scene, glm::mat4 const &viewProj,
+                          glm::vec3 const &camera,
+                          LightingSettings const &lighting, bool shadows);
+  DrawStatistics const &drawStatistics() const { return drawStatistics_; }
+  std::string const &renderGraphDump() const { return lastGraphDump_; }
+
   PreparedScene prepareScene(AssetLibrary const &assets);
   // Main thread, outside frame recording. First call submits upload and returns
-  // false; later calls poll and commit when ready. false preserves the candidate.
-  // retireSceneUi runs after old frame users complete, while old assets exist;
-  // it must not throw or reenter Renderer. Commit itself never waits for frames.
+  // false; later calls poll and commit when ready. false preserves the
+  // candidate. retireSceneUi runs after old frame users complete, while old
+  // assets exist; it must not throw or reenter Renderer. Commit itself never
+  // waits for frames.
   bool commitScene(PreparedScene &candidate,
                    std::function<void()> retireSceneUi = {});
   // Explicit blocking convenience only for cold startup and offline tests.
@@ -105,6 +135,7 @@ public:
   }
   void setRasterizerDebugSettings(RasterizerDebugSettings settings);
 
+  // Compatibility recording facade: collects items, never schedules GPU passes.
   FrameResult beginFrame(glm::mat4 const &viewProjMatrix,
                          glm::vec3 const &cameraPosition,
                          LightingSettings const &lighting,
@@ -122,7 +153,9 @@ public:
                         glm::vec3 const &cameraPosition,
                         LightingSettings const &lighting);
   void recreateForSwapChain(SwapChain const &swapChain);
-  void beginMainPass();
+  // Delivered once per completed submission, outside frame recording. The
+  // callback must not throw or reenter Renderer; UI keeps the highest frame ID.
+  void setGpuTimingCallback(std::function<void(GpuTimings const &)> callback);
   GpuTimings const &gpuTimings() const { return gpuTimings_; }
   bool gpuTimingSupported() const { return timestampBits_ != 0; }
   std::uint64_t submittedFrameId() const { return submittedFrameId_; }
@@ -162,14 +195,12 @@ private:
         storage = std::move(other.storage);
         accounting = std::move(other.accounting);
         imageView = std::move(other.imageView);
-        layout = other.layout;
       }
       return *this;
     }
     ResourceLedger::Lease accounting;
     GpuImage storage;
     vk::raii::ImageView imageView = nullptr;
-    vk::ImageLayout layout = vk::ImageLayout::eUndefined;
   };
 
   struct ShadowResources {
@@ -188,7 +219,6 @@ private:
         imageView = std::move(other.imageView);
         sampler = std::move(other.sampler);
         debugSampler = std::move(other.debugSampler);
-        layout = other.layout;
       }
       return *this;
     }
@@ -197,7 +227,6 @@ private:
     vk::raii::ImageView imageView = nullptr;
     vk::raii::Sampler sampler = nullptr;
     vk::raii::Sampler debugSampler = nullptr;
-    vk::ImageLayout layout = vk::ImageLayout::eUndefined;
   };
 
   enum class ActivePass {
@@ -206,12 +235,13 @@ private:
     eMain,
   };
 
-  static constexpr std::uint32_t kFramesInFlight = 1;
   static constexpr std::uint32_t kShadowMapSize = 2048;
 
   static std::vector<char> readBinaryFile(char const *path);
 
+  void onFrameSubmitted(FrameContext &frame);
   void collectFrameTimings(FrameContext &frame);
+  std::function<void(GpuTimings const &)> gpuTimingCallback_;
   void timestamp(vk::raii::CommandBuffer const &command, std::uint32_t query);
   unsigned timestampBits_ = 0;
   double timestampPeriod_ = 0;
@@ -220,8 +250,9 @@ private:
   std::uint64_t submittedFrameId_ = 0;
   void createPersistentResources();
   void createFrameResources();
-  MeshGpuResources createGeometryResources(Mesh const &mesh, UploadBatch &uploads,
-      ResourceLedger::Scope scope = {});
+  MeshGpuResources createGeometryResources(Mesh const &mesh,
+                                           UploadBatch &uploads,
+                                           ResourceLedger::Scope scope = {});
   void createCommandBuffers();
   void createCommandPool();
   void updateFrameUniformBuffer(FrameContext &frame,
@@ -246,26 +277,39 @@ private:
       SwapChain const &swapChain,
       vk::raii::PipelineLayout const &pipelineLayout) const;
 
-  void endCommandBuffer(vk::raii::CommandBuffer const &commandBuffer,
-                        std::uint32_t imageIndex);
+  struct FrameGraph {
+    RenderGraph::Plan plan;
+    RenderGraph::ImageId shadow{}, depth{}, hdr{}, output{};
+    std::optional<RenderGraph::PassId> shadowPass, uiPass;
+    RenderGraph::PassId mainPass{}, outputPass{};
+  };
+  struct ImageStates {
+    RenderGraph::State shadow, depth, hdr;
+    std::vector<RenderGraph::State> output;
+  } imageStates_;
+  FrameGraph buildFrameGraph(std::uint32_t imageIndex, bool shadows) const;
+  FrameResult finishFrame(SceneDrawList const &scene);
+  void recordGraph(SceneDrawList const &scene);
+  void recordObject(MeshId meshId, MaterialId materialId,
+                    glm::mat4 const &modelMatrix);
+  void recordEnvironment();
+  void recordAabb(Aabb const &bounds, glm::vec4 const &color);
+  void validateDrawItem(DrawItem const &item, bool caster) const;
+  RenderGraph::State const &hdrState() const;
+  std::optional<FrameGraph> activeGraph_;
+  std::string lastGraphDump_;
+  DrawStatistics drawStatistics_;
+  bool requestedShadows_ = false, queuedSky_ = false;
+  std::vector<DrawItem> queuedObjects_, queuedCasters_;
+  struct DebugBox {
+    Aabb bounds;
+    glm::vec4 color;
+  };
+  std::vector<DebugBox> queuedBoxes_;
 
   static constexpr vk::Format kDepthFormat = vk::Format::eD32Sfloat;
 
   DepthResources createDepthResources(SwapChain const &swapChain) const;
-  void transitionSwapChainImage(vk::raii::CommandBuffer const &commandBuffer,
-                                std::uint32_t imageIndex,
-                                vk::ImageLayout newLayout,
-                                vk::PipelineStageFlags2 srcStageMask,
-                                vk::AccessFlags2 srcAccessMask,
-                                vk::PipelineStageFlags2 dstStageMask,
-                                vk::AccessFlags2 dstAccessMask);
-
-  void transitionDepthImage(vk::raii::CommandBuffer const &commanderBuffer,
-                            vk::ImageLayout newLayout,
-                            vk::PipelineStageFlags2 srcStageMask,
-                            vk::AccessFlags2 srcAccessMask,
-                            vk::PipelineStageFlags2 dstStageMask,
-                            vk::AccessFlags2 dstAccessMask);
 
   void createFrameDescriptorSetLayout();
   void createFrameDescriptorPool();
@@ -275,17 +319,6 @@ private:
   vk::raii::Pipeline
   createShadowPipeline(vk::raii::PipelineLayout const &pipelineLayout,
                        vk::CullModeFlagBits cullMode) const;
-  void beginShadowPass(vk::raii::CommandBuffer const &commandBuffer,
-                       FrameContext const &frame);
-  void beginMainPass(vk::raii::CommandBuffer const &commandBuffer,
-                     FrameContext const &frame, std::uint32_t imageIndex,
-                     bool shadowPassEnabled);
-  void transitionShadowImage(vk::raii::CommandBuffer const &commandBuffer,
-                             vk::ImageLayout newLayout,
-                             vk::PipelineStageFlags2 srcStage,
-                             vk::AccessFlags2 srcAccess,
-                             vk::PipelineStageFlags2 dstStage,
-                             vk::AccessFlags2 dstAccess);
 
 private:
   DepthResources depthResources_{};
@@ -294,6 +327,7 @@ private:
 
   ShadowResources shadowResources_{};
   vk::raii::Pipeline shadowPipeline_ = nullptr;
+  vk::raii::Pipeline mirroredShadowPipeline_ = nullptr;
   vk::raii::Pipeline doubleSidedShadowPipeline_ = nullptr;
   MeshGpuResources debugAabbLineResources_{};
   ActivePass activePass_ = ActivePass::eNone;
@@ -322,15 +356,17 @@ private:
 
   vk::raii::PipelineLayout pipelineLayout_ = nullptr;
   vk::raii::Pipeline graphicsPipeline_ = nullptr;
+  vk::raii::Pipeline mirroredGraphicsPipeline_ = nullptr;
   vk::raii::Pipeline doubleSidedGraphicsPipeline_ = nullptr;
   vk::raii::Pipeline transparentPipeline_ = nullptr;
+  vk::raii::Pipeline mirroredTransparentPipeline_ = nullptr;
   vk::raii::Pipeline doubleSidedTransparentPipeline_ = nullptr;
   vk::raii::Pipeline debugLinePipeline_ = nullptr;
   vk::raii::Pipeline environmentPipeline_ = nullptr;
   TextureResources environmentTexture_{};
+  TextureResources environmentPrefilter_{};
+  TextureResources environmentBrdfLut_{};
   EnvironmentSh environmentSh_{};
-  std::vector<vk::raii::Semaphore> renderFinishedSemaphores_;
-  std::vector<vk::ImageLayout> swapChainImageLayouts_;
   std::vector<vk::Fence> imagesInFlight_;
   PreparedScene sceneAssets_;
   std::vector<PreparedScene> pendingSceneUploads_;

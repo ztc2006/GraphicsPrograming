@@ -1,0 +1,236 @@
+{
+  "asset": {
+    "version": "2.0"
+  },
+  "scene": 0,
+  "scenes": [
+    {
+      "nodes": [
+        0,
+        2
+      ]
+    }
+  ],
+  "nodes": [
+    {
+      "translation": [
+        2,
+        3,
+        4
+      ],
+      "rotation": [
+        0,
+        0,
+        0.29552020666133955,
+        0.955336489125606
+      ],
+      "scale": [
+        2,
+        1,
+        0.5
+      ],
+      "children": [
+        1
+      ]
+    },
+    {
+      "mesh": 0,
+      "rotation": [
+        0.19866933079506122,
+        0,
+        0,
+        0.9800665778412416
+      ]
+    },
+    {
+      "mesh": 0,
+      "matrix": [
+        1,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        5,
+        6,
+        7,
+        1
+      ]
+    }
+  ],
+  "meshes": [
+    {
+      "primitives": [
+        {
+          "attributes": {
+            "POSITION": 0,
+            "NORMAL": 1,
+            "TEXCOORD_0": 2,
+            "TEXCOORD_5": 3
+          },
+          "material": 0
+        }
+      ]
+    }
+  ],
+  "materials": [
+    {
+      "pbrMetallicRoughness": {
+        "baseColorTexture": {
+          "index": 0,
+          "texCoord": 0,
+          "extensions": {
+            "KHR_texture_transform": {
+              "texCoord": 5,
+              "offset": [
+                0.25,
+                -0.25
+              ],
+              "scale": [
+                2,
+                3
+              ],
+              "rotation": 1.5707963267948966
+            }
+          }
+        },
+        "metallicRoughnessTexture": {
+          "index": 1,
+          "texCoord": 5
+        },
+        "metallicFactor": 0
+      },
+      "normalTexture": {
+        "index": 0,
+        "texCoord": 5
+      },
+      "extensions": {
+        "KHR_materials_specular": {
+          "specularFactor": 0.35,
+          "specularColorFactor": [
+            2,
+            0.5,
+            30
+          ],
+          "specularTexture": {
+            "index": 0,
+            "texCoord": 7
+          },
+          "specularColorTexture": {
+            "index": 1,
+            "texCoord": 0,
+            "extensions": {
+              "KHR_texture_transform": {
+                "texCoord": 5,
+                "offset": [
+                  0.25,
+                  -0.25
+                ],
+                "scale": [
+                  2,
+                  3
+                ],
+                "rotation": 1.5707963267948966
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "textures": [
+    {
+      "source": 0,
+      "sampler": 0
+    },
+    {
+      "source": 0,
+      "sampler": 1
+    }
+  ],
+  "images": [
+    {
+      "uri": "../../../texture/smile.png"
+    }
+  ],
+  "buffers": [
+    {
+      "byteLength": 120,
+      "uri": "data:application/octet-stream;base64,AAAAAAAAAAAAAAAAAACAPwAAAAAAAAAAAAAAAAAAgD8AAAAAAAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAzczMPc3MTD7NzEw/zcxMPs3MzD1mZmY/"
+    }
+  ],
+  "bufferViews": [
+    {
+      "buffer": 0,
+      "byteOffset": 0,
+      "byteLength": 36
+    },
+    {
+      "buffer": 0,
+      "byteOffset": 36,
+      "byteLength": 36
+    },
+    {
+      "buffer": 0,
+      "byteOffset": 72,
+      "byteLength": 24
+    },
+    {
+      "buffer": 0,
+      "byteOffset": 96,
+      "byteLength": 24
+    }
+  ],
+  "accessors": [
+    {
+      "bufferView": 0,
+      "componentType": 5126,
+      "count": 3,
+      "type": "VEC3"
+    },
+    {
+      "bufferView": 1,
+      "componentType": 5126,
+      "count": 3,
+      "type": "VEC3"
+    },
+    {
+      "bufferView": 2,
+      "componentType": 5126,
+      "count": 3,
+      "type": "VEC2"
+    },
+    {
+      "bufferView": 3,
+      "componentType": 5126,
+      "count": 3,
+      "type": "VEC2"
+    }
+  ],
+  "samplers": [
+    {
+      "magFilter": 9728,
+      "minFilter": 9987,
+      "wrapS": 33071,
+      "wrapT": 33648
+    },
+    {
+      "magFilter": 9729,
+      "minFilter": 9728
+    }
+  ],
+  "extensionsUsed": [
+    "KHR_texture_transform",
+    "KHR_materials_specular"
+  ],
+  "extensionsRequired": [
+    "KHR_texture_transform",
+    "KHR_materials_specular"
+  ]
+}
