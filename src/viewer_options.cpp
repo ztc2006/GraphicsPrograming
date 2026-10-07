@@ -48,6 +48,12 @@ ViewerOptions parseViewerOptions(std::span<std::string_view const> args) {
       o.durationSeconds = number(value());
     else if (!positionalOnly && arg == "--camera-path")
       o.cameraPath = value();
+    else if (!positionalOnly && arg == "--light-culling")
+      o.lightCulling = value();
+    else if (!positionalOnly && arg == "--lighting-preset")
+      o.lightingPreset = value();
+    else if (!positionalOnly && arg == "--taa-history")
+      o.taaHistory = value();
     else if (!positionalOnly && arg == "--gpu")
       o.gpu = value();
     else if (!positionalOnly && arg == "--present")
@@ -59,7 +65,9 @@ ViewerOptions parseViewerOptions(std::span<std::string_view const> args) {
       if (count != 1 && count != 2)
         throw std::invalid_argument("Frames in flight must be 1 or 2");
       o.framesInFlight = static_cast<unsigned>(count);
-    } else if (!positionalOnly && arg == "--no-ui")
+    } else if (!positionalOnly && arg == "--no-taa")
+      o.taa = false;
+    else if (!positionalOnly && arg == "--no-ui")
       o.ui = false;
     else if (!positionalOnly && arg == "--validation")
       o.validation = true;
@@ -79,17 +87,27 @@ ViewerOptions parseViewerOptions(std::span<std::string_view const> args) {
       o.scene = std::filesystem::absolute(arg);
     }
   }
+  if (o.taaHistory != "bilinear" && o.taaHistory != "catmull-rom")
+    throw std::invalid_argument("TAA history filter: bilinear or catmull-rom");
   if (o.warmupSeconds < 0 || o.durationSeconds <= 0)
     throw std::invalid_argument(
         "Warmup must be nonnegative and duration positive");
+  if (o.lightingPreset != "auto" && o.lightingPreset != "asset" &&
+      o.lightingPreset != "kitchen")
+    throw std::invalid_argument(
+        "Lighting preset must be auto, asset or kitchen");
+  if (o.lightCulling != "full" && o.lightCulling != "clustered")
+    throw std::invalid_argument("Light culling must be full or clustered");
   if (o.cameraPath != "static" && o.cameraPath != "orbit")
     throw std::invalid_argument("Camera path: static or orbit");
   if (o.present != "auto" && o.present != "fifo" && o.present != "mailbox" &&
       o.present != "immediate")
     throw std::invalid_argument(
         "Present mode: auto, fifo, mailbox or immediate");
-  if (o.presentSync != "auto" && o.presentSync != "fence" && o.presentSync != "legacy")
-    throw std::invalid_argument("Present synchronization: auto, fence or legacy");
+  if (o.presentSync != "auto" && o.presentSync != "fence" &&
+      o.presentSync != "legacy")
+    throw std::invalid_argument(
+        "Present synchronization: auto, fence or legacy");
   if (o.benchmarkDirectory && !sizeSet) {
     o.width = 1920;
     o.height = 1080;
@@ -101,11 +119,16 @@ ViewerOptions parseViewerOptions(std::span<std::string_view const> args) {
 
 std::string_view viewerUsage() {
   return "Usage: vulkan [options] [scene.gltf|scene.glb|scene.obj]\n"
+         "  --taa-history bilinear|catmull-rom (default catmull-rom)\n"
+         "  --no-taa           Disable temporal resolve and jitter\n"
          "  --benchmark DIR    Save frames.csv and summary.json; then exit\n"
          "  --warmup SECONDS   Default 30; excluded from measurement\n"
          "  --duration SECONDS Default 120\n"
          "  --size WIDTHxHEIGHT (benchmark default: 1920x1080)\n"
          "  --camera-path static|orbit (default static)\n"
+         "  --light-culling full|clustered (default clustered)\n"
+         "  --lighting-preset auto|asset|kitchen (auto: kitchen preview for "
+         "known fixture)\n"
          "  --present auto|fifo|mailbox|immediate\n"
          "  --present-sync auto|fence|legacy (default auto)\n"
          "  --frames-in-flight 1|2 (default 1; shared frame targets)\n"

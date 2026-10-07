@@ -19,7 +19,9 @@ with tempfile.TemporaryDirectory(prefix='vulkan-benchmark-smoke-') as temporary:
     assert summary['schema'] == 4
     assert summary['frames_in_flight'] == int(frames)
     assert summary['swapchain_image_count'] >= 2
-    assert summary['frame_target_policy'] == 'shared_hdr_depth_shadow'
+    assert summary['frame_target_policy'] == 'shared_hdr_depth_motion_shadow'
+    assert summary['motion_vectors_enabled'] and summary['taa_enabled']
+    assert summary['temporal_jitter_enabled']
     assert summary['completed'] and len(rows) > 0
     assert summary['pending_present_fences'] == 0
     assert summary['present_queued_count'] == len(rows)

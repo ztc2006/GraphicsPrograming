@@ -405,6 +405,51 @@ void exerciseTextureMips(Device const &device) {
               "NPOT GPU copy dropped/misaligned mip texels");
     }
     Probe probe(device);
+    // Independent normal-alpha oracle: black/white RGB decode to opposed
+    // unit vectors. LOD1 is exactly cancelling, with +Z fallback and loss=1.
+    close(probe.sample(normal, {.25f, .25f, 0})[3], 0,
+          "Normal LOD0 variance must be zero");
+    close(probe.sample(normal, {.25f, .25f, 1})[3], 1,
+          "Normal opposing mean length loss");
+    {
+      UploadBatch batch(device);
+      auto normalTri =
+          cache.encoded(bytes, "normal trilinear", TextureColorSpace::Linear,
+                        trilinear, batch, TextureMipPolicy::Normal);
+      batch.finish();
+      require(normalTri.image() == normal.image(),
+              "Normal sampler duplicated variance image");
+      close(probe.sample(normalTri, {.25f, .25f, .5f})[3], .5f,
+            "Normal loss trilinear interpolation");
+      std::array<unsigned char, 192> checker{}, stripes{};
+      for (unsigned y = 0; y < 8; ++y)
+        for (unsigned x = 0; x < 8; ++x) {
+          auto i = (y * 8 + x) * 3;
+          checker[i] = x % 2 ? 51 : 204;
+          stripes[i] = x < 4 ? 51 : 204;
+          checker[i + 1] = stripes[i + 1] = 128;
+          checker[i + 2] = stripes[i + 2] = 230;
+        }
+      auto a = ppm(8, 8, checker), b = ppm(8, 8, stripes);
+      UploadBatch frequencyUpload(device);
+      auto high = cache.encoded(std::as_bytes(std::span(a)), "high frequency",
+                                TextureColorSpace::Linear, nearest,
+                                frequencyUpload, TextureMipPolicy::Normal);
+      auto low = cache.encoded(std::as_bytes(std::span(b)), "low frequency",
+                               TextureColorSpace::Linear, nearest,
+                               frequencyUpload, TextureMipPolicy::Normal);
+      frequencyUpload.finish();
+      double nx = 153. / 255, ny = 1. / 255, nz = 205. / 255;
+      double length =
+          std::sqrt((ny * ny + nz * nz) / (nx * nx + ny * ny + nz * nz));
+      float loss = float(std::round((1 - length) * 255) / 255);
+      for (unsigned level = 1; level <= 3; ++level) {
+        close(probe.sample(high, {.0625f, .0625f, float(level)})[3], loss,
+              "High-frequency normal variance mip");
+        close(probe.sample(low, {.0625f, .0625f, float(level)})[3],
+              level == 3 ? loss : 0, "Normal frequency footprint selection");
+      }
+    }
     close(probe.sample(linear, {.25f, .25f, 8})[0], 128.f / 255,
           "LOD/view still clamped to base");
     close(probe.sample(color, {.25f, .25f, 8})[0], .5f,
@@ -528,7 +573,8 @@ void exerciseTextureMips(Device const &device) {
              "coverage, source view shares storage, no extra copies\n";
     }
     std::cout << "PASS GPU typed mips: full/NPOT chain readback, independent "
-                 "image policies/samplers, explicit LOD/trilinear/non-mip "
+                 "image policies/samplers, normal variance/frequency/cache, "
+                 "explicit LOD/trilinear/non-mip "
                  "min-mag/wrap, anisotropy limit="
               << aniso.maxAnisotropy() << '\n';
   }

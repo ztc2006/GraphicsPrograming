@@ -146,7 +146,8 @@ bool Device::isDeviceSuitable(
       features.template get<vk::PhysicalDeviceVulkan13Features>()
           .dynamicRendering &&
       features.template get<vk::PhysicalDeviceVulkan13Features>()
-          .synchronization2;
+          .synchronization2 &&
+      features.template get<vk::PhysicalDeviceFeatures2>().features.imageCubeArray;
 
   return supportsRequiredFeatures;
 }
@@ -190,6 +191,8 @@ void Device::createLogicalDevice() {
   auto supported = physicalDevice_.getFeatures2<vk::PhysicalDeviceFeatures2,
       vk::PhysicalDeviceVulkan12Features>();
   timelineSemaphoreSupported_ = supported.get<vk::PhysicalDeviceVulkan12Features>().timelineSemaphore;
+  if (!supported.get<vk::PhysicalDeviceFeatures2>().features.imageCubeArray)
+    throw std::runtime_error("Local environment probes require imageCubeArray");
   bool anisotropy =
       supported.get<vk::PhysicalDeviceFeatures2>().features.samplerAnisotropy;
   maxSamplerAnisotropy_ =
@@ -225,6 +228,8 @@ void Device::createLogicalDevice() {
     featureChain.unlink<vk::PhysicalDeviceSwapchainMaintenance1FeaturesKHR>();
   featureChain.get<vk::PhysicalDeviceFeatures2>().features.samplerAnisotropy =
       anisotropy;
+
+  featureChain.get<vk::PhysicalDeviceFeatures2>().features.imageCubeArray = true;
 
   float queuePriority = 1.0f;
   std::set<std::uint32_t> uniqueQueueFamilies = {

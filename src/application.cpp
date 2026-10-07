@@ -1,6 +1,7 @@
 #include "pch.hpp"
 
 #include "application.hpp"
+#include "lighting_presets.hpp"
 #include "build_info.hpp"
 
 #include <algorithm>
@@ -273,6 +274,7 @@ struct Application::SceneCandidate {
   SceneEcs ecs;
   Camera camera;
   std::vector<Camera> cameras;
+  std::vector<PunctualLight> lights;
   glm::vec3 center{0};
   float radius = 1;
   std::filesystem::path path;
@@ -364,6 +366,8 @@ void Application::initVulkan() {
                                            options_.present);
   renderer_ = std::make_unique<Renderer>(*device_, options_.framesInFlight);
   renderer_->recreateForSwapChain(*swapChain_);
+  renderer_->setTaaEnabled(options_.taa);
+  renderer_->setTaaHistoryFilter(options_.taaHistory=="bilinear"?TaaHistoryFilter::Bilinear:TaaHistoryFilter::CatmullRom);
   auto loadStart = std::chrono::steady_clock::now();
   if (startupScenePath_) {
     loadScene(*startupScenePath_);
@@ -409,6 +413,7 @@ void Application::initVulkan() {
             std::to_string(VK_VERSION_PATCH(props.apiVersion));
     m.scene = loadedScenePath_.string();
     m.cameraPath = options_.cameraPath;
+    m.lightCulling = scene_.lighting.clusteredLights ? "clustered" : "full";
     m.presentMode = vk::to_string(swapChain_->presentMode());
     m.framesInFlight = renderer_->framesInFlight();
     m.swapchainImageCount = swapChain_->images().size();
@@ -453,8 +458,20 @@ void Application::initVulkan() {
 }
 
 void Application::mainLoop() {
+  if (probeCaptureRequested_) {
+    probeCaptureRequested_=false;
+    auto queues=buildRenderQueues(sceneEcs_,assets_,scene_.cameras.front().position);
+    renderer_->captureLocalProbe({.transparent=queues.transparent,.allOpaque=queues.opaque,
+      .allMask=queues.mask,.sky=true},scene_.lighting);
+    std::clog << "Startup room probe captured (excluded from benchmark)\n";
+  }
+  benchmarkMetadata_.lightingPreset=activeLightingPreset_;
+  benchmarkMetadata_.punctualLightCount=std::count_if(scene_.lighting.punctualLights.begin(),scene_.lighting.punctualLights.end(),[](auto const &l){return l.enabled;});
+  benchmarkMetadata_.spotShadowCount=renderer_->spotShadowsAssigned();
+  benchmarkMetadata_.localProbeValid=scene_.lighting.localProbe.enabled && renderer_->localProbeValid();
   benchmarkStart_ = lastFrameTime_ = std::chrono::steady_clock::now();
   double lastMemorySample = -1;
+  auto temporalCameraIndex = scene_.activeCameraIndex;
   while (!glfwWindowShouldClose(window_)) {
     auto const now = std::chrono::steady_clock::now();
     float const deltaSeconds =
@@ -493,6 +510,10 @@ void Application::mainLoop() {
     float aspect = static_cast<float>(swapChain_->extent().width) /
                    static_cast<float>(swapChain_->extent().height);
 
+    if (temporalCameraIndex != scene_.activeCameraIndex) {
+      renderer_->invalidateTemporalHistory();
+      temporalCameraIndex = scene_.activeCameraIndex;
+    }
     auto &camera = scene_.cameras[scene_.activeCameraIndex];
     if (options_.benchmarkDirectory) {
       camera = benchmarkCamera_;
@@ -524,7 +545,7 @@ void Application::mainLoop() {
     };
     sortTransparentQueue(visibleRenderQueues.transparent);
     if (frustumCullingEnabled_) {
-      Frustum const cameraFrustum = extractFrustum(viewProjMatrix);
+      Frustum const cameraFrustum = extractFrustum(renderer_->temporalJitterEnabled() ? temporalCullingViewProj(viewProjMatrix, swapChain_->extent().width, swapChain_->extent().height) : viewProjMatrix);
       visibleRenderQueues =
           filterVisibleRenderQueues(renderQueues, cameraFrustum);
     }
@@ -543,8 +564,19 @@ void Application::mainLoop() {
     debugDrawCalls_ = 0;
 
     LightingSettings frameLighting = scene_.lighting;
-    bool const shadowPassEnabled = shadowDebugEnabled_;
+    bool const shadowPassEnabled =
+        shadowDebugEnabled_ && (frameLighting.sunEnabled ||
+          std::ranges::any_of(frameLighting.punctualLights, [](auto const &l) { return l.enabled && l.castsShadow; }));
 
+    if (probeCaptureRequested_) {
+      probeCaptureRequested_ = false;
+      try {
+        renderer_->captureLocalProbe({.transparent=renderQueues.transparent, .allOpaque=renderQueues.opaque,
+          .allMask=renderQueues.mask, .sky=true}, frameLighting);
+        probeCaptureError_.clear();
+        std::clog << "Local probe captured for " << loadedScenePath_.string() << '\n';
+      } catch (std::exception const &error) { probeCaptureError_=error.what(); }
+    }
     auto prepareEnd = std::chrono::steady_clock::now();
     auto frameResult = renderer_->renderFrame(
         Renderer::SceneDrawList{
@@ -553,6 +585,7 @@ void Application::mainLoop() {
             .transparent = visibleRenderQueues.transparent,
             .allOpaque = renderQueues.opaque,
             .allMask = renderQueues.mask,
+            .allTransparent=renderQueues.transparent,
             .sky = true, .bounds = showAabbDebug_},
         viewProjMatrix, camera.position, frameLighting, shadowPassEnabled);
     auto const &draws = renderer_->drawStatistics();
@@ -759,6 +792,7 @@ void Application::drawImGui() {
     }
 
     if (ImGui::Button("Reset Camera")) {
+      renderer_->invalidateTemporalHistory();
       camera = sceneCamera_;
       orbitCameraController_.reset(camera);
     }
@@ -770,17 +804,52 @@ void Application::drawImGui() {
   ImGui::End();
 
   if (ImGui::Begin("Lighting")) {
-    ImGui::TextUnformatted("Directional Cook-Torrance PBR");
-    ImGui::DragFloat3("Direction", &scene_.lighting.direction.x, 0.01f);
-    ImGui::SliderFloat("Intensity", &scene_.lighting.intensity, 0.0f, 4.0f);
-    ImGui::ColorEdit3("Color", &scene_.lighting.color.x);
+    ImGui::TextUnformatted("Cook-Torrance PBR");
+    if(isKitchenFixture())ImGui::TextWrapped("Kitchen preview uses warm ceiling lights. Check Base Color to separate material color from illumination.");
+    ImGui::Text("Lighting setup: %s", activeLightingPreset_.c_str());
+    if (isKitchenFixture() && ImGui::Button("Kitchen lighting preview")) applyKitchenLighting();
+    ImGui::SameLine();
+    if (ImGui::Button("Restore asset lighting")) useAssetLighting();
+    ImGui::Text("Sun: %s | local shadows: %u / %u requested (4 spot slots)",
+      scene_.lighting.sunEnabled ? "enabled" : "disabled",
+      renderer_->spotShadowsAssigned(),renderer_->spotShadowsRequested());
+    if (ImGui::CollapsingHeader("Room reflection probe",ImGuiTreeNodeFlags_DefaultOpen)) {
+      auto &probe=scene_.lighting.localProbe;
+      ImGui::Checkbox("Use local probe", &probe.enabled);
+      ImGui::DragFloat3("Probe position", &probe.position.x,.05f);
+      ImGui::DragFloat3("Room minimum", &probe.minimum.x,.05f);
+      ImGui::DragFloat3("Room maximum", &probe.maximum.x,.05f);
+      if (ImGui::Button("Capture / refresh probe")) {probe.enabled=true;probeCaptureRequested_=true;}
+      ImGui::Text("Probe: %s", !renderer_->localProbeValid() ? "not captured (global sky fallback)" :
+        renderer_->localProbeMatches(scene_.lighting) ? "ready" : "scene/lighting/bounds changed - refresh required");
+      ImGui::TextWrapped("Static room lighting. Refresh after changing geometry, materials, light color or strength. Light edits update direct lighting immediately; the captured room illumination stays until refreshed.");
+      if (!probeCaptureError_.empty()) ImGui::TextWrapped("%s",probeCaptureError_.c_str());
+    }
+    ImGui::Checkbox("Clustered Lights", &scene_.lighting.clusteredLights);
+    ImGui::Checkbox("Default Sun", &scene_.lighting.sunEnabled);
+    ImGui::DragFloat3("Sun direction", &scene_.lighting.direction.x, 0.01f);
+    ImGui::SliderFloat("Sun intensity", &scene_.lighting.intensity, 0.0f, 4.0f);
+    ImGui::ColorEdit3("Sun color", &scene_.lighting.color.x);
     ImGui::SliderFloat("Diffuse", &scene_.lighting.diffuseStrength, 0.0f, 2.0f);
     ImGui::SliderFloat("Specular", &scene_.lighting.specularStrength, 0.0f,
                        4.0f);
-    char const *pbrDebugModes[] = {"Final",     "Base Color",  "Metallic",
-                                   "Roughness", "Normal",      "AO",
-                                   "Emissive",  "Diffuse IBL", "Specular IBL",
-                                   "Specular Weight", "Dielectric F0"};
+    ImGui::Checkbox("Specular AA", &scene_.lighting.specularAaEnabled);
+    char const *pbrDebugModes[] = {"Final",
+                                   "Base Color",
+                                   "Metallic",
+                                   "Roughness",
+                                   "Normal",
+                                   "AO",
+                                   "Emissive",
+                                   "Diffuse IBL",
+                                   "Specular IBL",
+                                   "Specular Weight",
+                                   "Dielectric F0",
+                                   "Authored Roughness",
+                                   "Normal Mip Kernel",
+                                   "Geometry AA Kernel",
+                                   "Direct Lighting",
+                                   "Cluster Light Count", "Local Shadow Visibility", "Sun Cascades", "Motion UV", "Motion History Validity"};
     ImGui::Combo("PBR Debug", &scene_.lighting.pbrDebugMode, pbrDebugModes,
                  static_cast<int>(std::size(pbrDebugModes)));
     ImGui::SliderFloat("Environment Intensity",
@@ -797,13 +866,129 @@ void Application::drawImGui() {
                        &scene_.lighting.environmentSpecularStrength, 0.0f, 4.0f,
                        "%.2f");
 
+    if (ImGui::CollapsingHeader("Punctual Lights",
+                                ImGuiTreeNodeFlags_DefaultOpen)) {
+      auto &lights = scene_.lighting.punctualLights;
+      auto add = [&](PunctualLightType type) {
+        PunctualLight light;
+        light.name = type == PunctualLightType::Point ? "Point" : "Spot";
+        light.type = type;
+        auto const &camera = scene_.cameras[scene_.activeCameraIndex];
+        light.position = camera.position;
+        auto direction = camera.target - camera.position;
+        light.direction = glm::length(direction) > .0001f
+                              ? glm::normalize(direction)
+                              : glm::vec3(0, 0, -1);
+        light.castsShadow = type == PunctualLightType::Spot;
+        light.intensity = 50;
+        light.range = 0;
+        lights.push_back(std::move(light));
+      };
+      if (ImGui::Button("Add Point"))
+        add(PunctualLightType::Point);
+      ImGui::SameLine();
+      if (ImGui::Button("Add Spot"))
+        add(PunctualLightType::Spot);
+      ImGui::Text("%zu lights; point/directional local shadows are not supported", lights.size());
+      for (std::size_t i = 0; i < lights.size(); ++i) {
+        auto &light = lights[i];
+        ImGui::PushID(static_cast<int>(i));
+        bool remove = false;
+        if (ImGui::TreeNode("Light", "%s (%zu)", light.name.c_str(), i)) {
+          ImGui::Checkbox("Enabled", &light.enabled);
+          char const *types[] = {"Directional", "Point", "Spot"};
+          int type = static_cast<int>(light.type);
+          if (ImGui::Combo("Type", &type, types, 3)) {
+            light.type = static_cast<PunctualLightType>(type);
+            if (light.type != PunctualLightType::Point &&
+                glm::length(light.direction) < .0001f)
+              light.direction = {0, 0, -1};
+          }
+          if (light.type != PunctualLightType::Directional)
+            ImGui::DragFloat3("World Position (m)", &light.position.x, .05f);
+          if (light.type != PunctualLightType::Point &&
+              ImGui::DragFloat3("Emission Direction", &light.direction.x,
+                                .01f) &&
+              glm::length(light.direction) < .0001f)
+            light.direction = {0, 0, -1};
+          ImGui::ColorEdit3("Linear Color", &light.color.x);
+          ImGui::DragFloat(light.type == PunctualLightType::Directional
+                               ? "Intensity (lux)"
+                               : "Intensity (cd)",
+                           &light.intensity, .25f, 0, 1e6f, "%.3f",
+                           ImGuiSliderFlags_AlwaysClamp);
+          if (light.type != PunctualLightType::Directional)
+            ImGui::DragFloat("Range (m; 0 = infinite)", &light.range, .1f, 0,
+                             1e6f, "%.3f", ImGuiSliderFlags_AlwaysClamp);
+          if (light.type == PunctualLightType::Spot) {
+            float inner = glm::degrees(light.innerCone),
+                  outer = glm::degrees(light.outerCone);
+            if (ImGui::DragFloat("Inner Cone (deg)", &inner, .1f, 0,
+                                 outer - std::min(.001f, outer * .5f), "%.3f",
+                                 ImGuiSliderFlags_AlwaysClamp))
+              light.innerCone = glm::radians(inner);
+            if (ImGui::DragFloat(
+                    "Outer Cone (deg)", &outer, .1f,
+                    glm::degrees(light.innerCone) +
+                        std::min(.001f,
+                                 (90.f - glm::degrees(light.innerCone)) * .5f),
+                    90, "%.3f", ImGuiSliderFlags_AlwaysClamp))
+              light.outerCone = glm::radians(outer);
+          }
+          if (light.type==PunctualLightType::Spot) {
+            ImGui::Checkbox("Cast shadow (first 4 eligible spots)", &light.castsShadow);
+            ImGui::DragFloat("Shadow near", &light.shadowNear,.01f,.001f,light.shadowDistance-.001f,"%.3f",ImGuiSliderFlags_AlwaysClamp);
+            ImGui::DragFloat("Shadow distance (infinite-range light)",&light.shadowDistance,.1f,light.shadowNear+.001f,1000,"%.2f",ImGuiSliderFlags_AlwaysClamp);
+            ImGui::SliderFloat("Spot bias slope",&light.shadowBiasSlope,0,.02f,"%.5f");
+            ImGui::SliderFloat("Spot bias constant",&light.shadowBiasConstant,0,.005f,"%.5f");
+            ImGui::SliderFloat("Spot PCF radius",&light.shadowPcfRadius,0,4,"%.1f");
+            if (light.outerCone>=glm::radians(89.5f) || light.outerCone<.001f)
+              ImGui::TextWrapped("Shadow requires outer cone from 0.057 to 89.5 degrees; light still illuminates.");
+            if (ImGui::Button("Inspect this shadow")) {
+              auto packed=packPunctualLights(lights, device_->physicalDevice().getProperties().limits.maxStorageBufferRange);
+              IndoorLightingGpu assignments;
+              assignSpotShadows(lights,packed,assignments,true);
+              unsigned packedIndex=0;
+              for (std::size_t k=0;k<i;++k) if (lights[k].enabled) ++packedIndex;
+              float index=light.enabled?packed.lights[packedIndex].cones.z:-1;
+              scene_.lighting.localShadowDebugIndex=index>=0?unsigned(index):spotShadowBudget;
+              scene_.lighting.pbrDebugMode=16;
+            }
+          }
+          remove = ImGui::Button("Remove Light");
+          ImGui::TreePop();
+        }
+        ImGui::PopID();
+        if (remove) {
+          lights.erase(lights.begin() + i);
+          break;
+        }
+      }
+    }
     ImGui::Separator();
-    ImGui::TextUnformatted("Shadow");
+    ImGui::TextUnformatted("Sun Shadow");
     char const *shadowModes[] = {"Off", "Lit", "Visibility", "Depth Map"};
     int shadowMode = scene_.lighting.shadowDebugMode;
     if (ImGui::Combo("Mode", &shadowMode, shadowModes, 4)) {
       scene_.lighting.shadowDebugMode = shadowMode;
     }
+    auto &csm = scene_.lighting.sunCascades;
+    ImGui::Checkbox("Stable CSM", &csm.enabled);
+    if (csm.enabled) {
+      int quality = csm.count == 4 ? 2 : csm.count == 2 ? 1 : 0;
+      if (ImGui::Combo("Cascades", &quality, "1\0" "2\0" "4\0"))
+        csm.count = quality == 2 ? 4 : quality == 1 ? 2 : 1;
+      ImGui::Text("Active: %u | 1024 per cascade", renderer_->sunCascadesAssigned());
+      ImGui::DragFloat("Shadow distance", &csm.distance, .1f, .01f, 1000.f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+      ImGui::SliderFloat("Split lambda", &csm.splitLambda, 0, 1);
+      ImGui::SliderFloat("Cascade blend", &csm.blendFraction, 0, .3f);
+      ImGui::DragFloat("Caster extension", &csm.casterDistance, .1f, 0, 1000, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+      ImGui::SliderFloat("Bias world units", &csm.biasConstant, 0, .03f, "%.4f");
+      ImGui::SliderFloat("Bias texels", &csm.biasSlope, 0, 4, "%.2f");
+      int tile = int(csm.debugIndex);
+      if (ImGui::SliderInt("Depth debug cascade", &tile, 0, int(csm.count)-1)) csm.debugIndex=unsigned(tile);
+      if (ImGui::Button("Inspect cascade coverage")) scene_.lighting.pbrDebugMode=17;
+    } else {
     ImGui::SliderFloat("Bias Slope", &scene_.lighting.shadowBiasSlope, 0.0f,
                        0.02f, "%.5f");
     ImGui::SliderFloat("Bias Constant", &scene_.lighting.shadowBiasConstant,
@@ -818,6 +1003,8 @@ void Application::drawImGui() {
                      0.001f, scene_.lighting.shadowFarPlane - 0.001f, "%.3f");
     ImGui::DragFloat("Shadow Far", &scene_.lighting.shadowFarPlane, 0.05f,
                      scene_.lighting.shadowNearPlane + 0.001f, 100.0f, "%.2f");
+    }
+    ImGui::SliderFloat("Sun PCF Radius", &scene_.lighting.shadowPcfRadius, 0, 4, "%.2f");
   }
   ImGui::End();
 
@@ -936,6 +1123,19 @@ void Application::drawImGui() {
   ImGui::End();
 
   if (ImGui::Begin("Render Debug")) {
+    bool taa=renderer_->taaEnabled();
+    if(ImGui::Checkbox("TAA",&taa))renderer_->setTaaEnabled(taa);
+    int filter=int(renderer_->taaHistoryFilter());
+    char const *filters[]={"Bilinear","Catmull-Rom"};
+    if(ImGui::Combo("History reconstruction",&filter,filters,2))renderer_->setTaaHistoryFilter(TaaHistoryFilter(filter));
+    ImGui::Text("TAA GPU: %.3f ms",renderer_->gpuTimings().taaMs);
+    bool jitter = renderer_->temporalJitterEnabled();
+    ImGui::BeginDisabled(taa);
+    if (ImGui::Checkbox("Jitter preview", &jitter)) renderer_->setTemporalJitterEnabled(jitter);
+    ImGui::EndDisabled();
+    if (ImGui::Button("Reset temporal history")) renderer_->invalidateTemporalHistory();
+    auto const &temporal = renderer_->temporalCamera();
+    ImGui::Text("Camera history: %s; jitter UV: %.6f %.6f", temporal.previousCamera.w > .5f ? "valid" : "invalid", temporal.jitterUv.x, temporal.jitterUv.y);
     Renderer::RasterizerDebugSettings settings =
         renderer_->rasterizerDebugSettings();
 
@@ -953,6 +1153,7 @@ void Application::drawImGui() {
     if (gpu.valid) {
       ImGui::Text("GPU frame #%llu: %.3f ms",
                   static_cast<unsigned long long>(gpu.frameId), gpu.totalMs);
+      ImGui::Text("GPU light culling: %.3f ms", gpu.cullingMs);
       ImGui::Text("GPU shadow / main: %.3f / %.3f ms", gpu.shadowMs, gpu.mainMs);
       ImGui::Text("GPU output / UI: %.3f / %.3f ms", gpu.outputMs, gpu.uiMs);
     } else
@@ -965,6 +1166,8 @@ void Application::drawImGui() {
     if (ImGui::CollapsingHeader("Render Graph"))
       ImGui::TextUnformatted(renderer_->renderGraphDump().c_str());
     ImGui::Separator();
+    auto const &grid = renderer_->clusterGrid();
+    ImGui::Text("Light culling: %s (%u x %u x %u)", grid.screen.z ? "clustered" : "full", grid.grid.x, grid.grid.y, grid.grid.z);
     ImGui::Checkbox("Shadows", &shadowDebugEnabled_);
     ImGui::Checkbox("Normal/Bump Mapping", &normalMapDebugEnabled_);
     ImGui::Checkbox("Parallax Mapping", &parallaxDebugEnabled_);
@@ -1386,6 +1589,7 @@ void Application::createScene() {
   scene_.cameras = {Camera{}};
   scene_.activeCameraIndex = 0;
   scene_.lighting = LightingSettings{};
+  scene_.lighting.clusteredLights = options_.lightCulling == "clustered";
   orbitCameraController_.attach(scene_.cameras.front());
 }
 
@@ -1395,10 +1599,16 @@ void Application::loadScene(std::filesystem::path const &path) {
   auto job = std::make_unique<SceneLoad>();
   job->path = std::filesystem::absolute(path).lexically_normal();
   auto *renderer = renderer_.get();
-  job->preparation = std::async(std::launch::async, [renderer, path = job->path] {
+  auto lightLimit =
+      device_->physicalDevice().getProperties().limits.maxStorageBufferRange;
+  job->preparation = std::async(std::launch::async, [renderer, lightLimit,
+                                                     path = job->path] {
     if (!std::filesystem::is_regular_file(path))
       throw std::runtime_error("Scene file not found: " + path.string());
     ImportedScene loaded = loadStaticModelScene(path, {});
+    // Check the actual device limit before preparing GPU assets or publishing a
+    // candidate; an oversized scene must preserve the current scene and lights.
+    (void)packPunctualLights(loaded.lights, lightLimit);
     if (loaded.meshes.empty() || loaded.materials.empty() || loaded.objects.empty())
       throw std::runtime_error("Imported scene has no drawable geometry.");
     Aabb bounds{};
@@ -1425,6 +1635,7 @@ void Application::loadScene(std::filesystem::path const &path) {
     result.path = path;
     result.pathText = path.string();
     result.warnings = std::move(loaded.warnings);
+    result.lights = std::move(loaded.lights);
     result.gpu = renderer->prepareScene(result.assets);
     return result;
   });
@@ -1465,6 +1676,7 @@ void Application::advanceSceneLoad(bool waitForStartup) {
         if (id) ImGui_ImplVulkan_RemoveTexture((VkDescriptorSet)id);
     };
   }
+  auto assetLights=next.lights;
   auto [usage, budget] = device_->memoryUsageBudget();
   benchmarkMetadata_.sampledPeakHeapUsage = std::max(benchmarkMetadata_.sampledPeakHeapUsage, usage);
   benchmarkMetadata_.lastHeapBudget = budget;
@@ -1477,6 +1689,13 @@ void Application::advanceSceneLoad(bool waitForStartup) {
   assets_ = std::move(next.assets);
   sceneEcs_ = std::move(next.ecs);
   scene_.cameras.swap(next.cameras);
+  scene_.lighting.localProbe.enabled=false;
+  probeCaptureRequested_=false;
+  probeCaptureError_.clear();
+  activeLightingPreset_="asset";
+  assetLights_.swap(assetLights);
+  scene_.lighting.punctualLights.swap(next.lights);
+  scene_.lighting.sunEnabled = scene_.lighting.punctualLights.empty();
   sceneCamera_ = next.camera;
   scene_.activeCameraIndex = 0;
   orbitCameraController_.attach(scene_.cameras.front());
@@ -1499,6 +1718,35 @@ void Application::advanceSceneLoad(bool waitForStartup) {
   for (auto const &warning : sceneLoadWarnings_)
     std::cerr << "Scene warning: " << warning << '\n';
   sceneLoad_.reset();
+  if ((options_.lightingPreset=="auto" || options_.lightingPreset=="kitchen") && isKitchenFixture())
+    applyKitchenLighting();
+  else if (options_.lightingPreset=="kitchen")
+    sceneLoadWarnings_.push_back("Kitchen preset requires the pinned Country Kitchen fixture; asset lighting used.");
+}
+
+bool Application::isKitchenFixture() const {
+  // Match the known converted asset's material semantics, never all lightless scenes.
+  return assets_.materials.size()==90 && std::ranges::any_of(assets_.materials,[](auto const &m) {
+    return m.name=="diffuse_00_area_light_295";
+  });
+}
+void Application::useAssetLighting() {
+  scene_.lighting.punctualLights=assetLights_;
+  scene_.lighting.sunEnabled=assetLights_.empty();
+  scene_.lighting.localProbe.enabled=false;
+  activeLightingPreset_="asset";
+  probeCaptureRequested_=false;
+}
+void Application::applyKitchenLighting() {
+  if (!isKitchenFixture()) return;
+  scene_.lighting.punctualLights=assetLights_;
+  auto &camera=scene_.cameras.front();
+  applyKitchenLightingPreset(scene_.lighting,camera);
+  sceneCamera_=camera;
+  orbitCameraController_.attach(camera);
+  orbitCameraController_.setMoveSpeed(1);
+  activeLightingPreset_="kitchen preview (2 shadowed spots + room probe)";
+  probeCaptureRequested_=true;
 }
 
 void Application::cancelSceneLoad() {
@@ -1664,6 +1912,12 @@ void Application::finishBenchmark() {
   benchmarkMetadata_.validationErrors = validationErrors_;
   benchmarkMetadata_.validationWarnings = validationWarnings_;
   benchmarkMetadata_.engineResources = renderer_->resourceSnapshot();
+  benchmarkMetadata_.taaHistoryFilter=renderer_->taaHistoryFilter()==TaaHistoryFilter::CatmullRom?"catmull-rom":"bilinear";
+  benchmarkMetadata_.taaEnabled=renderer_->taaActive();
+  benchmarkMetadata_.temporalJitterEnabled=renderer_->temporalJitterEnabled();
+  benchmarkMetadata_.temporalHistoryValid=renderer_->temporalCamera().previousCamera.w>.5f;
+  benchmarkMetadata_.sunCascadeCount=renderer_->sunCascadesAssigned();
+  benchmarkMetadata_.sunShadowDistance=renderer_->sunCascades().params.w;
   writeBenchmarkReport(*options_.benchmarkDirectory, benchmarkMetadata_,
                        benchmarkFrames_);
   std::cout << "Benchmark: " << options_.benchmarkDirectory->string() << ", "

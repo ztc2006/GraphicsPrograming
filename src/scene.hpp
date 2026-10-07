@@ -7,6 +7,8 @@
 
 #include "camera.hpp"
 #include "glm_include.hpp"
+#include "punctual_lights.hpp"
+#include "indoor_lighting.hpp"
 #include "scene_object.hpp"
 #include "texture_sampler.hpp"
 
@@ -70,13 +72,19 @@ struct Material {
 };
 
 struct LightingSettings {
+  LocalProbeSettings localProbe;
+  SunCascadeSettings sunCascades;
+  unsigned localShadowDebugIndex = 0;
   glm::vec3 direction{-0.4f, 1.0f, 0.3f};
   float intensity = 1.0f;
+  bool sunEnabled = true;
+  bool clusteredLights = true;
+  std::vector<PunctualLight> punctualLights;
   glm::vec3 color{1.0f, 0.98f, 0.92f};
   float ambientStrength = 0.08f;
   float diffuseStrength = 1.0f;
   float specularStrength = 1.0f;
-  float shininess = 32.0f;
+  bool specularAaEnabled = true;
   int pbrDebugMode = 0;
   float shadowBiasSlope = 0.0025f;
   float shadowBiasConstant = 0.0007f;

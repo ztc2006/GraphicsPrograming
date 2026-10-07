@@ -64,7 +64,7 @@ public:
   // generation.
   TextureResources createFromHdrCube(std::span<float const> rgba,
                                      std::uint32_t faceSize,
-                                     UploadBatch &batch) const;
+                                     UploadBatch &batch, unsigned cubes = 1) const;
 
 private:
   friend class TextureCache;

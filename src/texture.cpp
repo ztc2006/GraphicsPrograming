@@ -155,18 +155,19 @@ TextureResources TextureLoader::createFromHdrPixels(std::span<float const> rgba,
 
 TextureResources TextureLoader::createFromHdrCube(std::span<float const> rgba,
                                                   std::uint32_t faceSize,
-                                                  UploadBatch &batch) const {
+                                                  UploadBatch &batch, unsigned cubes) const {
+  if (cubes < 1 || cubes > 2) throw std::runtime_error("HDR cube array requires one or two cubes");
   auto levels = textureMipLayout(faceSize, faceSize, 16, true);
   for (auto &level : levels) {
-    level.offset *= 6;
-    level.size *= 6;
+    level.offset *= 6 * cubes;
+    level.size *= 6 * cubes;
   }
   if (rgba.size_bytes() != levels.back().offset + levels.back().size)
     throw std::runtime_error(
         "HDR cube requires six faces and a complete chain");
   TextureResources result;
   result.view_ = uploadImage(std::as_bytes(rgba), levels,
-                             vk::Format::eR32G32B32A32Sfloat, batch, true, 6);
+                             vk::Format::eR32G32B32A32Sfloat, batch, true, 6 * cubes);
   result.sampler_ = createSampler({.u = TextureWrap::ClampToEdge,
                                    .v = TextureWrap::ClampToEdge,
                                    .w = TextureWrap::ClampToEdge,
@@ -181,7 +182,9 @@ TextureLoader::uploadImage(std::span<std::byte const> pixels,
                            bool opaqueAlpha, std::uint32_t arrayLayers) const {
   if (levels.empty())
     throw std::runtime_error("Texture requires at least one mip.");
-  bool cube = arrayLayers == 6;
+  bool cube = arrayLayers >= 6 && arrayLayers % 6 == 0;
+  if (arrayLayers > device_.physicalDevice().getProperties().limits.maxImageArrayLayers)
+    throw std::runtime_error("Texture exceeds image array layer limit");
   auto limit = device_.physicalDevice().getProperties().limits;
   if (levels[0].width >
           (cube ? limit.maxImageDimensionCube : limit.maxImageDimension2D) ||
@@ -228,7 +231,7 @@ TextureLoader::uploadImage(std::span<std::byte const> pixels,
       device_.logicalDevice(),
       vk::ImageViewCreateInfo{
           .image = *view->storage->allocation.image,
-          .viewType = cube ? vk::ImageViewType::eCube : vk::ImageViewType::e2D,
+          .viewType = cube ? vk::ImageViewType::eCubeArray : vk::ImageViewType::e2D,
           .format = format,
           .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, count, 0,
                                arrayLayers}});

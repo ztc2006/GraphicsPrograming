@@ -40,7 +40,12 @@ M3-C1 adds KHR_materials_specular (factor, linear alpha/sRGB color textures,
 independent UV/samplers, direct and IBL response) and a UI-loadable
 [reference grid](assets/render_tests/specular_reference.gltf);
 [20/20 software regressions pass](docs/M3_C1_Specular_Implementation.md).
-Next: M3-C2 normal variance filtering and specular antialiasing.
+M3-C2 adds normal-variance filtering and specular antialiasing; M4-A imports/edits
+point, spot and directional lights with independent per-frame SSBOs. M4-B adds
+GPU clustered assignment and a full-light comparison switch; see the
+[cluster contract](docs/M4_B_Clustered_Implementation.md). A kitchen correctness repair adds four spot-shadow slots and one on-demand room
+probe before stable CSM. Point/directional local shadows, CSM and SSR remain pending.
+See [indoor contract](docs/Indoor_Lighting_Implementation.md).
 
 Build and open the viewer:
 
@@ -85,6 +90,57 @@ Specular IBL samples a GGX prefiltered cubemap and split-sum BRDF LUT;
 see the [IBL decision](docs/M3_B_IBL_Decision.md). Lighting's PBR Debug selector exposes base
 color, metallic, roughness, normals, AO and environment-light components.
 
+
+## PBR test scenes
+
+Download the pinned assets once (about 109.0 MB total); subsequent runs verify and
+reuse them. Sources, licenses, file sizes and SHA-256 are recorded in
+`tools/pbr_test_assets.json`. Downloaded payloads stay out of Git history.
+
+```bash
+python3 tools/fetch_pbr_test_assets.py
+python3 tools/fetch_pbr_test_assets.py --verify-only   # local integrity, no network
+./run.sh --no-build assets/models/pbr_kitchen/kitchen_cutaway.gltf
+./run.sh --no-build assets/models/pbr_flight_helmet/source/FlightHelmet.gltf
+```
+
+[Country Kitchen](assets/models/pbr_kitchen/README.md) supplies a complete static
+interior with 90 materials and approximately 1.44 million triangles. Its generated
+cutaway opens the walls/ceiling for the current bounds-fit camera; the complete
+core scene remains in `source/kitchen_core.gltf`. Use the complete scene for enclosed
+room coverage, and fly inside with right mouse + WASD/Space/Ctrl. The viewer does
+not yet use imported glTF cameras. The cutaway changes occlusion and is intended
+for material inspection. Glass is an alpha blend approximation; emissive meshes
+do not illuminate nearby objects in the current renderer.
+
+[Flight Helmet](assets/models/pbr_flight_helmet/README.md) complements it with
+normal and ORM textures, leather/rubber/wood/metal and detailed specular surfaces.
+It uses the original upstream core version preceding the transmission extension.
+Both load through the existing Scene panel and file-drop path.
+
+Additional extension references are available:
+[Anisotropy Barn Lamp](assets/models/pbr_anisotropy_barn_lamp/README.md) and
+[Green Glass Dragon](assets/models/pbr_green_glass_dragon/README.md).
+The green dragon is a labelled volume-absorption variant of upstream DragonAttenuation;
+its original thickness map, geometry and white surface colour are retained.
+Current unsupported transmission/volume/anisotropy extensions use reported core
+fallbacks: these assets expose missing material features, rather than proving
+that glass or anisotropic reflections are already implemented.
+
+```bash
+./run.sh --no-build assets/models/pbr_green_glass_dragon/green_glass_dragon.gltf
+./run.sh --no-build assets/models/pbr_anisotropy_barn_lamp/source/AnisotropyBarnLamp.gltf
+```
+
+ Keep the courtyard
+for existing asset compatibility and the analytic grids for numeric correctness;
+future coverage should include these assets instead of relying on one courtyard.
+Asset selection follows RTR4 Chapters 5/6/9: distinguish texture/color/tangent
+semantics from scene lighting and visibility.
+
+Software Vulkan smoke checks cover loading, uploads, submission, reports and clean
+shutdown. These checks establish compatibility; RTX 4060 Ti image quality,
+temporal behavior, GPU budgets and RenderDoc captures remain deferred.
 
 ## Repeatable M0 measurements
 
@@ -350,3 +406,118 @@ keeps its native driver path. That native shared-image failure, actual OUT_OF_DA
 device-lost, native minimize, validation and RTX 4060 Ti acceptance remain open.
 See the [decision](docs/M2_C2_Presentation_Decision.md) and
 [implementation/evidence](docs/M2_C2_Presentation_Implementation.md).
+
+
+## Clustered lighting (M4-B)
+
+```bash
+./run.sh --no-build --light-culling clustered assets/render_tests/punctual_reference.gltf
+./run.sh --no-build --light-culling full assets/render_tests/punctual_reference.gltf
+```
+
+The default requests clustered assignment. Lighting's **Clustered Lights** switch
+selects it at runtime; **Cluster Light Count** shows count/64 in gray and full-light
+fallback in magenta. The 64×64 / 24-slice grid covers transparent surfaces too.
+Overflow above 64 lights per cell falls back to the complete light table. Zero
+punctual lights, unsupported projections or resource limits use the full path.
+Render Debug shows the actual grid/pass/barriers. Reports add completed-frame
+`gpu_culling_ms` and `clustered_active`; requested mode alone does not prove activation.
+Performance acceptance and the low-light crossover await RTX 4060 Ti measurements.
+This stage adds light assignment; local shadows follow in M5.
+
+### Kitchen lighting and room reflection preview
+
+`./run.sh assets/models/pbr_kitchen/source/kitchen_core.gltf` recognizes the pinned
+fixture and applies two explicit ceiling spots plus a captured room probe. The
+asset itself has no punctual lights. `--lighting-preset asset` preserves asset
+lighting; `auto` is the default, `kitchen` requests this known fixture preset.
+In Lighting, **Kitchen lighting preview** and **Restore asset lighting** switch
+the setup. **Cast shadow** allocates up to four eligible spots; unassigned lights
+remain lit. **Room reflection probe → Capture / refresh probe** updates the
+room's static SH/GGX environment. Changes to lights, geometry or materials show
+a refresh warning; this is an approximation with one box and no dynamic GI.
+
+### Stable cascaded sun shadows (M5-A)
+
+The main view defaults to four 1024² sun cascades in the left half of the existing
+4096×2048 atlas. The four spot tiles retain the right half. In **Lighting → Sun
+Shadow**, change **Stable CSM**, **Cascades** (1/2/4), **Shadow distance**, **Split
+lambda**, **Cascade blend**, **Caster extension**, world/texel bias, and PCF radius.
+**Inspect cascade coverage** shows the selected levels and blend bands; **Depth
+debug cascade** selects the tile used by depth debug. Disabling CSM restores the
+previous scene-fitted single map for comparison.
+
+Sphere fitting and world texel snapping stabilize sampling; overlap and the last
+cascade fade soften transitions. Receiver-plane depth correction handles tilted
+surfaces under PCF without a large global bias. Beyond the configured shadow
+range, direct sunlight stays enabled. Room captures retain a separate fixed scene
+map. Benchmark schema 4 records actual `sun_cascade_count`/`sun_shadow_distance`.
+
+28 CPU/software GPU CTests pass; camera motion quality and cost on the 4060 Ti
+remain pending. TAA and GTAO are subsequent stages. See the
+[CSM implementation](docs/M5_A_CSM_Implementation.md) and
+[decision](docs/M5_A_CSM_Decision.md).
+
+
+### Motion vectors and jitter (M6-A)
+
+PBR Debug now includes **Motion UV** and **Motion History Validity**. The main
+scene writes a second RGBA16F target with unjittered current-minus-previous UV,
+validity and diagnostic previous depth. Camera/object state follows the previous
+successful submission, including with two frame slots; anonymous compatibility
+draws have no object history. Sky motion ignores translation. Transparent coverage
+reduces validity for the upcoming temporal resolve.
+
+**Jitter preview (TAA pending)** in Render Debug is off by default. The preview
+changes sampling only: TAA accumulation/reprojection is the next increment, and
+GTAO comes later. CSM uses the unjittered camera. Camera/scene/resize/jitter resets
+invalidate previous state; offline probe capture leaves submission history alone.
+
+Benchmark schema 4 reports `motion_vectors_enabled`, `temporal_jitter_enabled`,
+`temporal_camera_history_valid`, `taa_enabled=false` and
+`frame_target_policy=shared_hdr_depth_motion_shadow`. Motion adds 8 bytes/pixel;
+UBO is now 608 bytes per slot, push remains 128 bytes. The frame/material layout
+requires five total storage descriptors, four per shader stage, 16 sampled
+images/samplers and 22 per-stage resources; unsupported limits are rejected early. FP16 projected previous depth
+is diagnostic; M6-B will use suitable linear depth for disocclusion rejection.
+See the [implementation](docs/M6_A_Motion_Implementation.md) and
+[decision](docs/M6_A_Motion_Decision.md).
+
+
+### Native-resolution TAA (M6-B)
+
+The viewer now enables TAA by default. Use **TAA** in Render Debug or `--no-taa`
+for comparison; disabling it also disables jitter. Linear HDR resolve precedes
+exposure/filmic/sRGB and UI. History uses RGBA16F color and R32F linear depth,
+with submitted-order ping-pong, invalid/depth/transparent rejection and YCoCg
+neighborhood limits. Motion's fourth component is now previous linear clip.w;
+zero represents infinite sky. Unsupported projections and data debug bypass TAA.
+
+Scene/camera/resize/AA resets invalidate history, and offline probes leave it alone.
+`gpu_taa_ms` is available in UI, CSV and summary. Current bilinear reconstruction
+softens fine detail; M6-C will tune reconstruction/reactivity and motion quality.
+32 RTX 4060 Ti/X11 regressions pass, including a two-pending-submission resolve test.
+RenderDoc confirms the HDR/resolve/display order. Native Wayland startup tests,
+validation-layer acceptance, compositor-dependent acquisition stalls and final
+quality/performance acceptance remain open. See [implementation](docs/M6_B_TAA_Implementation.md).
+
+
+### TAA reconstruction and validity (M6-C)
+
+History now stays on an unjittered output lattice; sampling jitter does not move
+old color each frame. **History reconstruction** in Render Debug and
+`--taa-history bilinear|catmull-rom` compare the two modes (default Catmull-Rom).
+Cubic taps validate depth and history eligibility, with a trusted bilinear
+fallback. Historical RGB is bounded to valid evidence to limit negative-lobe halos.
+
+Motion z is now signed: +1 has a valid previous correspondence, -1 is an opaque
+current sample without correspondence, and mixed transparency/debug has magnitude
+below one. History color alpha records eligibility; display alpha stays opaque.
+This fixes reusing transparent composites after they move away. Changed material
+or reconstruction settings invalidate color history; exposure remains display-only.
+
+Static Halton fine-signal RMS versus a 64-sample reference improves from .159873
+to .00148403. RTX quality fixtures and software resolve pass. Full native X11
+regression has 30/32 passes: legacy/EXT generic presentation tests timed out twice;
+they remain open, along with final broad motion-quality/performance acceptance.
+See [implementation](docs/M6_C_TAA_Implementation.md).

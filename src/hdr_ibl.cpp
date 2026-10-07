@@ -309,6 +309,33 @@ glm::vec2 integrateEnvironmentBrdf(float noV, float r, std::uint32_t samples) {
   return glm::vec2(sum / double(samples));
 }
 
+HdrImage environmentCubeToEquirectangular(std::span<float const> rgba, unsigned size) {
+  if (size<2 || size>512 || rgba.size()!=std::size_t(size)*size*6*4)
+    throw std::runtime_error("Captured cube dimensions do not match pixels");
+  CubeSourceLevel cube;
+  cube.size=size;
+  cube.pixels.reserve(rgba.size()/4);
+  for (std::size_t i=0;i<rgba.size();i+=4) {
+    glm::vec3 p{rgba[i],rgba[i+1],rgba[i+2]};
+    for (unsigned c=0;c<3;++c)
+      if (!std::isfinite(p[c]) || p[c]<0)
+        throw std::runtime_error("Captured cube has invalid radiance");
+    cube.pixels.push_back(p);
+  }
+  HdrImage image{size*4,size*2,{}};
+  image.rgba.resize(std::size_t(image.width)*image.height*4);
+  for (unsigned y=0;y<image.height;++y)
+    for (unsigned x=0;x<image.width;++x) {
+      float longitude=(float(x)+.5f)/image.width*2*kPi-kPi;
+      float latitude=(float(y)+.5f)/image.height*kPi-kPi/2;
+      auto rgb=sampleCube(cube,{std::cos(latitude)*std::cos(longitude),std::sin(latitude),std::cos(latitude)*std::sin(longitude)});
+      auto offset=(std::size_t(y)*image.width+x)*4;
+      for (unsigned c=0;c<3;++c) image.rgba[offset+c]=rgb[c];
+      image.rgba[offset+3]=1;
+    }
+  return image;
+}
+
 BakedEnvironment bakeEnvironment(HdrImage const &image,
                                  EnvironmentBakeSettings const &s) {
   validateEnvironmentImage(image);

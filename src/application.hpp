@@ -54,6 +54,9 @@ private:
   struct SceneLoad;
   std::unique_ptr<SceneLoad> sceneLoad_;
   void drawSceneBrowser();
+  bool isKitchenFixture() const;
+  void applyKitchenLighting();
+  void useAssetLighting();
   static void dropCallback(GLFWwindow *window, int count, char const **paths);
   void initImGui();
   void beginImGuiFrame();
@@ -115,6 +118,9 @@ private:
   bool parallaxDebugEnabled_ = true;
   bool frustumCullingEnabled_ = false;
   bool animateScene_ = false;
+  bool probeCaptureRequested_ = false;
+  std::string probeCaptureError_, activeLightingPreset_ = "asset";
+  std::vector<PunctualLight> assetLights_;
   std::optional<std::filesystem::path> startupScenePath_;
   std::optional<std::filesystem::path> pendingScenePath_;
   std::filesystem::path loadedScenePath_;

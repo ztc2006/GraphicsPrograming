@@ -6,11 +6,12 @@
 #include <string>
 #include <vector>
 
-// Non-owning, whole-image, one graphics queue graph. Uploads, allocation,
+// Non-owning whole-image/buffer-range graph on one graphics/compute queue. Uploads, allocation,
 // presentation semaphores and GPU completion belong to the caller.
 class RenderGraph {
 public:
   struct ImageId { std::uint32_t value; bool operator==(ImageId const &) const = default; };
+  struct BufferId { std::uint32_t value; bool operator==(BufferId const &) const = default; };
   struct PassId { std::uint32_t value; bool operator==(PassId const &) const = default; };
   enum class Usage { ColorAttachment, DepthAttachment, SampledColor, SampledDepth, TransferSource, Present };
   struct State {
@@ -40,6 +41,27 @@ public:
     bool fullOverwrite = false;
     vk::ClearValue clear{};
   };
+  enum class BufferUsage { ComputeRead, ComputeWrite, VertexRead, FragmentRead };
+  struct BufferState {
+    vk::PipelineStageFlags2 stages{};
+    vk::AccessFlags2 access{};
+    bool defined = false;
+    vk::PipelineStageFlags2 writerStages{};
+    vk::AccessFlags2 writerAccess{};
+    bool operator==(BufferState const &) const = default;
+  };
+  struct Buffer {
+    std::string name;
+    vk::Buffer buffer{};
+    vk::DeviceSize offset = 0, size = 0;
+    vk::BufferUsageFlags usage{};
+    BufferState initial{};
+  };
+  struct BufferUse {
+    BufferId buffer;
+    BufferUsage usage;
+    bool fullOverwrite = false;
+  };
   enum class Event { Begin, Draw, End };
   struct Pass {
     PassId id;
@@ -47,6 +69,8 @@ public:
     std::vector<Use> uses;
     std::vector<PassId> dependencies;
     std::vector<vk::ImageMemoryBarrier2> barriers;
+    std::vector<BufferUse> bufferUses;
+    std::vector<vk::BufferMemoryBarrier2> bufferBarriers;
   };
   class Plan {
     friend class RenderGraph;
@@ -57,11 +81,14 @@ public:
                 std::function<void(Pass const &, Event)> const &callback);
     State const &finalState(ImageId id) const;
     State const &recordedState(ImageId id) const;
+    BufferState const &finalBufferState(BufferId id) const;
     std::vector<Pass> const &passes() const { return passes_; }
     std::vector<vk::ImageMemoryBarrier2> const &exportBarriers() const { return exports_; }
     std::string dump() const;
   private:
     std::vector<Image> images_;
+    std::vector<Buffer> buffers_;
+    std::vector<BufferState> bufferFinal_;
     std::vector<Pass> passes_;
     std::vector<vk::ImageMemoryBarrier2> exports_;
     std::vector<State> final_, recorded_;
@@ -69,7 +96,9 @@ public:
   };
   // IDs are local to this graph. Duplicate underlying images are rejected.
   ImageId importImage(Image image);
-  PassId addPass(std::string name, std::vector<Use> uses);
+  BufferId importBuffer(Buffer buffer);
+  PassId addPass(std::string name, std::vector<Use> uses,
+                 std::vector<BufferUse> buffers = {});
   void dependsOn(PassId pass, PassId predecessor);
   void exportImage(ImageId image, Usage usage);
   // Pure compile: infer RAW/WAR/WAW edges in declaration order, stable sort,
@@ -77,6 +106,7 @@ public:
   Plan compile() const;
 private:
   std::vector<Image> images_;
+  std::vector<Buffer> buffers_;
   std::vector<Pass> passes_;
   std::vector<std::pair<ImageId, Usage>> exports_;
 };

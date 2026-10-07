@@ -14,9 +14,13 @@ MaterialGpuStore::createDescriptorSetLayout(Device const &device) {
       limits.maxPerStageDescriptorSampledImages < 16 ||
       limits.maxDescriptorSetSamplers < 16 ||
       limits.maxDescriptorSetSampledImages < 16 ||
-      limits.maxPerStageResources < 18)
-    throw std::runtime_error("Renderer requires 16 sampled images/samplers and "
-                             "18 per-stage resources for specular materials.");
+      limits.maxPerStageDescriptorStorageBuffers < 4 ||
+      limits.maxDescriptorSetStorageBuffers < 5 ||
+      limits.maxPerStageResources < 22)
+    throw std::runtime_error(
+        "Renderer requires 16 sampled images/samplers and "
+        "4 storage buffers per stage, 5 across the pipeline layout and "
+        "22 per-stage resources for PBR, lighting and motion.");
   std::array bindings = {
       vk::DescriptorSetLayoutBinding{
           .binding = 0,

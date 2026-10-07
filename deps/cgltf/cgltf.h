@@ -682,6 +682,8 @@ typedef struct cgltf_light {
 	cgltf_float range;
 	cgltf_float spot_inner_cone_angle;
 	cgltf_float spot_outer_cone_angle;
+	cgltf_bool has_range; /* local adapter presence flags; see LOCAL_PATCHES.md */
+	cgltf_bool has_spot;
 	cgltf_extras extras;
 } cgltf_light;
 
@@ -5599,11 +5601,13 @@ static int cgltf_parse_json_light(cgltf_options* options, jsmntok_t const* token
 		else if (cgltf_json_strcmp(tokens + i, json_chunk, "range") == 0)
 		{
 			++i;
+			out_light->has_range = 1;
 			out_light->range = cgltf_json_to_float(tokens + i, json_chunk);
 			++i;
 		}
 		else if (cgltf_json_strcmp(tokens+i, json_chunk, "spot") == 0)
 		{
+			out_light->has_spot = 1;
 			++i;
 
 			CGLTF_CHECK_TOKTYPE(tokens[i], JSMN_OBJECT);

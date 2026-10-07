@@ -12,8 +12,10 @@ struct ViewerOptions {
   unsigned width = 800, height = 600;
   unsigned framesInFlight = 1;
   double warmupSeconds = 30, durationSeconds = 120;
-  std::string cameraPath = "static", gpu;
+  std::string cameraPath = "static", lightCulling = "clustered", lightingPreset = "auto", gpu;
   std::string present = "auto", presentSync = "auto";
+  std::string taaHistory="catmull-rom";
+  bool taa=true;
   bool ui = true, validation = false, help = false;
 };
 

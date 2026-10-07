@@ -11,3 +11,12 @@ __MACOSX/
 Vulkan_Simple_Engine_从零搭建学习路线.md
 Vulkan_学习与封装顺序建议.md
 Vulkan_引擎下一步推进路线.md
+# Downloaded, pinned test assets: restore with tools/fetch_pbr_test_assets.py.
+/assets/models/pbr_kitchen/source/
+/assets/models/pbr_kitchen/kitchen_cutaway.gltf
+/assets/models/pbr_flight_helmet/source/
+/assets/models/pbr_anisotropy_barn_lamp/source/
+/assets/models/pbr_anisotropy_barn_lamp/anisotropy_off_control.gltf
+/assets/models/pbr_green_glass_dragon/source/
+/assets/models/pbr_green_glass_dragon/green_glass_dragon.gltf
+/assets/models/pbr_green_glass_dragon/green_surface_control.gltf

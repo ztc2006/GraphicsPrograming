@@ -77,8 +77,8 @@ void UploadBatch::copyImage(std::span<std::byte const> data,
                             std::span<TextureMipLevel const> levels,
                             std::size_t texelBytes, std::uint32_t arrayLayers) {
   if (levels.empty() || (texelBytes != 4 && texelBytes != 16) ||
-      (arrayLayers != 1 && arrayLayers != 6) ||
-      (arrayLayers == 6 && levels[0].width != levels[0].height))
+      (arrayLayers != 1 && arrayLayers != 6 && arrayLayers != 12) ||
+      (arrayLayers >= 6 && levels[0].width != levels[0].height))
     throw std::runtime_error("Image upload requires RGBA8 or RGBA32F levels.");
   auto expected = textureMipLayout(levels[0].width, levels[0].height,
                                    texelBytes, levels.size() > 1);

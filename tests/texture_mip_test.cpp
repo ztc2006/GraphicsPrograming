@@ -50,8 +50,8 @@ int main() {
       length2 += v * v;
     }
     require(std::abs(std::sqrt(length2) - 1) < .01 &&
-                n.pixels[11] == std::byte{20},
-            "Normal mip lost unit direction/alpha");
+                n.pixels[11] == std::byte{74},
+            "Normal mip lost unit direction/length-loss metadata");
     std::array<unsigned char, 8> opposed{255, 128, 128, 255, 0, 127, 127, 255};
     auto zero = generateTextureMips(std::as_bytes(std::span(opposed)), 2, 1,
                                     TextureColorSpace::Linear,
@@ -60,6 +60,70 @@ int main() {
                 zero.pixels[9] == std::byte{128} &&
                 zero.pixels[10] == std::byte{255},
             "Degenerate normal fallback");
+    // Independent source-space first-moment reference, including non-unit
+    // encoded vectors. No generation helper contributes to this oracle.
+    auto checkMoments = [&](unsigned w, unsigned h,
+                            std::vector<std::byte> pixels) {
+      std::array<double, 3> mean{};
+      for (unsigned i = 0; i < w * h; ++i) {
+        std::array<double, 3> n{};
+        for (unsigned c = 0; c < 3; ++c)
+          n[c] = 2.0 * std::to_integer<int>(pixels[i * 4 + c]) / 255 - 1;
+        double norm = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+        for (unsigned c = 0; c < 3; ++c)
+          mean[c] += n[c] / norm / (w * h);
+      }
+      double length =
+          std::sqrt(mean[0] * mean[0] + mean[1] * mean[1] + mean[2] * mean[2]);
+      auto chain = generateTextureMips(pixels, w, h, TextureColorSpace::Linear,
+                                       TextureMipPolicy::Normal);
+      for (unsigned i = 0; i < w * h; ++i) {
+        for (unsigned c = 0; c < 3; ++c)
+          require(chain.pixels[i * 4 + c] == pixels[i * 4 + c],
+                  "Normal LOD0 RGB changed");
+        require(chain.pixels[i * 4 + 3] == std::byte{0},
+                "Authored normal alpha leaked into variance");
+      }
+      auto offset = chain.levels.back().offset;
+      double loss = std::to_integer<unsigned>(chain.pixels[offset + 3]) / 255.0;
+      require(std::abs(loss - (1 - length)) <= .5001 / 255,
+              "Hierarchical normal moments lost variance/precision");
+      if (length > 1e-6)
+        for (unsigned c = 0; c < 3; ++c) {
+          double actual =
+              2.0 * std::to_integer<unsigned>(chain.pixels[offset + c]) / 255 -
+              1;
+          require(std::abs(actual - mean[c] / length) <= 1.001 / 255,
+                  "Normal first-moment direction differs");
+        }
+      return chain;
+    };
+    for (auto shape : {std::array{8u, 8u}, std::array{3u, 5u},
+                       std::array{1u, 9u}, std::array{9u, 1u}}) {
+      std::vector<std::byte> pixels(shape[0] * shape[1] * 4);
+      // Unequal child lengths: renormalizing intermediate means would change
+      // both the final direction and loss. Alpha deliberately unrelated.
+      std::array<unsigned char, 12> dirs{255, 128, 128, 128, 128, 255,
+                                         128, 255, 128, 100, 160, 220};
+      for (unsigned i = 0; i < shape[0] * shape[1]; ++i) {
+        for (unsigned c = 0; c < 3; ++c)
+          pixels[i * 4 + c] = std::byte(dirs[(i % 4) * 3 + c]);
+        pixels[i * 4 + 3] = std::byte(i * 17 % 256);
+      }
+      checkMoments(shape[0], shape[1], pixels);
+      for (unsigned i = 0; i < shape[0] * shape[1]; ++i)
+        for (unsigned c = 0; c < 3; ++c)
+          pixels[i * 4 + c] = std::byte(dirs[9 + c]);
+      auto flat = checkMoments(shape[0], shape[1], pixels);
+      for (auto const &m : flat.levels)
+        for (auto i = m.offset + 3; i < m.offset + m.size; i += 4)
+          require(flat.pixels[i] == std::byte{0},
+                  "Constant tilted normal acquired variance");
+    }
+    require(zero.pixels[11] == std::byte{255},
+            "Opposed normal distribution lost full variance");
+    require(textureMipAlgorithmVersion == 3,
+            "Normal metadata cache not versioned");
     auto layout = textureMipLayout(3, 5, 4, true);
     require(layout == std::vector<TextureMipLevel>{{3, 5, 0, 60},
                                                    {1, 2, 60, 8},
@@ -175,7 +239,8 @@ int main() {
     rejects([] { textureMipLayout(UINT32_MAX, UINT32_MAX, 4, true); });
     rejects([] { textureMipLayout(1, 1, 0, true); });
     std::cout << "PASS typed mips: sRGB/linear/alpha, packed channels, "
-                 "unit/degenerate normals, odd/long extents, layout/overflow, "
+                 "normal first moments/length loss/flat/opposed/LOD0/version, "
+                 "odd/long extents, layout/overflow, "
                  "BaseOnly/quantized alpha coverage/threshold/channel/ties\n";
   } catch (std::exception const &e) {
     std::cerr << e.what() << '\n';

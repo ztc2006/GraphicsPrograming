@@ -10,8 +10,8 @@
 
 struct GpuTimings {
   std::uint64_t frameId = 0;
-  bool valid = false;
-  double totalMs = 0, shadowMs = 0, mainMs = 0, outputMs = 0, uiMs = 0;
+  bool valid = false, clustered = false;
+  double totalMs = 0, shadowMs = 0, mainMs = 0, outputMs = 0, uiMs = 0, cullingMs = 0, taaMs = 0;
 };
 
 inline double timestampMilliseconds(std::uint64_t start, std::uint64_t end,

@@ -12,8 +12,11 @@
 #include "asset_ids.hpp"
 #include "asset_library.hpp"
 #include "device.hpp"
+#include "cluster_grid.hpp"
 #include "hdr_ibl.hpp"
 #include "hdr_output.hpp"
+#include "temporal_motion.hpp"
+#include "taa_resolve.hpp"
 #include "material_gpu_store.hpp"
 #include "measurement.hpp"
 #include "mesh.hpp"
@@ -24,6 +27,7 @@
 #include "texture.hpp"
 
 class Renderer {
+  friend struct RendererMotionTestAccess;
   friend struct RendererHdrTestAccess;
   friend struct RendererFrameTestAccess;
   const unsigned framesInFlight_;
@@ -89,7 +93,7 @@ public:
   Renderer &operator=(Renderer &&) = delete;
 
   struct DrawItem {
-    std::size_t objectIndex = 0;
+    std::size_t objectIndex = invalidMotionIdentity;
     MeshId meshId = 0;
     MaterialId materialId = 0;
     glm::mat4 modelMatrix{1.0f};
@@ -99,7 +103,7 @@ public:
   struct SceneDrawList {
     std::span<DrawItem const> opaque, mask, transparent;
     // Complete sets, including objects outside the camera frustum.
-    std::span<DrawItem const> allOpaque, allMask;
+    std::span<DrawItem const> allOpaque, allMask, allTransparent;
     bool sky = true, bounds = false;
   };
   struct DrawStatistics {
@@ -108,7 +112,27 @@ public:
   FrameResult renderFrame(SceneDrawList const &scene, glm::mat4 const &viewProj,
                           glm::vec3 const &camera,
                           LightingSettings const &lighting, bool shadows);
+  void setTemporalJitterEnabled(bool enabled);
+  void setTaaEnabled(bool);
+  void setTaaHistoryFilter(TaaHistoryFilter);
+  TaaHistoryFilter taaHistoryFilter() const {return taaHistoryFilter_;}
+  bool taaEnabled() const {return taaEnabled_;}
+  bool taaActive() const {return lastTaaActive_;}
+  bool temporalJitterEnabled() const { return temporalJitterEnabled_; }
+  void invalidateTemporalHistory();
+  TemporalCamera const &temporalCamera() const { return lastTemporalCamera_; }
   DrawStatistics const &drawStatistics() const { return drawStatistics_; }
+  // Explicit offline capture. Complete scene lists required; drains frame users
+  // before capture/publication and never acquires or presents a swapchain image.
+  void captureLocalProbe(SceneDrawList const &, LightingSettings const &);
+  bool localProbeValid() const { return probeValid_; }
+  unsigned sunCascadesAssigned() const { return unsigned(lastIndoor_.sun.params.x); }
+  SunCascadeGpu const &sunCascades() const { return lastIndoor_.sun; }
+  unsigned spotShadowsAssigned() const { return lastIndoor_.counts.x; }
+  unsigned spotShadowsRequested() const { return lastIndoor_.counts.y; }
+  bool localProbeMatches(LightingSettings const &) const;
+  bool clusterSupported() const { return clusterSupported_; }
+  ClusterGrid const &clusterGrid() const { return lastClusterGrid_; }
   std::string const &renderGraphDump() const { return lastGraphDump_; }
 
   PreparedScene prepareScene(AssetLibrary const &assets);
@@ -170,11 +194,23 @@ private:
     vk::raii::Semaphore imageAvailableSemaphore = nullptr;
     vk::raii::Fence inFlightFence = nullptr;
     Device::BufferResources uniform;
+    Device::BufferResources punctualLights;
+    std::size_t punctualCapacity = 0;
+    Device::BufferResources clusterConfig, clusterIndices;
+    Device::BufferResources motionBuffer;
+    std::size_t motionCapacityBytes = sizeof(MotionObjectGpu);
+    std::optional<TemporalSnapshot> temporal;
+    Device::BufferResources indoorBuffer;
+    IndoorLightingGpu indoor;
+    std::size_t clusterCapacityBytes = 4;
+    ClusterGrid clusterGrid;
+    RenderGraph::BufferState clusterState;
     vk::DescriptorSet descriptorSet = nullptr;
-    vk::raii::QueryPool timestamps = nullptr;
+    vk::raii::QueryPool timestamps = nullptr,taaTimestamps=nullptr;
+    bool taaEnabled=false;
     std::uint64_t frameId = 0;
     bool submitted = false;
-    bool shadowEnabled = false, uiEnabled = false;
+    bool shadowEnabled = false, uiEnabled = false, clusterEnabled = false;
   };
 
   struct ActiveFrameState {
@@ -235,7 +271,7 @@ private:
     eMain,
   };
 
-  static constexpr std::uint32_t kShadowMapSize = 2048;
+  static constexpr std::uint32_t kShadowMapSize = 2048, kShadowAtlasWidth = 4096;
 
   static std::vector<char> readBinaryFile(char const *path);
 
@@ -250,11 +286,20 @@ private:
   std::uint64_t submittedFrameId_ = 0;
   void createPersistentResources();
   void createFrameResources();
+  void createClusterPipeline();
+  void updateFrameClusters(FrameContext &frame, ClusterGrid const &grid);
   MeshGpuResources createGeometryResources(Mesh const &mesh,
                                            UploadBatch &uploads,
                                            ResourceLedger::Scope scope = {});
   void createCommandBuffers();
   void createCommandPool();
+  // Call only after this slot's fence completes, before image acquisition.
+  FrameResult beginFrameImpl(glm::mat4 const &, glm::vec3 const &,
+                             LightingSettings const &, bool, std::span<MotionObject const>);
+  void updateFrameMotion(FrameContext &, TemporalSnapshot &&);
+  DepthResources createMotionResources(vk::Extent2D) const;
+  void updateFrameLights(FrameContext &frame,
+                         PackedPunctualLights const &lights);
   void updateFrameUniformBuffer(FrameContext &frame,
                                 glm::mat4 const &viewProjMatrix,
                                 glm::vec3 const &cameraPosition,
@@ -279,20 +324,35 @@ private:
 
   struct FrameGraph {
     RenderGraph::Plan plan;
-    RenderGraph::ImageId shadow{}, depth{}, hdr{}, output{};
-    std::optional<RenderGraph::PassId> shadowPass, uiPass;
+    RenderGraph::ImageId shadow{}, depth{}, hdr{}, motion{}, output{};
+    std::optional<RenderGraph::PassId> shadowPass, uiPass, clusterPass;
+    RenderGraph::BufferId clusterIndices{};
     RenderGraph::PassId mainPass{}, outputPass{};
+    std::optional<TaaResolve::Frame> taa;
   };
   struct ImageStates {
-    RenderGraph::State shadow, depth, hdr;
+    RenderGraph::State shadow, depth, hdr, motion;
     std::vector<RenderGraph::State> output;
   } imageStates_;
   FrameGraph buildFrameGraph(std::uint32_t imageIndex, bool shadows) const;
   FrameResult finishFrame(SceneDrawList const &scene);
   void recordGraph(SceneDrawList const &scene);
   void recordObject(MeshId meshId, MaterialId materialId,
-                    glm::mat4 const &modelMatrix);
+                    glm::mat4 const &modelMatrix, std::uint32_t motionIndex = 0);
   void recordEnvironment();
+  void recordShadowTiles(SceneDrawList const &);
+  int activeShadowIndex_ = -1;
+  bool activeSunShadow_ = true;
+  IndoorLightingGpu lastIndoor_;
+  IndoorLightingGpu makeIndoorLighting(LightingSettings const &, PackedPunctualLights &, bool) const;
+  BakedEnvironment globalEnvironment_;
+  EnvironmentSh probeSh_;
+  bool probeValid_ = false;
+  LocalProbeSettings capturedProbe_;
+  std::vector<std::byte> capturedLightingKey_, capturedGeometryKey_;
+  bool probeGeometryDirty_ = false, probeMaterialsDirty_ = false;
+  std::vector<std::byte> probeGeometryKey(SceneDrawList const &) const;
+  std::vector<std::byte> probeLightingKey(LightingSettings const &) const;
   void recordAabb(Aabb const &bounds, glm::vec4 const &color);
   void validateDrawItem(DrawItem const &item, bool caster) const;
   RenderGraph::State const &hdrState() const;
@@ -321,6 +381,15 @@ private:
                        vk::CullModeFlagBits cullMode) const;
 
 private:
+  TaaHistoryFilter taaHistoryFilter_=TaaHistoryFilter::CatmullRom;
+  bool taaEnabled_=false,lastTaaActive_=false;
+  std::unique_ptr<TaaResolve> taa_;
+  TaaPush taaPush_;
+  TemporalMotionHistory temporalHistory_;
+  TemporalCamera lastTemporalCamera_;
+  bool temporalJitterEnabled_ = false;
+  DepthResources motionResources_{};
+  static constexpr vk::Format kMotionFormat = vk::Format::eR16G16B16A16Sfloat;
   DepthResources depthResources_{};
   std::unique_ptr<HdrOutput> hdrOutput_;
   DisplaySettings displaySettings_;
@@ -354,6 +423,10 @@ private:
   ResourceLedger::Lease frameDescriptorAccounting_;
   vk::raii::DescriptorPool frameDescriptorPool_ = nullptr;
 
+  bool clusterSupported_ = false;
+  ClusterGrid lastClusterGrid_;
+  vk::raii::PipelineLayout clusterPipelineLayout_ = nullptr;
+  vk::raii::Pipeline clusterPipeline_ = nullptr;
   vk::raii::PipelineLayout pipelineLayout_ = nullptr;
   vk::raii::Pipeline graphicsPipeline_ = nullptr;
   vk::raii::Pipeline mirroredGraphicsPipeline_ = nullptr;

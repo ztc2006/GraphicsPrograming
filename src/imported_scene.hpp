@@ -11,4 +11,5 @@ struct ImportedScene {
   std::vector<Material> materials;
   std::vector<SceneObject> objects;
   std::vector<std::string> warnings;
+  std::vector<PunctualLight> lights;
 };

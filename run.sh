@@ -25,6 +25,7 @@ Relative model paths are resolved from the caller's current directory.
   --release      Configure an optimized Release build.
   --benchmark DIR --warmup S --duration S --size WIDTHxHEIGHT
   --frames-in-flight 1|2 --present-sync auto|fence|legacy
+  --light-culling full|clustered --lighting-preset auto|asset|kitchen
   --camera-path static|orbit --present auto|fifo|mailbox|immediate
   --gpu NAME --no-ui --validation are forwarded to the viewer.
 EOF
@@ -38,7 +39,7 @@ while (($#)); do
     --benchmark)
       (($# >= 2)) || fail "$1 requires an output directory"
       VIEWER_ARGS+=("$1" "$(realpath -m -- "$2")"); shift ;;
-    --warmup|--duration|--size|--camera-path|--present|--gpu|--frames-in-flight|--present-sync)
+    --warmup|--duration|--size|--camera-path|--light-culling|--lighting-preset|--present|--gpu|--frames-in-flight|--present-sync)
       (($# >= 2)) || fail "$1 requires a value"
       VIEWER_ARGS+=("$1" "$2"); shift ;;
     --no-ui|--validation) VIEWER_ARGS+=("$1") ;;

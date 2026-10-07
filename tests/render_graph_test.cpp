@@ -1,5 +1,6 @@
 #include "render_graph.hpp"
 #include <iostream>
+#include <algorithm>
 #include <stdexcept>
 
 namespace {
@@ -167,10 +168,83 @@ void validation() {
   present.exportImage(presentId, G::Usage::Present);
   rejects([&] { present.compile(); }, "Offscreen image presented");
 }
+void bufferContracts() {
+  auto description = G::Buffer{"lights", vk::Buffer(reinterpret_cast<VkBuffer>(std::uintptr_t(12))),
+      0, 128, vk::BufferUsageFlagBits::eStorageBuffer,
+      {vk::PipelineStageFlagBits2::eHost, vk::AccessFlagBits2::eHostWrite, true}};
+  G g;
+  auto lights = g.importBuffer(description);
+  description.name = "indices"; description.buffer = vk::Buffer(reinterpret_cast<VkBuffer>(std::uintptr_t(13)));
+  description.initial = {};
+  auto indices = g.importBuffer(description);
+  auto cull = g.addPass("cull", {}, {{lights, G::BufferUsage::ComputeRead},
+                                    {indices, G::BufferUsage::ComputeWrite, true}});
+  auto draw = g.addPass("draw", {}, {{lights, G::BufferUsage::FragmentRead},
+                                    {indices, G::BufferUsage::FragmentRead}});
+  auto plan = g.compile();
+  require(plan.passes()[1].dependencies == std::vector{cull}, "Compute RAW edge missing");
+  auto barrier = plan.passes()[1].bufferBarriers.back();
+  require(barrier.srcStageMask == vk::PipelineStageFlagBits2::eComputeShader &&
+          barrier.dstStageMask == vk::PipelineStageFlagBits2::eFragmentShader &&
+          barrier.srcAccessMask == vk::AccessFlagBits2::eShaderStorageWrite &&
+          barrier.dstAccessMask == vk::AccessFlagBits2::eShaderStorageRead && barrier.size == 128,
+          "Compute-to-fragment storage barrier mismatch");
+  require(std::any_of(plan.passes()[1].bufferBarriers.begin(), plan.passes()[1].bufferBarriers.end(),
+      [&](auto const &b) { return b.buffer == g.compile().passes()[0].bufferBarriers[0].buffer &&
+          bool(b.srcAccessMask & vk::AccessFlagBits2::eHostWrite) &&
+          bool(b.dstStageMask & vk::PipelineStageFlagBits2::eFragmentShader); }),
+      "Read-to-read stage change lost original writer visibility");
+  require(plan.finalBufferState(indices).defined, "Cluster buffer remains undefined");
+  auto rewrite = g.addPass("rewrite", {}, {{indices, G::BufferUsage::ComputeWrite, true}});
+  auto again = g.compile();
+  require(again.passes().back().dependencies == std::vector{cull, draw}, "Buffer WAR/WAW missing");
+  g.dependsOn(cull, rewrite);
+  rejects([&] { g.compile(); }, "Buffer hazard cycle accepted");
+  G vertexGraph;
+  auto hostDescription=description;
+  hostDescription.initial={vk::PipelineStageFlagBits2::eHost, vk::AccessFlagBits2::eHostWrite, true};
+  auto shadowConfig=vertexGraph.importBuffer(hostDescription);
+  vertexGraph.addPass("shadow vertex",{},{{shadowConfig,G::BufferUsage::VertexRead}});
+  vertexGraph.addPass("main fragment",{},{{shadowConfig,G::BufferUsage::FragmentRead}});
+  auto vertexPlan=vertexGraph.compile();
+  for (unsigned pass=0;pass<2;++pass) {
+    auto b=vertexPlan.passes()[pass].bufferBarriers.at(0);
+    require(bool(b.srcStageMask & vk::PipelineStageFlagBits2::eHost) &&
+      bool(b.srcAccessMask & vk::AccessFlagBits2::eHostWrite) &&
+      b.dstStageMask==(pass==0?vk::PipelineStageFlagBits2::eVertexShader:vk::PipelineStageFlagBits2::eFragmentShader),
+      "Host config write not made visible to both shadow vertex and main fragment");
+  }
+  G bad; auto unknown = bad.importBuffer(description);
+  bad.addPass("read", {}, {{unknown, G::BufferUsage::FragmentRead}});
+  rejects([&] { bad.compile(); }, "Undefined buffer read accepted");
+  rejects([&] { bad.importBuffer(description); }, "Duplicate buffer identity accepted");
+  G partial; auto partialId = partial.importBuffer(description);
+  partial.addPass("partial", {}, {{partialId, G::BufferUsage::ComputeWrite}});
+  partial.addPass("read", {}, {{partialId, G::BufferUsage::ComputeRead}});
+  rejects([&] { partial.compile(); }, "Undefined partial buffer contents accepted");
+  G same; auto sameId = same.importBuffer(description);
+  same.addPass("duplicate", {}, {{sameId, G::BufferUsage::ComputeWrite, true},
+                                 {sameId, G::BufferUsage::FragmentRead}});
+  rejects([&] { same.compile(); }, "Buffer feedback accepted");
+}
+void motionMrt() {
+  G g; auto hdr=g.importImage(image(1)), velocity=g.importImage(image(2));
+  auto main=g.addPass("MRT",{color(hdr),color(velocity)});
+  g.addPass("Read HDR and motion",{{hdr,G::Usage::SampledColor},{velocity,G::Usage::SampledColor}});
+  auto plan=g.compile();
+  require(plan.passes()[1].dependencies==std::vector{main} && plan.passes()[1].barriers.size()==2,
+      "MRT targets did not each receive dependency/barrier");
+  require(plan.finalState(hdr).defined && plan.finalState(velocity).defined,
+      "MRT contents were not both preserved");
+  G limit; std::vector<G::Use> uses;
+  for(unsigned i=1;i<=5;++i)uses.push_back(color(limit.importImage(image(i))));
+  limit.addPass("Too many targets",std::move(uses));
+  rejects([&]{limit.compile();},"Graph exceeded guaranteed four color targets");
+}
 } // namespace
 int main() {
   try {
-    sceneGraph(); dependencies(); contentContracts(); validation();
+    sceneGraph(); dependencies(); contentContracts(); validation(); bufferContracts(); motionMrt();
     std::cout << "PASS graph compiler: RAW/WAR/WAW, stable topology/cycle rejection, "
                  "depth scopes, UI same-layout LOAD, content validity, exports, pure compile\n";
     return 0;

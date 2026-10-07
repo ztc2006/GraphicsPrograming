@@ -21,8 +21,8 @@ void writeBenchmarkReport(std::filesystem::path const &directory,
   csv << std::setprecision(9)
       << "frame_id,elapsed_s,cpu_frame_ms,cpu_prepare_ms,fence_wait_ms,acquire_"
          "ms,submit_ms,present_call_ms,gpu_valid,gpu_total_ms,gpu_shadow_ms,"
-         "gpu_main_ms,gpu_output_ms,gpu_ui_ms,shadow_draws,main_draws\n";
-  std::vector<double> cpu, gpu, prepare, shadow, main, output, ui;
+         "gpu_main_ms,gpu_output_ms,gpu_ui_ms,gpu_culling_ms,clustered_active,shadow_draws,main_draws,gpu_taa_ms\n";
+  std::vector<double> cpu, gpu, prepare, shadow, main, output, ui, culling, taa;
   for (auto const &f : frames) {
     cpu.push_back(f.cpuFrameMs);
     prepare.push_back(f.cpuPrepareMs);
@@ -35,11 +35,15 @@ void writeBenchmarkReport(std::filesystem::path const &directory,
       main.push_back(f.gpu.mainMs);
       output.push_back(f.gpu.outputMs);
       ui.push_back(f.gpu.uiMs);
+      culling.push_back(f.gpu.cullingMs);
+      taa.push_back(f.gpu.taaMs);
       csv << f.gpu.totalMs << ',' << f.gpu.shadowMs << ',' << f.gpu.mainMs
-          << ',' << f.gpu.outputMs << ',' << f.gpu.uiMs;
+          << ',' << f.gpu.outputMs << ',' << f.gpu.uiMs << ',' << f.gpu.cullingMs;
     } else
-      csv << ",,,,";
-    csv << ',' << f.shadowDraws << ',' << f.mainDraws << '\n';
+      csv << ",,,,,";
+    csv << ',' << f.gpu.clustered << ',' << f.shadowDraws << ',' << f.mainDraws << ',';
+    if(f.gpu.valid)csv<<f.gpu.taaMs;
+    csv<<'\n';
   }
   json << std::boolalpha << std::setprecision(9) << "{\n  \"schema\": 4,\n";
   auto text = [&](char const *key, std::string const &v) {
@@ -52,9 +56,22 @@ void writeBenchmarkReport(std::filesystem::path const &directory,
   text("vulkan_api", m.api);
   text("scene", m.scene);
   text("camera_path", m.cameraPath);
+  text("light_culling_requested", m.lightCulling);
+  text("lighting_preset", m.lightingPreset);
+  json << "  \"punctual_light_count\": " << m.punctualLightCount
+       << ",\n  \"spot_shadow_count\": " << m.spotShadowCount
+       << ",\n  \"sun_cascade_count\": " << m.sunCascadeCount
+       << ",\n  \"sun_shadow_distance\": " << m.sunShadowDistance
+       << ",\n  \"local_probe_valid\": " << m.localProbeValid << ",\n";
   text("present_mode", m.presentMode);
   text("build_type", m.buildType);
-  text("frame_target_policy", "shared_hdr_depth_shadow");
+  text("taa_history_filter",m.taaHistoryFilter);
+  text("taa_history_lattice","unjittered_output");
+  text("frame_target_policy", "shared_hdr_depth_motion_shadow");
+  json << "  \"motion_vectors_enabled\": true,\n"
+       << "  \"taa_enabled\": " << m.taaEnabled << ",\n"
+       << "  \"temporal_jitter_enabled\": " << m.temporalJitterEnabled << ",\n"
+       << "  \"temporal_camera_history_valid\": " << m.temporalHistoryValid << ",\n";
   text("present_sync_backend", m.presentSyncBackend);
   text("present_sync_reason", m.presentSyncReason);
   json << "  \"present_fences_enabled\": " << m.presentFencesEnabled
@@ -147,6 +164,8 @@ void writeBenchmarkReport(std::filesystem::path const &directory,
   stats("gpu_total_ms", gpu);
   stats("gpu_shadow_ms", shadow);
   stats("gpu_main_ms", main);
+  stats("gpu_culling_ms", culling);
+  stats("gpu_taa_ms", taa);
   stats("gpu_output_ms", output);
   stats("gpu_ui_ms", ui);
   json

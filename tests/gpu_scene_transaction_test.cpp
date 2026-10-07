@@ -613,7 +613,7 @@ void exerciseCanceledUpload(Renderer &renderer, Device const &device,
 void exercise(Renderer &renderer, Device const &device,
               AssetLibrary const &assets) {
   auto initial = renderer.resourceStatistics();
-  require(initial.environmentUploads == 1 && initial.pipelineBuilds == 12,
+  require(initial.environmentUploads == 1 && initial.pipelineBuilds == 13 + (renderer.clusterSupported() ? 1 : 0),
           "Initial environment and material pipelines are missing");
   unsigned uiCalls = 0, releases = 0;
   renderer.setUiDrawCallback([&](vk::CommandBuffer) { ++uiCalls; });
@@ -886,18 +886,33 @@ int main(int argc, char **argv) {
     std::cout << "Presentation backend: "
               << presentationBackendName(device.presentationSupport().backend)
               << " (" << device.presentationSupport().reason << ")\n";
+    SwapChain swapchain(device, surface, window);
+    unsigned framesInFlight = argc > 1 ? std::stoul(argv[1]) : 1;
+    if (argc > 3 && std::string_view(argv[3]) == "taa") {
+      exerciseTaaResolve(device,swapchain,framesInFlight);
+    } else if (argc > 3 && std::string_view(argv[3]) == "motion") {
+      exerciseTemporalMotion(device, swapchain, framesInFlight);
+      exerciseFrameContexts(device, swapchain);
+    } else if (argc > 3 && std::string_view(argv[3]) == "csm") {
+      exerciseSunCascades(device, swapchain, framesInFlight);
+      exerciseFrameContexts(device, swapchain);
+    } else if (argc > 3 && std::string_view(argv[3]) == "indoor") {
+      exerciseIndoorLighting(device, swapchain, framesInFlight);
+    } else if (argc>5 && (std::string_view(argv[3])=="kitchen" || std::string_view(argv[3])=="kitchen-colour")) {
+      exerciseKitchenScene(device,swapchain,framesInFlight,argv[4],argv[5],std::string_view(argv[3])=="kitchen-colour");
+    } else {
     exerciseGpuAllocator(device);
     exerciseImageAllocator(device);
     exerciseHdrAllocation(device);
     exerciseTextureMips(device);
     exerciseHdrOutput(device);
-    SwapChain swapchain(device, surface, window);
-    unsigned framesInFlight = argc > 1 ? std::stoul(argv[1]) : 1;
     exercisePresentation(device, swapchain, framesInFlight);
     exerciseHdrScene(device, swapchain, framesInFlight);
     exerciseMaterialContract(device, swapchain, framesInFlight);
     exerciseEnvironmentIbl(device, swapchain, framesInFlight);
     exerciseSpecularExtension(device, swapchain, framesInFlight);
+    exerciseSpecularAa(device, swapchain, framesInFlight);
+    exercisePunctualLights(device, swapchain, framesInFlight);
     exerciseFrameContexts(device, swapchain);
     {
       std::unique_ptr<SwapChain> resized;
@@ -954,8 +969,8 @@ int main(int argc, char **argv) {
           auto after = snapshot.at(ResourceLedger::Domain::Persistent);
           auto expected = before.payloadBytes -
                           std::uint64_t(swapchain.extent().width) *
-                              swapchain.extent().height * 12 +
-                          std::uint64_t(size.width) * size.height * 12;
+                              swapchain.extent().height * 44 +
+                          std::uint64_t(size.width) * size.height * 44;
           if (after.payloadBytes != expected || after.images != before.images ||
               after.imageViews != before.imageViews)
             std::cerr << "Resize " << size.width << 'x' << size.height
@@ -1008,6 +1023,7 @@ int main(int argc, char **argv) {
         device.logicalDevice().waitIdle();
         throw;
       }
+    }
     }
     require(device.resourceLedger().snapshot().current ==
                 ResourceLedger::Footprint{},

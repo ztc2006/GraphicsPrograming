@@ -1,6 +1,6 @@
 # Renderer 阶段执行清单
 
-更新：2026-10-04。当前入口：M3-A typed mip/过滤/alpha coverage；M2-C2 扩展呈现生命周期软件增量已交付；M2-A 线性 HDR/统一显示输出与 M2-B 最小单队列图已交付软件实现；M1-C cgltf 与 VMA buffer/image/staging 适配已交付。正式范围与依赖以 [Engine_Roadmap.md](./Engine_Roadmap.md) 为准；代码依据见 [Renderer_Design_Review.md](./Renderer_Design_Review.md)。
+更新：2026-10-07。当前入口：M6-C剩余固定轨迹/呈现审查；历史重建改进已交付；M6-B已接入并通过RTX原生X11回归；M6-A运动矢量/jitter软件增量已交付；M5-A 稳定 CSM 与厨房阴影/探针软件增量已交付；M4-B GPU clustered 软件增量已交付；M4-A 多光源普通 forward 软件基线已交付；M3-A/B/C 软件增量已交付，硬件验收仍延后；M2-C2 扩展呈现生命周期软件增量已交付；M2-A 线性 HDR/统一显示输出与 M2-B 最小单队列图已交付软件实现；M1-C cgltf 与 VMA buffer/image/staging 适配已交付。正式范围与依赖以 [Engine_Roadmap.md](./Engine_Roadmap.md) 为准；代码依据见 [Renderer_Design_Review.md](./Renderer_Design_Review.md)。
 
 旧生命周期重构方案已归档到 [完整旧版](./docs/archive/Renderer_Refactor_Checklist_before_2026-10-02.md)，其中先销毁旧资源、Windows launcher 和三角形验收等规则不再生效。
 
@@ -67,18 +67,28 @@
 - [x] M3-A1：18/18 CPU/软件 Vulkan 回归、ASan/UBSan、SPIR-V validation；真实 mip 回读/六种过滤/LOD/wrap、异步/取消/退休/归零，四合院一/两帧报告一致。见 [实施](docs/M3_A1_Texture_Mips_Implementation.md)。
 - [x] M3-A2：单来源 alpha coverage/阈值身份、共享 LOD 0 编辑/复合/vertex/POM 回退、COLOR_0 alpha、固定 Mikk seam、双面法线与负缩放单面剔除；19/19 CPU/软件 Vulkan、sanitizer、生产 main/shadow/normal 像素与四合院报告通过。见 [实施](docs/M3_A2_Material_Implementation.md)。
 - [x] M3-C1：specular 因子/双贴图/独立 UV/sampler、直接光/IBL 的 F0/F90 与 scalar diffuse、UI debug 和参考球；20/20 软件测试、ASan/UBSan、SPIR-V、四合院报告与归零通过。见 [实施](docs/M3_C1_Specular_Implementation.md)。
-- [ ] M3-C2：法线方差过滤/镜面抗锯齿；运动画质和 GPU 成本等换机验收。
+- [x] M3-C2：一阶矩/法线长度损失、几何导数过滤、统一直接光/IBL 粗糙度、开关/参考场景；20/20 软件回归、sanitizer/SPIR-V、四合院 GPU 账本零增量。见 [实施](docs/M3_C2_Specular_AA_Implementation.md)。运动画质和 GPU 成本等换机验收。
+- [x] M4-A：KHR_lights_punctual glTF/GLB/UI、单位/变换/衰减/锥角校验、per-slot SSBO与65灯扩容、共用C1/C2 PBR；21/21软件回归、ASan/UBSan、SPIR-V、HDR/pending槽/原子加载与四合院报告通过。见 [实施](docs/M4_A_Punctual_Implementation.md)。新增灯暂不投影。
+- [x] M4-B：64×64/24深度分区、透明/无限灯/溢出完整回退、GPU索引/per-slot扩容、最小图buffer合同与屏障、full开关/计数debug/culling查询；22/22软件回归、84组完整HDR对照、双pending槽与CPU sanitizer/SPIR-V通过。见 [实施](docs/M4_B_Clustered_Implementation.md)。
+- [ ] M4-B：4060 Ti 实际剔除收益/成本、低灯数阈值、内存/RenderDoc及运动画质验收。
 - [x] M3-B：GGX 环境预过滤、BRDF LUT、准确 SH 投影与版本化磁盘缓存；20/20 CPU/软件 Vulkan、sanitizer、六面/mip/LUT 回读、生产 PBR 视角/旋转/能量、四合院报告与归零通过。见 [实施](docs/M3_B_IBL_Implementation.md)。
 - [ ] M3：材质球与四合院最终参考画质、运动缝隙/高光与 GPU 时间等 4060 Ti 验收。
-- [ ] M4：普通多灯 forward 先作为正确性对照，再接 clustered light culling；低灯数成本与溢出有回退。
-- [ ] M5：稳定 CSM、边界混合与偏移测试；四盏重点聚光灯阴影额度及投影者剔除。
+- [x] M4 软件实现：普通多灯 forward 作数值对照，GPU clustered候选灯列表、手动full及溢出回退已接入；目标硬件收益仍在上项验收。
+- [x] M5-A：1/2/4级稳定CSM、混合/渐退、世界单位偏移/PCF接收面校正、UI/报告；28/28软件回归、sanitizer/SPIR-V和厨房/四合院共9个query rows通过。见[实施](docs/M5_A_CSM_Implementation.md)。
+- [ ] M5-A：4060 Ti固定轨迹、薄墙/叶片、接触/acne、RenderDoc/validation与GPU成本；投影者剔除/分辨率档等测量。
+- [x] 厨房修复：四盏聚光灯图集额度、投影/逐帧更新/PCF tile clamp；投影者目前完整绘制，剔除后续。
 
 ## M6–M8：运动画质和局部效果
 
-- [ ] M6：相机/物体运动矢量、jitter、历史拒绝与 clamp；透明、灯光变化和曝光变化测试。
-- [ ] M6：场景切换、相机跳变、resize 清历史；固定轨迹检查拖影与细节损失。
+- [x] M6-A 软件：提交顺序的前帧相机/实例、每槽motion数据、主场景MRT、jitter/未抖动CSM、天空/alpha边界、模型和帧槽数值回读。
+- [x] M6-A 软件：场景提交、camera index/reset、resize和jitter切换重置前帧状态；capture与失败请求不推进历史。
+- [x] M6-B实现：前帧线性深度、HDR历史重投影、遮挡显露拒绝、邻域clamp和运动权重；32项RTX、双pending TAA与软件fixture通过。
+- [x] M6-C实现：未抖动历史网格、CR/足迹深度资格验证、透明历史泄漏修复、材质/曝光状态、着色矛盾响应与数值reference。
+- [ ] M6-C最终画质：固定轨迹的透明/移动灯、镜面细节、alpha mask/薄线运动稳定性；legacy/EXT呈现两次超时仍需定位。
+- [ ] M6：TAA颜色/深度历史在场景切换、相机跳变、resize失效；固定轨迹检查拖影与细节损失，4060 Ti画质/时序/内存验收。
 - [ ] M7：GTAO 与滤波，正确调制间接光；可控 Bloom 与可关闭自动曝光。
-- [ ] M8：静态/按需局部探针、预过滤、箱体视差校正、混合与更新状态。
+- [x] 厨房修复：单房间按需捕获、SH/GGX、箱体视差校正、范围和更新状态。
+- [ ] M8：多探针混合、探针导入和覆盖交界；SSR。
 - [ ] M8：SSR 深度层级与置信度、时间稳定和 probe fallback；镜面来源不重复累加。
 
 ## 每次验收记录

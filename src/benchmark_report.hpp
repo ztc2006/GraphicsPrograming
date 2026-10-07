@@ -16,8 +16,15 @@ struct BenchmarkFrame {
 
 struct BenchmarkMetadata {
   std::string projectSourceSha256;
-  std::string gpu, deviceType, driver, api, scene, cameraPath, presentMode,
+  std::string gpu, deviceType, driver, api, scene, cameraPath, lightCulling, presentMode,
       buildType;
+  std::string lightingPreset = "asset";
+  unsigned punctualLightCount = 0, spotShadowCount = 0, sunCascadeCount = 0;
+  float sunShadowDistance = 0;
+  bool localProbeValid = false;
+  std::string taaHistoryFilter="catmull-rom";
+  bool taaEnabled=false;
+  bool temporalJitterEnabled = false, temporalHistoryValid = false;
   unsigned width = 0, height = 0;
   unsigned framesInFlight = 1, swapchainImageCount = 0;
   std::string presentSyncBackend = "legacy_wait_idle", presentSyncReason;

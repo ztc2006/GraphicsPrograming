@@ -23,7 +23,10 @@ struct PushConstants {
   glm::vec4 materialTint{1.0f};
   glm::vec4 surfaceParams{1.0f, 0.04f, 0.0f, 0.0f};
   glm::vec4 alphaParams{0.0f, 0.5f, 0.0f, 0.0f};
+  glm::ivec4 shadowPass{-1, 0, 0, 0};
 };
+
+static_assert(sizeof(PushConstants) == 128);
 
 struct FrameUniformBufferObject {
   glm::mat4 viewProj{1.0f};
@@ -31,13 +34,17 @@ struct FrameUniformBufferObject {
   glm::vec4 lightDirection{0.0f, 1.0f, 0.3f, 0.0f};
   glm::vec4 lightColor{1.0f, 0.98f, 0.92f, 1.0f};
   glm::vec4 ambientColor{0.08f, 0.08f, 0.1f, 1.0f};
-  glm::vec4 lightingParams{1.0f, 0.35f, 32.0f, 0.0f};
+  glm::vec4 lightingParams{1.0f, 0.35f, 1.0f, 0.0f};
   glm::mat4 lightViewProj{1.0f};
   glm::vec4 shadowParams{0.0025f, 0.0007f, 1.0f, 1.0f};
   glm::mat4 inverseViewProj{1.0f};
   glm::vec4 environmentParams{1.0f, 0.0f, 0.0f, 0.0f};
   std::array<glm::vec4, 9> environmentSh{};
+  glm::mat4 currentViewProj{1}, previousViewProj{1};
+  glm::vec4 previousCamera{}, jitterUv{};
 };
+static_assert(sizeof(FrameUniformBufferObject) == 608);
+static_assert(offsetof(FrameUniformBufferObject, currentViewProj) == 448);
 
 glm::mat4 computeLightViewProj(glm::vec3 direction,
                                LightingSettings const &lighting) {
@@ -171,10 +178,15 @@ void Renderer::recreateForSwapChain(SwapChain const &swapChain) {
                                            vk::Fence{});
   SwapChain const *newSwapChain = &swapChain;
   DepthResources newDepthResource = createDepthResources(swapChain);
+  auto newMotionResource = createMotionResources(swapChain.extent());
   auto newHdrOutput = std::make_unique<HdrOutput>(device_, swapChain.extent(),
                                                   swapChain.imageFormat());
 
+  auto newTaa=std::make_unique<TaaResolve>(device_,swapChain.extent(),newHdrOutput->sceneView(),*newDepthResource.imageView,*newMotionResource.imageView);
+  newHdrOutput->configureTemporalViews({newTaa->colorView(0),newTaa->colorView(1)});
   using std::swap;
+  swap(taa_,newTaa);
+  lastTaaActive_=false;
   swap(pipelineLayout_, newPipelineLayout);
   swap(graphicsPipeline_, newGraphicsPipeline);
   swap(doubleSidedGraphicsPipeline_, newDoubleSidedGraphicsPipeline);
@@ -191,6 +203,10 @@ void Renderer::recreateForSwapChain(SwapChain const &swapChain) {
   swap(imagesInFlight_, newImagesInFlight);
   swap(swapChain_, newSwapChain);
   swap(depthResources_, newDepthResource);
+  swap(motionResources_, newMotionResource);
+  temporalHistory_.reset();
+  lastTemporalCamera_ = {};
+  imageStates_.motion = {};
   swap(hdrOutput_, newHdrOutput);
   imageStates_.depth = {};
   imageStates_.hdr = {};
@@ -198,7 +214,7 @@ void Renderer::recreateForSwapChain(SwapChain const &swapChain) {
   currentFrame_ = 0;
   activeFrame_.reset();
   activePass_ = ActivePass::eNone;
-  resourceStatistics_.pipelineBuilds += 12;
+  resourceStatistics_.pipelineBuilds += 13;
 }
 
 void Renderer::createPersistentResources() {
@@ -213,6 +229,7 @@ void Renderer::createPersistentResources() {
       loadHdrImage("assets/environments/environment.hdr");
   auto bake = loadOrBakeEnvironment(environment, {}, ".cache/ibl");
   environmentSh_ = bake.data.sh;
+  globalEnvironment_ = bake.data;
   TextureLoader environmentLoader(
       device_,
       device_.resourceLedger().scope(ResourceLedger::Domain::Persistent));
@@ -241,6 +258,7 @@ void Renderer::createPersistentResources() {
   createFrameDescriptorPool();
   allocateAndWriteFrameDescriptorSets();
   createCommandBuffers();
+  createClusterPipeline();
   device_.nameObject(*shadowResources_.storage.image,
                      "Directional shadow depth");
   device_.nameObject(environmentTexture_.image(), "HDR environment");
@@ -253,6 +271,13 @@ void Renderer::createPersistentResources() {
 
 void Renderer::createFrameResources() {
   auto properties = device_.physicalDevice().getProperties();
+  auto const &limits = properties.limits;
+  if (limits.maxPerStageDescriptorStorageBuffers < 4 ||
+      limits.maxDescriptorSetStorageBuffers < 4 ||
+      limits.maxPerStageResources < 22)
+    throw std::runtime_error("Punctual lights require fragment storage buffer "
+                             "and 22 stage resources");
+  auto capacity = punctualCapacity(0, 0, limits.maxStorageBufferRange);
   timestampPeriod_ = properties.limits.timestampPeriod;
   timestampBits_ =
       device_.physicalDevice()
@@ -264,10 +289,11 @@ void Renderer::createFrameResources() {
   for (std::uint32_t index = 0; index < framesInFlight_; ++index) {
     FrameContext frame{};
     if (timestampBits_) {
+      frame.taaTimestamps=vk::raii::QueryPool(device_.logicalDevice(),vk::QueryPoolCreateInfo{.queryType=vk::QueryType::eTimestamp,.queryCount=2});
       frame.timestamps = vk::raii::QueryPool(
           device_.logicalDevice(),
           vk::QueryPoolCreateInfo{.queryType = vk::QueryType::eTimestamp,
-                                  .queryCount = 10});
+                                  .queryCount = 12});
       device_.nameObject(*frame.timestamps, "Frame GPU timestamps");
     }
     frame.imageAvailableSemaphore =
@@ -280,6 +306,22 @@ void Renderer::createFrameResources() {
         device_.createBuffer(sizeof(FrameUniformBufferObject),
                              vk::BufferUsageFlagBits::eUniformBuffer,
                              vk::MemoryPropertyFlagBits::eHostVisible);
+    frame.motionBuffer = device_.createBuffer(sizeof(MotionObjectGpu), vk::BufferUsageFlagBits::eStorageBuffer, vk::MemoryPropertyFlagBits::eHostVisible);
+    MotionObjectGpu noHistory;
+    frame.motionBuffer.write(std::as_bytes(std::span{&noHistory, 1}));
+    frame.indoorBuffer = device_.createBuffer(sizeof(IndoorLightingGpu), vk::BufferUsageFlagBits::eStorageBuffer, vk::MemoryPropertyFlagBits::eHostVisible);
+    frame.indoorBuffer.write(std::as_bytes(std::span{&frame.indoor, 1}));
+    frame.clusterConfig = device_.createBuffer(sizeof(ClusterGrid), vk::BufferUsageFlagBits::eStorageBuffer, vk::MemoryPropertyFlagBits::eHostVisible);
+    frame.clusterConfig.write(std::as_bytes(std::span{&frame.clusterGrid, 1}));
+    frame.clusterIndices = device_.createBuffer(4, vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferSrc, vk::MemoryPropertyFlagBits::eDeviceLocal);
+    frame.punctualCapacity = capacity;
+    frame.punctualLights = device_.createBuffer(
+        punctualHeaderBytes + capacity * sizeof(GpuPunctualLight),
+        vk::BufferUsageFlagBits::eStorageBuffer,
+        vk::MemoryPropertyFlagBits::eHostVisible);
+    std::array<std::uint32_t, 4> empty{};
+    frame.punctualLights.write(std::as_bytes(std::span{empty}));
+    device_.nameObject(*frame.punctualLights.buffer, "Frame punctual lights");
     frames_.push_back(std::move(frame));
   }
 }
@@ -371,7 +413,7 @@ Renderer::ShadowResources Renderer::createShadowResources() const {
       .format = kDepthFormat,
       .extent =
           {
-              .width = kShadowMapSize,
+              .width = kShadowAtlasWidth,
               .height = kShadowMapSize,
               .depth = 1,
           },
@@ -388,7 +430,7 @@ Renderer::ShadowResources Renderer::createShadowResources() const {
 
   ShadowResources resources;
   resources.storage = device_.createImage(
-      imageCreateInfo, std::uint64_t(kShadowMapSize) * kShadowMapSize * 4,
+      imageCreateInfo, std::uint64_t(kShadowAtlasWidth) * kShadowMapSize * 4,
       vk::MemoryPropertyFlagBits::eDeviceLocal);
 
   vk::ImageViewCreateInfo imageViewCreateInfo{
@@ -526,6 +568,8 @@ bool Renderer::commitScene(PreparedScene &candidate,
         ResourceLedger::Domain::RetiredScene);
   candidate->resourceScope_.setDomain(ResourceLedger::Domain::LiveScene);
   sceneAssets_.swap(candidate);
+  probeValid_ = false;
+  invalidateTemporalHistory();
   candidate.reset();
   ++resourceStatistics_.sceneCommits;
   resourceStatistics_.retiredScenes = retiredScenes_.size();
@@ -539,22 +583,32 @@ MaterialGpuStore &Renderer::materials() const {
 }
 
 void Renderer::setMaterialTint(MaterialId materialId, glm::vec4 const &tint) {
+  bool changed=materials().material(materialId).tint!=tint;
   materials().setMaterialTint(materialId, tint);
+  if(changed && taa_)taa_->reset();
+  probeMaterialsDirty_=true;
 }
 
 void Renderer::setMaterialSurfaceParams(MaterialId materialId,
                                         float normalScale,
                                         float parallaxScale) {
+  auto before=materials().material(materialId).surfaceParams;
   materials().setMaterialSurfaceParams(materialId, normalScale, parallaxScale);
+  if(before!=materials().material(materialId).surfaceParams && taa_)taa_->reset();
+  probeMaterialsDirty_=true;
 }
 
 void Renderer::setMaterialAlphaParams(MaterialId materialId,
                                       AlphaMode alphaMode, float alphaCutoff) {
+  auto before=materials().material(materialId).alphaParams;
   materials().setMaterialAlphaParams(materialId, alphaMode, alphaCutoff);
+  if(before!=materials().material(materialId).alphaParams && taa_)taa_->reset();
+  probeMaterialsDirty_=true;
 }
 
 void Renderer::setSurfaceDebugEnabled(bool normalMapsEnabled,
                                       bool parallaxEnabled) {
+  if(normalMapsEnabled_!=normalMapsEnabled || parallaxEnabled_!=parallaxEnabled){probeMaterialsDirty_=true;if(taa_)taa_->reset();}
   normalMapsEnabled_ = normalMapsEnabled;
   parallaxEnabled_ = parallaxEnabled;
 }
@@ -626,6 +680,19 @@ void Renderer::createFrameDescriptorSetLayout() {
           .descriptorType = vk::DescriptorType::eCombinedImageSampler,
           .descriptorCount = 1,
           .stageFlags = vk::ShaderStageFlagBits::eFragment},
+      vk::DescriptorSetLayoutBinding{
+          .binding = 6,
+          .descriptorType = vk::DescriptorType::eStorageBuffer,
+          .descriptorCount = 1,
+          .stageFlags = vk::ShaderStageFlagBits::eFragment | vk::ShaderStageFlagBits::eCompute},
+      vk::DescriptorSetLayoutBinding{.binding = 7, .descriptorType = vk::DescriptorType::eStorageBuffer,
+          .descriptorCount = 1, .stageFlags = vk::ShaderStageFlagBits::eFragment | vk::ShaderStageFlagBits::eCompute},
+      vk::DescriptorSetLayoutBinding{.binding = 8, .descriptorType = vk::DescriptorType::eStorageBuffer,
+          .descriptorCount = 1, .stageFlags = vk::ShaderStageFlagBits::eFragment | vk::ShaderStageFlagBits::eCompute},
+      vk::DescriptorSetLayoutBinding{.binding=9, .descriptorType=vk::DescriptorType::eStorageBuffer,
+          .descriptorCount=1, .stageFlags=vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment},
+      vk::DescriptorSetLayoutBinding{.binding=10, .descriptorType=vk::DescriptorType::eStorageBuffer,
+          .descriptorCount=1, .stageFlags=vk::ShaderStageFlagBits::eVertex},
   };
 
   vk::DescriptorSetLayoutCreateInfo createInfo{
@@ -646,6 +713,8 @@ void Renderer::createFrameDescriptorPool() {
           .type = vk::DescriptorType::eCombinedImageSampler,
           .descriptorCount = framesInFlight_ * 5,
       },
+      vk::DescriptorPoolSize{.type = vk::DescriptorType::eStorageBuffer,
+                             .descriptorCount = framesInFlight_ * 5},
   };
 
   vk::DescriptorPoolCreateInfo createInfo{
@@ -683,6 +752,15 @@ void Renderer::allocateAndWriteFrameDescriptorSets() {
         .range = sizeof(FrameUniformBufferObject),
     };
 
+    vk::DescriptorBufferInfo motionInfo{.buffer=*frames_[index].motionBuffer.buffer, .range=frames_[index].motionCapacityBytes};
+    vk::DescriptorBufferInfo indoorInfo{.buffer=*frames_[index].indoorBuffer.buffer, .range=sizeof(IndoorLightingGpu)};
+    vk::DescriptorBufferInfo lightInfo{
+        .buffer = *frames_[index].punctualLights.buffer,
+        .offset = 0,
+        .range = punctualHeaderBytes +
+                 frames_[index].punctualCapacity * sizeof(GpuPunctualLight)};
+    vk::DescriptorBufferInfo clusterConfigInfo{.buffer = *frames_[index].clusterConfig.buffer, .range = sizeof(ClusterGrid)};
+    vk::DescriptorBufferInfo clusterIndicesInfo{.buffer = *frames_[index].clusterIndices.buffer, .range = frames_[index].clusterCapacityBytes};
     vk::DescriptorImageInfo shadowImageInfo{
         .sampler = *shadowResources_.sampler,
         .imageView = *shadowResources_.imageView,
@@ -750,6 +828,22 @@ void Renderer::allocateAndWriteFrameDescriptorSets() {
                                .descriptorType =
                                    vk::DescriptorType::eCombinedImageSampler,
                                .pImageInfo = &brdfImageInfo},
+        vk::WriteDescriptorSet{.dstSet = frames_[index].descriptorSet,
+                               .dstBinding = 6,
+                               .descriptorCount = 1,
+                               .descriptorType =
+                                   vk::DescriptorType::eStorageBuffer,
+                               .pBufferInfo = &lightInfo},
+        vk::WriteDescriptorSet{.dstSet = frames_[index].descriptorSet, .dstBinding = 7,
+            .descriptorCount = 1, .descriptorType = vk::DescriptorType::eStorageBuffer,
+            .pBufferInfo = &clusterConfigInfo},
+        vk::WriteDescriptorSet{.dstSet = frames_[index].descriptorSet, .dstBinding = 8,
+            .descriptorCount = 1, .descriptorType = vk::DescriptorType::eStorageBuffer,
+            .pBufferInfo = &clusterIndicesInfo},
+        vk::WriteDescriptorSet{.dstSet=frames_[index].descriptorSet,.dstBinding=10,.descriptorCount=1,
+            .descriptorType=vk::DescriptorType::eStorageBuffer,.pBufferInfo=&motionInfo},
+        vk::WriteDescriptorSet{.dstSet=frames_[index].descriptorSet, .dstBinding=9,
+            .descriptorCount=1, .descriptorType=vk::DescriptorType::eStorageBuffer, .pBufferInfo=&indoorInfo},
     };
 
     device_.logicalDevice().updateDescriptorSets(writes, {});
@@ -760,10 +854,16 @@ Renderer::FrameResult Renderer::beginFrame(glm::mat4 const &viewProjMatrix,
                                            glm::vec3 const &cameraPosition,
                                            LightingSettings const &lighting,
                                            bool shadowPassEnabled) {
+  return beginFrameImpl(viewProjMatrix, cameraPosition, lighting, shadowPassEnabled, {});
+}
+Renderer::FrameResult Renderer::beginFrameImpl(glm::mat4 const &viewProjMatrix,
+    glm::vec3 const &cameraPosition, LightingSettings const &lighting,
+    bool shadowPassEnabled, std::span<MotionObject const> objects) {
   auto display = DisplaySettings{.exposureEv = lighting.exposureEv,
                                  .toneMap = lighting.toneMappingEnabled};
   validateDisplaySettings(display);
   bool dataDebug = (lighting.pbrDebugMode >= 1 && lighting.pbrDebugMode <= 5) ||
+                   (lighting.pbrDebugMode >= 9 && lighting.pbrDebugMode <= 13) || lighting.pbrDebugMode == 15 || lighting.pbrDebugMode == 16 || lighting.pbrDebugMode == 17 || lighting.pbrDebugMode == 18 || lighting.pbrDebugMode == 19 ||
                    (shadowPassEnabled && (lighting.shadowDebugMode == 2 ||
                                           lighting.shadowDebugMode == 3));
   if (dataDebug) {
@@ -777,6 +877,30 @@ Renderer::FrameResult Renderer::beginFrame(glm::mat4 const &viewProjMatrix,
         "Cannot begin a new frame while another frame is in progress.");
   }
 
+  // Reject the complete invalid/oversized snapshot before acquiring an image or
+  // resetting a fence. The retry therefore retains a usable frame slot.
+  auto eye=viewProjMatrix*glm::vec4(cameraPosition,1);
+  bool perspective=std::abs(eye.w)<1e-4f && glm::length(glm::vec3(viewProjMatrix[0][3],viewProjMatrix[1][3],viewProjMatrix[2][3]))>.5f;
+  bool activeTaa=taaEnabled_ && perspective && lighting.pbrDebugMode==0 && lighting.shadowDebugMode<2;
+  if(activeTaa!=lastTaaActive_){temporalHistory_.reset();taa_->reset();}
+  lastTaaActive_=activeTaa;
+  auto temporal = temporalHistory_.prepare(viewProjMatrix, cameraPosition,
+      swapChain_->extent().width, swapChain_->extent().height, activeTaa || (temporalJitterEnabled_ && !taaEnabled_), objects);
+  if (temporal.gpu.size() > device_.physicalDevice().getProperties().limits.maxStorageBufferRange / sizeof(MotionObjectGpu))
+    throw std::runtime_error("Motion snapshot exceeds storage buffer range");
+  auto lights = packPunctualLights(
+      lighting.punctualLights,
+      device_.physicalDevice().getProperties().limits.maxStorageBufferRange);
+  auto indoor = makeIndoorLighting(lighting, lights, shadowPassEnabled);
+  validateSunCascades(lighting.sunCascades);
+  if (shadowPassEnabled && lighting.sunEnabled)
+    indoor.sun = buildSunCascades(viewProjMatrix, cameraPosition, lighting.direction,
+                                  lighting.sunCascades, lighting.shadowPcfRadius);
+  auto const &limits = device_.physicalDevice().getProperties().limits;
+  auto grid = makeClusterGrid(viewProjMatrix, cameraPosition, swapChain_->extent().width,
+      swapChain_->extent().height, limits.maxStorageBufferRange, limits.maxComputeWorkGroupCount[0],
+      lighting.clusteredLights && clusterSupported_ && !lights.lights.empty());
+  if (grid.screen.z) grid.inverseViewProj = glm::inverse(temporal.camera.rasterViewProj);
   displaySettings_ = display;
   std::uint32_t const frameIndex = currentFrame_;
   auto &frame = frames_[frameIndex];
@@ -790,6 +914,18 @@ Renderer::FrameResult Renderer::beginFrame(glm::mat4 const &viewProjMatrix,
                               .count();
   collectFrameTimings(frame);
   collectCompletedWork();
+  frame.taaEnabled=activeTaa;
+  taaPush_={.inverseRaster=glm::inverse(temporal.camera.rasterViewProj),
+    .depthRow={viewProjMatrix[0][3],viewProjMatrix[1][3],viewProjMatrix[2][3],viewProjMatrix[3][3]},
+    .jitterWeight={temporal.camera.jitterUv.x,temporal.camera.jitterUv.y,.1f,float(taaHistoryFilter_)},
+    .options={temporal.camera.previousCamera.w,.002f,8,1.5f}};
+  updateFrameMotion(frame, std::move(temporal));
+  updateFrameLights(frame, lights);
+  frame.indoor = indoor;
+  lastIndoor_ = indoor;
+  activeSunShadow_ = lighting.sunEnabled;
+  frame.indoorBuffer.write(std::as_bytes(std::span{&frame.indoor, 1}));
+  updateFrameClusters(frame, grid);
   auto acquireStart = std::chrono::steady_clock::now();
 
   vk::Result acquireResult = vk::Result::eSuccess;
@@ -828,7 +964,7 @@ Renderer::FrameResult Renderer::beginFrame(glm::mat4 const &viewProjMatrix,
   auto effectiveLighting = lighting;
   if (!shadowPassEnabled)
     effectiveLighting.shadowDebugMode = 0;
-  updateFrameUniformBuffer(frame, viewProjMatrix, cameraPosition,
+  updateFrameUniformBuffer(frame, frame.temporal->camera.rasterViewProj, cameraPosition,
                            effectiveLighting);
 
   commandBuffer.begin(vk::CommandBufferBeginInfo{
@@ -846,7 +982,8 @@ Renderer::FrameResult Renderer::beginFrame(glm::mat4 const &viewProjMatrix,
   frame.shadowEnabled = activeGraph_->shadowPass.has_value();
   frame.uiEnabled = activeGraph_->uiPass.has_value();
   if (*frame.timestamps)
-    commandBuffer.resetQueryPool(*frame.timestamps, 0, 10);
+    commandBuffer.resetQueryPool(*frame.timestamps, 0, 12);
+  if(activeTaa && *frame.taaTimestamps) commandBuffer.resetQueryPool(*frame.taaTimestamps,0,2);
   activeFrame_ = ActiveFrameState{frameIndex, imageIndex, acquireResult};
   activePass_ = ActivePass::eNone;
 
@@ -854,7 +991,7 @@ Renderer::FrameResult Renderer::beginFrame(glm::mat4 const &viewProjMatrix,
 }
 
 void Renderer::recordObject(MeshId meshId, MaterialId materialId,
-                            glm::mat4 const &modelMatrix) {
+                            glm::mat4 const &modelMatrix, std::uint32_t motionIndex) {
   if (!activeFrame_.has_value()) {
     throw std::runtime_error("Cannot draw without an active frame.");
   }
@@ -881,6 +1018,7 @@ void Renderer::recordObject(MeshId meshId, MaterialId materialId,
       .materialTint = materialResource.tint,
       .surfaceParams = materialResource.surfaceParams,
       .alphaParams = materialResource.alphaParams,
+      .shadowPass = {activeShadowIndex_, int(motionIndex), 0, 0},
   };
   if (!normalMapsEnabled_) {
     pushConstants.surfaceParams.z = 0.0f;
@@ -1050,9 +1188,12 @@ Renderer::FrameResult Renderer::finishFrame(SceneDrawList const &scene) {
   device_.logicalDevice().resetFences({*frame.inFlightFence});
   device_.graphicsQueue().submit({submitInfo}, *frame.inFlightFence);
   auto const &graph = *activeGraph_;
+  if (graph.clusterPass) frame.clusterState = graph.plan.finalBufferState(graph.clusterIndices);
   imageStates_.shadow = graph.plan.finalState(graph.shadow);
   imageStates_.depth = graph.plan.finalState(graph.depth);
   imageStates_.hdr = graph.plan.finalState(graph.hdr);
+  imageStates_.motion = graph.plan.finalState(graph.motion);
+  if(graph.taa)taa_->submitted(graph.plan,*graph.taa);
   imageStates_.output[frameState.imageIndex] =
       graph.plan.finalState(graph.output);
   onFrameSubmitted(frame);
@@ -1313,9 +1454,10 @@ vk::raii::Pipeline Renderer::createEnvironmentPipeline(
           vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
           vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA,
   };
+  std::array colorBlendAttachments{colorBlendAttachment, colorBlendAttachment};
   vk::PipelineColorBlendStateCreateInfo colorBlending{
-      .attachmentCount = 1,
-      .pAttachments = &colorBlendAttachment,
+      .attachmentCount = 2,
+      .pAttachments = colorBlendAttachments.data(),
   };
   std::array dynamicStates = {vk::DynamicState::eViewport,
                               vk::DynamicState::eScissor};
@@ -1323,10 +1465,10 @@ vk::raii::Pipeline Renderer::createEnvironmentPipeline(
       .dynamicStateCount = static_cast<std::uint32_t>(dynamicStates.size()),
       .pDynamicStates = dynamicStates.data(),
   };
-  vk::Format colorAttachmentFormat = HdrOutput::sceneFormat;
+  std::array colorAttachmentFormats{HdrOutput::sceneFormat, kMotionFormat};
   vk::PipelineRenderingCreateInfo renderingInfo{
-      .colorAttachmentCount = 1,
-      .pColorAttachmentFormats = &colorAttachmentFormat,
+      .colorAttachmentCount = 2,
+      .pColorAttachmentFormats = colorAttachmentFormats.data(),
       .depthAttachmentFormat = kDepthFormat,
   };
   vk::GraphicsPipelineCreateInfo pipelineInfo{
@@ -1426,10 +1568,11 @@ Renderer::createGraphicsPipeline(SwapChain const &swapChain,
           vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
           vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA,
   };
+  std::array colorBlendAttachments{colorBlendAttachment, colorBlendAttachment};
   vk::PipelineColorBlendStateCreateInfo colorBlending{
       .logicOpEnable = false,
-      .attachmentCount = 1,
-      .pAttachments = &colorBlendAttachment,
+      .attachmentCount = 2,
+      .pAttachments = colorBlendAttachments.data(),
   };
 
   vk::PipelineDepthStencilStateCreateInfo depthStencil{
@@ -1449,10 +1592,10 @@ Renderer::createGraphicsPipeline(SwapChain const &swapChain,
       .pDynamicStates = dynamicStates.data(),
   };
 
-  vk::Format colorAttachmentFormat = HdrOutput::sceneFormat;
+  std::array colorAttachmentFormats{HdrOutput::sceneFormat, kMotionFormat};
   vk::PipelineRenderingCreateInfo pipelineRenderingCreateInfo{
-      .colorAttachmentCount = 1,
-      .pColorAttachmentFormats = &colorAttachmentFormat,
+      .colorAttachmentCount = 2,
+      .pColorAttachmentFormats = colorAttachmentFormats.data(),
       .depthAttachmentFormat = kDepthFormat,
   };
 
@@ -1552,10 +1695,11 @@ vk::raii::Pipeline Renderer::createTransparentPipeline(
           vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
           vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA,
   };
+  std::array colorBlendAttachments{colorBlendAttachment, colorBlendAttachment};
   vk::PipelineColorBlendStateCreateInfo colorBlending{
       .logicOpEnable = false,
-      .attachmentCount = 1,
-      .pAttachments = &colorBlendAttachment,
+      .attachmentCount = 2,
+      .pAttachments = colorBlendAttachments.data(),
   };
 
   vk::PipelineDepthStencilStateCreateInfo depthStencil{
@@ -1575,10 +1719,10 @@ vk::raii::Pipeline Renderer::createTransparentPipeline(
       .pDynamicStates = dynamicStates.data(),
   };
 
-  vk::Format colorAttachmentFormat = HdrOutput::sceneFormat;
+  std::array colorAttachmentFormats{HdrOutput::sceneFormat, kMotionFormat};
   vk::PipelineRenderingCreateInfo pipelineRenderingCreateInfo{
-      .colorAttachmentCount = 1,
-      .pColorAttachmentFormats = &colorAttachmentFormat,
+      .colorAttachmentCount = 2,
+      .pColorAttachmentFormats = colorAttachmentFormats.data(),
       .depthAttachmentFormat = kDepthFormat,
   };
 
@@ -1678,10 +1822,11 @@ vk::raii::Pipeline Renderer::createDebugLinePipeline(
           vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
           vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA,
   };
+  std::array colorBlendAttachments{colorBlendAttachment, colorBlendAttachment};
   vk::PipelineColorBlendStateCreateInfo colorBlending{
       .logicOpEnable = false,
-      .attachmentCount = 1,
-      .pAttachments = &colorBlendAttachment,
+      .attachmentCount = 2,
+      .pAttachments = colorBlendAttachments.data(),
   };
 
   vk::PipelineDepthStencilStateCreateInfo depthStencil{
@@ -1701,10 +1846,10 @@ vk::raii::Pipeline Renderer::createDebugLinePipeline(
       .pDynamicStates = dynamicStates.data(),
   };
 
-  vk::Format colorAttachmentFormat = HdrOutput::sceneFormat;
+  std::array colorAttachmentFormats{HdrOutput::sceneFormat, kMotionFormat};
   vk::PipelineRenderingCreateInfo pipelineRenderingCreateInfo{
-      .colorAttachmentCount = 1,
-      .pColorAttachmentFormats = &colorAttachmentFormat,
+      .colorAttachmentCount = 2,
+      .pColorAttachmentFormats = colorAttachmentFormats.data(),
       .depthAttachmentFormat = kDepthFormat,
   };
 
@@ -1808,6 +1953,7 @@ Renderer::createShadowPipeline(vk::raii::PipelineLayout const &pipelineLayout,
   std::array dynamicStates = {
       vk::DynamicState::eViewport,
       vk::DynamicState::eScissor,
+      vk::DynamicState::eDepthBias,
   };
   vk::PipelineDynamicStateCreateInfo dynamicState{
       .dynamicStateCount = static_cast<std::uint32_t>(dynamicStates.size()),
@@ -1848,6 +1994,41 @@ void Renderer::createCommandBuffers() {
       vk::raii::CommandBuffers(device_.logicalDevice(), allocateInfo);
 }
 
+void Renderer::updateFrameLights(FrameContext &frame,
+                                 PackedPunctualLights const &lights) {
+  auto capacity = punctualCapacity(
+      frame.punctualCapacity, lights.lights.size(),
+      device_.physicalDevice().getProperties().limits.maxStorageBufferRange);
+  auto bytes = punctualHeaderBytes + capacity * sizeof(GpuPunctualLight);
+  if (capacity != frame.punctualCapacity) {
+    auto replacement =
+        device_.createBuffer(bytes, vk::BufferUsageFlagBits::eStorageBuffer,
+                             vk::MemoryPropertyFlagBits::eHostVisible);
+    replacement.write(std::as_bytes(std::span{lights.counts}));
+    if (!lights.lights.empty())
+      replacement.write(std::as_bytes(std::span{lights.lights}),
+                        punctualHeaderBytes);
+    vk::DescriptorBufferInfo info{
+        .buffer = *replacement.buffer, .offset = 0, .range = bytes};
+    device_.logicalDevice().updateDescriptorSets(
+        {vk::WriteDescriptorSet{.dstSet = frame.descriptorSet,
+                                .dstBinding = 6,
+                                .descriptorCount = 1,
+                                .descriptorType =
+                                    vk::DescriptorType::eStorageBuffer,
+                                .pBufferInfo = &info}},
+        {});
+    frame.punctualLights = std::move(replacement);
+    frame.punctualCapacity = capacity;
+    device_.nameObject(*frame.punctualLights.buffer, "Frame punctual lights");
+  } else {
+    frame.punctualLights.write(std::as_bytes(std::span{lights.counts}));
+    if (!lights.lights.empty())
+      frame.punctualLights.write(std::as_bytes(std::span{lights.lights}),
+                                 punctualHeaderBytes);
+  }
+}
+
 void Renderer::updateFrameUniformBuffer(
     FrameContext &frame, glm::mat4 const &viewProjMatrix,
     glm::vec3 const &cameraPosition, LightingSettings const &lighting) const {
@@ -1859,12 +2040,14 @@ void Renderer::updateFrameUniformBuffer(
     lightDirection = {0.0f, 1.0f, 0.0f};
   }
   ubo.lightDirection = glm::vec4(glm::normalize(lightDirection), 0.0f);
-  glm::vec3 const lightColor = lighting.color * lighting.intensity;
+  glm::vec3 const lightColor =
+      lighting.color * (lighting.sunEnabled ? lighting.intensity : 0.0f);
   ubo.lightColor = glm::vec4(lightColor, 1.0f);
   ubo.ambientColor = glm::vec4(lightColor * lighting.ambientStrength, 1.0f);
   ubo.lightingParams =
       glm::vec4(lighting.diffuseStrength, lighting.specularStrength,
-                lighting.shininess, static_cast<float>(lighting.pbrDebugMode));
+                lighting.specularAaEnabled ? 1.0f : 0.0f,
+                static_cast<float>(lighting.pbrDebugMode));
   ubo.lightViewProj = computeLightViewProj(lighting.direction, lighting);
   ubo.shadowParams = glm::vec4(
       lighting.shadowBiasSlope, lighting.shadowBiasConstant,
@@ -1880,6 +2063,15 @@ void Renderer::updateFrameUniformBuffer(
         glm::vec4(environmentSh_[coefficient], 0.0f);
   }
 
+  ubo.currentViewProj = viewProjMatrix;
+  ubo.previousViewProj = viewProjMatrix;
+  if (frame.temporal) {
+    auto const &t = frame.temporal->camera;
+    ubo.currentViewProj = t.currentViewProj;
+    ubo.previousViewProj = t.previousViewProj;
+    ubo.previousCamera = t.previousCamera;
+    ubo.jitterUv = t.jitterUv;
+  }
   frame.uniform.write(std::as_bytes(std::span{&ubo, 1}));
 }
 
@@ -1898,24 +2090,29 @@ void Renderer::setGpuTimingCallback(
   gpuTimingCallback_ = std::move(callback);
 }
 void Renderer::onFrameSubmitted(FrameContext &frame) {
+  if (frame.temporal) {
+    temporalHistory_.commit(std::move(*frame.temporal));
+    frame.temporal.reset();
+  }
   frame.frameId = ++submittedFrameId_;
   frame.submitted = true;
 }
 void Renderer::collectFrameTimings(FrameContext &frame) {
   if (!frame.submitted)
     return;
-  GpuTimings result{.frameId = frame.frameId};
+  GpuTimings result{.frameId = frame.frameId, .clustered = frame.clusterEnabled};
   if (*frame.timestamps) {
-    std::array<std::uint64_t, 20> values{};
+    std::array<std::uint64_t, 24> values{};
+    unsigned count = frame.clusterEnabled ? 12 : 10;
     auto status = vkGetQueryPoolResults(
         static_cast<VkDevice>(device_.deviceHandle()),
-        static_cast<VkQueryPool>(*frame.timestamps), 0, 10, sizeof(values),
+        static_cast<VkQueryPool>(*frame.timestamps), 0, count, sizeof(values),
         values.data(), 2 * sizeof(std::uint64_t),
         VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
     if (status != VK_SUCCESS && status != VK_NOT_READY)
       throw std::runtime_error("GPU timestamp readback failed");
     bool ready = true;
-    for (unsigned i = 0; i < 10; ++i)
+    for (unsigned i = 0; i < count; ++i)
       ready = ready && values[2 * i + 1] != 0;
     if (!ready)
       throw std::runtime_error(
@@ -1928,8 +2125,14 @@ void Renderer::collectFrameTimings(FrameContext &frame) {
     result.totalMs = elapsed(0, 9);
     result.shadowMs = frame.shadowEnabled ? elapsed(1, 2) : 0;
     result.mainMs = elapsed(3, 4);
+    result.cullingMs = frame.clusterEnabled ? elapsed(10, 11) : 0;
     result.outputMs = elapsed(5, 6);
     result.uiMs = frame.uiEnabled ? elapsed(7, 8) : 0;
+    if(frame.taaEnabled){std::array<std::uint64_t,4> v{};
+      auto status=vkGetQueryPoolResults(static_cast<VkDevice>(device_.deviceHandle()),static_cast<VkQueryPool>(*frame.taaTimestamps),0,2,sizeof(v),v.data(),16,VK_QUERY_RESULT_64_BIT|VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+      if(status!=VK_SUCCESS||!v[1]||!v[3])throw std::runtime_error("Completed TAA query unavailable");
+      result.taaMs=timestampMilliseconds(v[0],v[2],timestampBits_,timestampPeriod_);
+    }
   }
   resourceStatistics_.completedFrameId =
       std::max(resourceStatistics_.completedFrameId, frame.frameId);

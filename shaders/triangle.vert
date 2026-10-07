@@ -9,6 +9,13 @@ layout(set = 0, binding = 0) uniform FrameUbo {
   vec4 lightingParams;
   mat4 lightViewProj;
   vec4 shadowParams;
+  mat4 inverseViewProj;
+  vec4 environmentParams;
+  vec4 environmentSh[9];
+  mat4 currentViewProj;
+  mat4 previousViewProj;
+  vec4 previousCamera;
+  vec4 jitterUv;
 } ubo;
 
 layout(push_constant) uniform PushConstants {
@@ -16,8 +23,14 @@ layout(push_constant) uniform PushConstants {
   vec4 materialTint;
   vec4 surfaceParams;
   vec4 alphaParams;
+  ivec4 passData;
 } pushConstants;
 
+struct MotionObject { mat4 previousModel; vec4 flags; };
+layout(std430, set=0, binding=10) readonly buffer PreviousObjects { MotionObject objects[]; } previous;
+layout(location=12) out vec4 outCurrentClip;
+layout(location=13) out vec4 outPreviousClip;
+layout(location=14) flat out float outMotionValid;
 layout(location = 0) in vec3 inPosition;
 layout(location = 1) in vec3 inColor;
 layout(location = 2) in vec3 inNormal;
@@ -50,6 +63,12 @@ void main()
   mat3 normalMatrix = transpose(inverse(mat3(pushConstants.transform)));
 
   gl_Position = ubo.viewProj * worldPos;
+  MotionObject object;
+  object.previousModel = pushConstants.transform; object.flags = vec4(0);
+  if (pushConstants.passData.y > 0) object = previous.objects[pushConstants.passData.y];
+  outCurrentClip = ubo.currentViewProj * worldPos;
+  outPreviousClip = ubo.previousViewProj * object.previousModel * vec4(inPosition,1);
+  outMotionValid = object.flags.x * ubo.previousCamera.w;
   outColor = vec4(inColor, inAlpha);
   outUv = inUv;
   outNormalUv = inNormalUv;

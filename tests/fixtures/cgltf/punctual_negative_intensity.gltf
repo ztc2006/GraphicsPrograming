@@ -1,0 +1,244 @@
+{
+  "asset": {
+    "version": "2.0"
+  },
+  "scene": 0,
+  "scenes": [
+    {
+      "nodes": [
+        0,
+        1,
+        4,
+        5
+      ]
+    },
+    {
+      "nodes": [
+        0,
+        6
+      ]
+    }
+  ],
+  "nodes": [
+    {
+      "mesh": 0
+    },
+    {
+      "translation": [
+        1,
+        2,
+        3
+      ],
+      "scale": [
+        2,
+        3,
+        4
+      ],
+      "children": [
+        2,
+        3
+      ]
+    },
+    {
+      "extensions": {
+        "KHR_lights_punctual": {
+          "light": 0
+        }
+      },
+      "rotation": [
+        0,
+        0.7071067811865476,
+        0,
+        0.7071067811865476
+      ]
+    },
+    {
+      "extensions": {
+        "KHR_lights_punctual": {
+          "light": 2
+        }
+      },
+      "translation": [
+        0,
+        0,
+        1
+      ]
+    },
+    {
+      "extensions": {
+        "KHR_lights_punctual": {
+          "light": 1
+        }
+      },
+      "translation": [
+        4,
+        5,
+        6
+      ]
+    },
+    {
+      "extensions": {
+        "KHR_lights_punctual": {
+          "light": 1
+        }
+      },
+      "translation": [
+        -4,
+        -5,
+        -6
+      ]
+    },
+    {
+      "extensions": {
+        "KHR_lights_punctual": {
+          "light": 1
+        }
+      },
+      "translation": [
+        99,
+        0,
+        0
+      ]
+    }
+  ],
+  "meshes": [
+    {
+      "primitives": [
+        {
+          "attributes": {
+            "POSITION": 0,
+            "NORMAL": 1,
+            "TEXCOORD_0": 2,
+            "TANGENT": 3,
+            "COLOR_0": 4
+          }
+        }
+      ]
+    }
+  ],
+  "buffers": [
+    {
+      "byteLength": 121,
+      "uri": "data:application/octet-stream;base64,AAECAAAAAAAAAAAAAAAAAAAAgD8AAAAAAAAAAAAAAAAAAIA/AAAAAAAAfwAAfwAAfwAAAACA/////wAAAAAAAAAAAAAAAIA/AAAAAAAAgL8AAAAAAACAPwAAAAAAAIC/AAAAAAAAgD8AAAAAAACAv0CA/0CA/0CA/w=="
+    }
+  ],
+  "bufferViews": [
+    {
+      "buffer": 0,
+      "byteOffset": 0,
+      "byteLength": 3
+    },
+    {
+      "buffer": 0,
+      "byteOffset": 4,
+      "byteLength": 36
+    },
+    {
+      "buffer": 0,
+      "byteOffset": 40,
+      "byteLength": 9
+    },
+    {
+      "buffer": 0,
+      "byteOffset": 52,
+      "byteLength": 12
+    },
+    {
+      "buffer": 0,
+      "byteOffset": 64,
+      "byteLength": 48
+    },
+    {
+      "buffer": 0,
+      "byteOffset": 112,
+      "byteLength": 9
+    }
+  ],
+  "accessors": [
+    {
+      "type": "VEC3",
+      "componentType": 5126,
+      "count": 3,
+      "sparse": {
+        "count": 3,
+        "indices": {
+          "bufferView": 0,
+          "componentType": 5121
+        },
+        "values": {
+          "bufferView": 1
+        }
+      }
+    },
+    {
+      "bufferView": 2,
+      "type": "VEC3",
+      "componentType": 5120,
+      "count": 3,
+      "normalized": true
+    },
+    {
+      "bufferView": 3,
+      "type": "VEC2",
+      "componentType": 5123,
+      "count": 3,
+      "normalized": true
+    },
+    {
+      "bufferView": 4,
+      "type": "VEC4",
+      "componentType": 5126,
+      "count": 3
+    },
+    {
+      "bufferView": 5,
+      "type": "VEC3",
+      "componentType": 5121,
+      "count": 3,
+      "normalized": true
+    }
+  ],
+  "extensionsUsed": [
+    "KHR_lights_punctual"
+  ],
+  "extensionsRequired": [
+    "KHR_lights_punctual"
+  ],
+  "extensions": {
+    "KHR_lights_punctual": {
+      "lights": [
+        {
+          "type": "directional",
+          "name": "sun",
+          "color": [
+            0.5,
+            0.75,
+            1
+          ],
+          "intensity": -1
+        },
+        {
+          "type": "point",
+          "name": "bulb",
+          "color": [
+            1,
+            0.25,
+            0.5
+          ],
+          "intensity": 16,
+          "range": 8
+        },
+        {
+          "type": "spot",
+          "name": "cone",
+          "intensity": 32,
+          "range": 12,
+          "spot": {
+            "innerConeAngle": 0.2,
+            "outerConeAngle": 0.6
+          }
+        }
+      ]
+    }
+  }
+}

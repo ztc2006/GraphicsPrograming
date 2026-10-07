@@ -80,6 +80,72 @@ void preserveCoverage(std::span<std::byte> pixels, unsigned channel,
   for (std::size_t i = channel; i < pixels.size(); i += 4)
     pixels[i] = encode(std::to_integer<unsigned>(pixels[i]) * bestScale / 255);
 }
+// Preserve the first moment independently of quantized unit-direction mips.
+// glTF ignores normal-map alpha: we own it as length loss, including LOD0=0.
+void normalMips(TextureMipChain &chain) {
+  using Moment = std::array<float, 3>;
+  std::vector<Moment> previous;
+  for (std::size_t i = 3; i < chain.levels.front().size; i += 4)
+    chain.pixels[i] = std::byte{0};
+  for (std::size_t level = 1; level < chain.levels.size(); ++level) {
+    auto const &src = chain.levels[level - 1], &dst = chain.levels[level];
+    std::vector<Moment> next(std::size_t(dst.width) * dst.height);
+    for (unsigned y = 0; y < dst.height; ++y)
+      for (unsigned x = 0; x < dst.width; ++x) {
+        double left = double(x) * src.width / dst.width;
+        double right = double(x + 1) * src.width / dst.width;
+        double top = double(y) * src.height / dst.height;
+        double bottom = double(y + 1) * src.height / dst.height;
+        std::array<double, 3> sum{};
+        for (unsigned sy = unsigned(top); sy < unsigned(std::ceil(bottom));
+             ++sy)
+          for (unsigned sx = unsigned(left); sx < unsigned(std::ceil(right));
+               ++sx) {
+            double weight =
+                (std::min(bottom, double(sy + 1)) - std::max(top, double(sy))) *
+                (std::min(right, double(sx + 1)) - std::max(left, double(sx)));
+            auto index = std::size_t(sy) * src.width + sx;
+            std::array<double, 3> value{};
+            if (level == 1) {
+              for (unsigned c = 0; c < 3; ++c)
+                value[c] =
+                    (2 * std::to_integer<int>(chain.pixels[index * 4 + c]) -
+                     255) /
+                    255.0;
+              double length =
+                  std::sqrt(value[0] * value[0] + value[1] * value[1] +
+                            value[2] * value[2]);
+              if (length < 1e-12)
+                value = {0, 0, 1};
+              else
+                for (auto &v : value)
+                  v /= length;
+            } else
+              for (unsigned c = 0; c < 3; ++c)
+                value[c] = previous[index][c];
+            for (unsigned c = 0; c < 3; ++c)
+              sum[c] += weight * value[c];
+          }
+        for (auto &v : sum)
+          v /= (right - left) * (bottom - top);
+        auto index = std::size_t(y) * dst.width + x;
+        for (unsigned c = 0; c < 3; ++c)
+          next[index][c] = float(sum[c]);
+        double length =
+            std::sqrt(sum[0] * sum[0] + sum[1] * sum[1] + sum[2] * sum[2]);
+        auto output = dst.offset + index * 4;
+        chain.pixels[output + 3] = encode(1 - length);
+        if (length < 1e-12)
+          sum = {0, 0, 1};
+        else
+          for (auto &v : sum)
+            v /= length;
+        for (unsigned c = 0; c < 3; ++c)
+          chain.pixels[output + c] = encode(sum[c] * .5 + .5);
+      }
+    previous = std::move(next);
+  }
+}
 } // namespace
 TextureMipChain generateTextureMips(std::span<std::byte const> rgba,
                                     std::uint32_t width, std::uint32_t height,
@@ -103,6 +169,10 @@ TextureMipChain generateTextureMips(std::span<std::byte const> rgba,
     throw std::runtime_error("RGBA8 mip source dimensions do not match data.");
   result.pixels.resize(result.levels.back().offset + result.levels.back().size);
   std::copy(rgba.begin(), rgba.end(), result.pixels.begin());
+  if (policy == TextureMipPolicy::Normal) {
+    normalMips(result);
+    return result;
+  }
   unsigned threshold = 0;
   while (threshold < 256 && float(threshold) / 255 < coverage.cutoff)
     ++threshold;
@@ -135,9 +205,7 @@ TextureMipChain generateTextureMips(std::span<std::byte const> rgba,
             for (unsigned c = 0; c < 4; ++c) {
               int byte = std::to_integer<int>(result.pixels[index + c]);
               double value = byte / 255.0;
-              if (c < 3 && policy == TextureMipPolicy::Normal)
-                value = (2 * byte - 255) / 255.0;
-              else if (c < 3 && colorSpace == TextureColorSpace::Srgb)
+              if (c < 3 && colorSpace == TextureColorSpace::Srgb)
                 value = linearSrgb[byte];
               sum[c] += value * weight;
             }
@@ -145,19 +213,7 @@ TextureMipChain generateTextureMips(std::span<std::byte const> rgba,
         }
         for (auto &v : sum)
           v /= (right - left) * (bottom - top);
-        if (policy == TextureMipPolicy::Normal) {
-          double length =
-              std::sqrt(sum[0] * sum[0] + sum[1] * sum[1] + sum[2] * sum[2]);
-          if (length < 1e-12) {
-            sum[0] = 0;
-            sum[1] = 0;
-            sum[2] = 1;
-          } else
-            for (unsigned c = 0; c < 3; ++c)
-              sum[c] /= length;
-          for (unsigned c = 0; c < 3; ++c)
-            sum[c] = sum[c] * .5 + .5;
-        } else if (colorSpace == TextureColorSpace::Srgb) {
+        if (colorSpace == TextureColorSpace::Srgb) {
           for (unsigned c = 0; c < 3; ++c)
             sum[c] = sum[c] <= .0031308
                          ? 12.92 * sum[c]

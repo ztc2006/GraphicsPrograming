@@ -1,0 +1,60 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#define CLUSTER_CULL_STAGE
+#include "cluster_grid.glsl"
+layout(local_size_x = 64) in;
+struct PunctualLight { vec4 positionRange; vec4 directionType; vec4 colorIntensity; vec4 cones; };
+layout(set = 0, binding = 6, std430) readonly buffer PunctualLights {
+  uvec4 counts;
+  PunctualLight lights[];
+} punctual;
+void main() {
+  uint cell = gl_GlobalInvocationID.x;
+  if (cell >= clusters.grid.w) return;
+  uint base = cell * (clusters.screen.w + 1u);
+  for (uint i = 0u; i < clusters.screen.w; ++i) clusterIndices.words[base + 1u + i] = 0u;
+  uvec3 tile;
+  tile.x = cell % clusters.grid.x;
+  tile.y = (cell / clusters.grid.x) % clusters.grid.y;
+  tile.z = cell / (clusters.grid.x * clusters.grid.y);
+  vec2 low = vec2(tile.xy * 64u);
+  vec2 high = min(low + vec2(64), vec2(clusters.screen.xy));
+  float ratio = clusters.forwardFar.w / clusters.cameraNear.w;
+  float d0 = clusters.cameraNear.w * pow(ratio, float(tile.z) / float(clusters.grid.z));
+  float d1 = clusters.cameraNear.w * pow(ratio, float(tile.z + 1u) / float(clusters.grid.z));
+  vec3 lo = vec3(3.402823e38), hi = -lo;
+  for (int y = 0; y < 2; ++y) for (int x = 0; x < 2; ++x) {
+    vec2 pixel = vec2(x == 0 ? low.x : high.x, y == 0 ? low.y : high.y);
+    vec2 ndc = pixel / vec2(clusters.screen.xy) * 2.0 - 1.0;
+    vec4 p = clusters.inverseViewProj * vec4(ndc, 0, 1);
+    vec3 ray = p.xyz / p.w - clusters.cameraNear.xyz;
+    float denominator = dot(ray, clusters.forwardFar.xyz);
+    vec3 a = clusters.cameraNear.xyz + ray * (d0 / denominator);
+    vec3 b = clusters.cameraNear.xyz + ray * (d1 / denominator);
+    if (denominator <= 0.0 || any(isnan(a)) || any(isinf(a)) || any(isnan(b)) || any(isinf(b))) {
+      clusterIndices.words[base] = 0xffffffffu;
+      return;
+    }
+    lo = min(lo, min(a, b)); hi = max(hi, max(a, b));
+  }
+  // Expand for projection/slice rounding. Extra lights are harmless; missing
+  // lights are not. Keep the source order for reproducible floating-point sums.
+  vec3 epsilon = 1e-4 * (vec3(1) + max(abs(lo), abs(hi)));
+  lo -= epsilon; hi += epsilon;
+  uint count = 0u;
+  for (uint i = 0u; i < punctual.counts.x; ++i) {
+    PunctualLight light = punctual.lights[i];
+    vec3 delta = light.positionRange.xyz - clamp(light.positionRange.xyz, lo, hi);
+    float range = light.positionRange.w;
+    float distance = length(delta);
+    bool include = isnan(distance) || isinf(distance) || light.directionType.w == 0.0 || range == 0.0 ||
+                   distance <= range * 1.0001 + 1e-5;
+    if (!include) continue;
+    if (count == clusters.screen.w) {
+      clusterIndices.words[base] = 0xffffffffu;
+      return;
+    }
+    clusterIndices.words[base + 1u + count++] = i;
+  }
+  clusterIndices.words[base] = count;
+}

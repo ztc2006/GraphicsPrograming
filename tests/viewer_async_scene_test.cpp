@@ -134,7 +134,7 @@ public:
       auto const &stats = app.renderer_->resourceStatistics();
       require(stats.sceneUploadFenceWaits == 0,
               "Runtime load waited an upload fence");
-      require(stats.environmentUploads == 1 && stats.pipelineBuilds == 12,
+      require(stats.environmentUploads == 1 && stats.pipelineBuilds == 13 + (app.renderer_->clusterSupported() ? 1 : 0),
               "Runtime load rebuilt persistent renderer resources");
       std::cout << "PASS cancellation before and after upload submission, zero "
                    "upload waits\n";
@@ -163,6 +163,44 @@ public:
               "Rejected required extension changed live scene or warnings");
       std::cout << "PASS importer warnings publish with the scene; required "
                    "extension rolls back\n";
+
+      auto lightPath = std::filesystem::path{TEST_ADAPTER_FIXTURES} /
+                       "punctual_semantics.gltf";
+      app.pendingScenePath_ = lightPath;
+      pump(app, [&] {
+        return app.loadedScenePath_ == lightPath && !app.sceneLoad_;
+      });
+      require(app.scene_.lighting.punctualLights.size() == 4 &&
+                  !app.scene_.lighting.sunEnabled,
+              "Imported lights failed atomic publication or default sun "
+              "double-lit scene");
+      app.scene_.lighting.punctualLights[2].intensity = 123;
+      auto lightCommits = app.renderer_->resourceStatistics().sceneCommits;
+      app.pendingScenePath_ = std::filesystem::path{TEST_ADAPTER_FIXTURES} /
+                              "punctual_zero_range.gltf";
+      pump(app, [&] {
+        return !app.sceneLoad_ && !app.pendingScenePath_ &&
+               !app.sceneLoadError_.empty();
+      });
+      app.loadScene(lightPath);
+      app.cancelSceneLoad();
+      pump(app, [&] { return !app.sceneLoad_; });
+      require(app.loadedScenePath_ == lightPath &&
+                  app.scene_.lighting.punctualLights.size() == 4 &&
+                  app.scene_.lighting.punctualLights[2].intensity == 123 &&
+                  app.renderer_->resourceStatistics().sceneCommits ==
+                      lightCommits &&
+                  !app.scene_.lighting.sunEnabled,
+              "Failed/canceled scene replaced live edited lights");
+      app.pendingScenePath_ = path;
+      pump(app,
+           [&] { return app.loadedScenePath_ == path && !app.sceneLoad_; });
+      require(
+          app.scene_.lighting.punctualLights.empty() &&
+              app.scene_.lighting.sunEnabled,
+          "Lightless scene retained stale imported lights or lost default sun");
+      std::cout << "PASS scene/light atomic publish, failure/cancel preserve "
+                   "edits, lightless replacement clears lights\n";
 
       auto const liveImage = app.renderer_->materialAlbedoTexture(0).image();
       auto const beforeRestore = app.renderer_->resourceStatistics();
@@ -199,7 +237,7 @@ public:
               afterRestore.sceneCommits == beforeRestore.sceneCommits &&
               afterRestore.environmentUploads ==
                   beforeRestore.environmentUploads &&
-              afterRestore.pipelineBuilds == beforeRestore.pipelineBuilds + 12,
+              afterRestore.pipelineBuilds == beforeRestore.pipelineBuilds + 13,
           "Restore rebuilt scene/shared assets or lost graph output pipelines");
       std::cout << (iconified ? "PASS native minimize/restore"
                               : "SKIP native iconify: window manager did not "

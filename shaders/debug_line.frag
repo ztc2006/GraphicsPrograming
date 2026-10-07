@@ -8,7 +8,9 @@ layout(push_constant) uniform PushConstants {
 } pushConstants;
 
 layout(location = 0) out vec4 outFragColor;
+layout(location=1) out vec4 outMotion;
 
 void main() {
+  outMotion = vec4(0,0,0,pushConstants.materialTint.a);
   outFragColor = pushConstants.materialTint;
 }

@@ -26,7 +26,8 @@ public:
   vk::Extent2D extent() const { return extent_; }
   // Called inside a graph rendering pass with its target format and extent.
   // Scene image must already be in shader-read-only layout.
-  void drawDisplay(vk::CommandBuffer command, DisplaySettings settings);
+  void configureTemporalViews(std::array<vk::ImageView,2> views);
+  void drawDisplay(vk::CommandBuffer command, DisplaySettings settings, int temporalIndex=-1);
 
 private:
   vk::raii::Pipeline createPipeline(vk::Format displayFormat) const;
@@ -40,6 +41,9 @@ private:
   vk::raii::DescriptorSetLayout descriptorLayout_ = nullptr;
   vk::raii::DescriptorPool descriptorPool_ = nullptr;
   vk::DescriptorSet descriptor_ = nullptr;
+  std::array<vk::DescriptorSet,2> temporalDescriptors_{};
+  ResourceLedger::Lease temporalAccounting_;
+  vk::raii::DescriptorPool temporalPool_=nullptr;
   vk::raii::PipelineLayout pipelineLayout_ = nullptr;
   vk::raii::Pipeline pipeline_ = nullptr;
 };

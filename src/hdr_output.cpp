@@ -192,14 +192,23 @@ vk::raii::Pipeline HdrOutput::createPipeline(vk::Format displayFormat) const {
                                       .layout = *pipelineLayout_};
   return vk::raii::Pipeline(device_.logicalDevice(), nullptr, info);
 }
-void HdrOutput::drawDisplay(vk::CommandBuffer command, DisplaySettings settings) {
+void HdrOutput::configureTemporalViews(std::array<vk::ImageView,2> views) {
+  vk::DescriptorPoolSize size{vk::DescriptorType::eCombinedImageSampler,2};
+  temporalPool_=vk::raii::DescriptorPool(device_.logicalDevice(),vk::DescriptorPoolCreateInfo{.maxSets=2,.poolSizeCount=1,.pPoolSizes=&size});
+  std::array layouts{*descriptorLayout_,*descriptorLayout_};
+  auto sets=(*device_.logicalDevice()).allocateDescriptorSets(vk::DescriptorSetAllocateInfo{.descriptorPool=*temporalPool_,.descriptorSetCount=2,.pSetLayouts=layouts.data()});
+  for(unsigned i=0;i<2;++i){temporalDescriptors_[i]=sets[i];vk::DescriptorImageInfo info{*sampler_,views[i],vk::ImageLayout::eShaderReadOnlyOptimal};
+    device_.logicalDevice().updateDescriptorSets({vk::WriteDescriptorSet{.dstSet=sets[i],.dstBinding=0,.descriptorCount=1,.descriptorType=vk::DescriptorType::eCombinedImageSampler,.pImageInfo=&info}},{});}
+  temporalAccounting_=device_.resourceLedger().scope(ResourceLedger::Domain::Persistent).track({.descriptorPools=1,.descriptorSets=2});
+}
+void HdrOutput::drawDisplay(vk::CommandBuffer command, DisplaySettings settings,int temporalIndex) {
   validateDisplaySettings(settings);
   command.setViewport(0, {vk::Viewport{0, 0, float(extent_.width),
                                        float(extent_.height), 0, 1}});
   command.setScissor(0, {vk::Rect2D{{0, 0}, extent_}});
   command.bindPipeline(vk::PipelineBindPoint::eGraphics, *pipeline_);
   command.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *pipelineLayout_,
-                             0, {descriptor_}, {});
+                             0, {temporalIndex<0?descriptor_:temporalDescriptors_.at(unsigned(temporalIndex))}, {});
   DisplayPush push{std::exp2(settings.exposureEv),
                    std::uint32_t(settings.toneMap),
                    std::uint32_t(!hardwareSrgb_)};

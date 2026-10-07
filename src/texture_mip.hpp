@@ -6,13 +6,15 @@
 #include <vector>
 
 enum class TextureColorSpace { Linear, Srgb };
+// Normal RGB: authored LOD0 / normalized mip direction. A: 1-|mean|; LOD0=0.
+// All other policies retain authored alpha/coverage semantics.
 enum class TextureMipPolicy { Average, Normal, BaseOnly, AlphaCoverage };
 enum class TextureAlphaChannel : std::uint8_t { Red = 0, Alpha = 3 };
 struct TextureAlphaCoverage {
   float cutoff = 0.5f; // Effective cutoff: material cutoff / constant alpha.
   TextureAlphaChannel channel = TextureAlphaChannel::Alpha;
 };
-inline constexpr std::uint8_t textureMipAlgorithmVersion = 2;
+inline constexpr std::uint8_t textureMipAlgorithmVersion = 3;
 
 // Tightly packed levels; RGBA8 offsets are also Vulkan copy-aligned.
 struct TextureMipLevel {

@@ -38,6 +38,8 @@ int main() {
                      {"--warmup", "nan"},
                      {"--duration", "-1"},
                      {"--gpu"},
+                     {"--light-culling"},
+                     {"--light-culling", "bad"},
                      {"--frames-in-flight"},
                      {"--frames-in-flight", "0"},
                      {"--frames-in-flight", "3"},
@@ -59,19 +61,28 @@ int main() {
     }
     require(parseViewerOptions(std::vector<std::string_view>{"--frames-in-flight", "2"}).framesInFlight == 2, "Two frame CLI rejected");
     require(parseViewerOptions(std::vector<std::string_view>{"--present-sync", "fence"}).presentSync == "fence", "Fence policy rejected");
+    require(parseViewerOptions({}).lightingPreset=="auto" &&
+      parseViewerOptions(std::vector<std::string_view>{"--lighting-preset","asset"}).lightingPreset=="asset",
+      "Lighting setup CLI/default lost");
     require(parseViewerOptions({}).framesInFlight == 1, "Default frame count changed");
+    require(parseViewerOptions({}).lightCulling == "clustered" &&
+                parseViewerOptions(std::vector<std::string_view>{"--light-culling", "full"}).lightCulling == "full",
+            "Full-light comparison switch/default lost");
     auto dir =
         std::filesystem::temp_directory_path() /
         ("vulkan-measurement-test-" +
          std::to_string(
              std::chrono::steady_clock::now().time_since_epoch().count()));
     BenchmarkMetadata metadata{.gpu = "software\nGPU", .software = true};
+    metadata.lightCulling = "clustered";
+    metadata.temporalJitterEnabled=true;metadata.temporalHistoryValid=true;
+    metadata.sunCascadeCount=4;metadata.sunShadowDistance=40;
     metadata.engineResources.current.allocatedBytes = 8192;
     metadata.engineResources.current.suballocatedBytes = 1024;
     std::vector<BenchmarkFrame> frames{
         {.id = 4,
          .cpuFrameMs = 10,
-         .gpu = {.frameId = 4, .valid = true, .totalMs = 5}},
+         .gpu = {.frameId = 4, .valid = true, .clustered = true, .totalMs = 5, .cullingMs = .125}},
         {.id = 5, .cpuFrameMs = 20}};
     writeBenchmarkReport(dir, metadata, frames);
     std::ifstream input(dir / "summary.json");
@@ -86,16 +97,32 @@ int main() {
                 report.find("\"allocator_blocks\":") != std::string::npos,
             "Report lost the backing/suballocation distinction");
     require(report.find("\"frames_in_flight\": 1") != std::string::npos &&
-                report.find("shared_hdr_depth_shadow") != std::string::npos,
+                report.find("shared_hdr_depth_motion_shadow") != std::string::npos,
             "Report lost frame configuration");
+    require(report.find("\"motion_vectors_enabled\": true")!=std::string::npos &&
+                report.find("\"taa_enabled\": false")!=std::string::npos &&
+                report.find("\"temporal_jitter_enabled\": true")!=std::string::npos &&
+                report.find("\"temporal_camera_history_valid\": true")!=std::string::npos,
+            "Report confused motion foundation with completed TAA");
     require(report.find("\"presentation_release_proven\": false") != std::string::npos &&
                 report.find("legacy_wait_idle") != std::string::npos &&
                 report.find("\"pending_present_fences\": 0") != std::string::npos,
             "Report lost presentation fallback diagnostics");
+    require(report.find("\"gpu_taa_ms\":")!=std::string::npos,"Missing TAA timing field");
     require(report.find("\"gpu_output_ms\":") != std::string::npos &&
                 report.find("\"exposure_ev\":") != std::string::npos &&
                 report.find("R16G16B16A16_SFLOAT") != std::string::npos,
             "Report lost HDR output configuration/timing");
+    require(report.find("\"light_culling_requested\": \"clustered\"") != std::string::npos &&
+                report.find("\"gpu_culling_ms\": {\"p50\":0.125") != std::string::npos,
+            "Culling metadata or completed-frame timing lost");
+    require(report.find("\"sun_cascade_count\": 4")!=std::string::npos &&
+        report.find("\"sun_shadow_distance\": 40")!=std::string::npos,"Report lost actual CSM configuration");
+    std::ifstream csvInput(dir / "frames.csv");
+    std::string csv((std::istreambuf_iterator<char>(csvInput)), {});
+    require(csv.find("gpu_culling_ms,clustered_active,shadow_draws,main_draws") != std::string::npos &&
+                csv.find("5,0,0,0,0,0.125,1,0,0") != std::string::npos,
+            "CSV culling value/active flag columns misaligned");
     bool rejected = false;
     try {
       writeBenchmarkReport(dir, metadata, frames);

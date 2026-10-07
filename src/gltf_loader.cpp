@@ -525,6 +525,39 @@ Mesh primitive(cgltf_primitive const &p) {
     generateMeshTangents(mesh, true);
   return mesh;
 }
+PunctualLight importLight(cgltf_light const &source) {
+  PunctualLight light;
+  light.name = source.name ? source.name : "glTF light";
+  switch (source.type) {
+  case cgltf_light_type_directional:
+    light.type = PunctualLightType::Directional;
+    break;
+  case cgltf_light_type_point:
+    light.type = PunctualLightType::Point;
+    break;
+  case cgltf_light_type_spot:
+    light.type = PunctualLightType::Spot;
+    break;
+  default:
+    invalid("unknown punctual light type");
+  }
+  if (source.has_range && (!std::isfinite(source.range) || source.range <= 0))
+    invalid("punctual range must be positive when present");
+  if (light.type == PunctualLightType::Spot && !source.has_spot)
+    invalid("spot light requires spot object");
+  light.color = {source.color[0], source.color[1], source.color[2]};
+  light.intensity = source.intensity;
+  light.range = source.range;
+  light.innerCone = source.spot_inner_cone_angle;
+  light.outerCone = source.spot_outer_cone_angle;
+  try {
+    validatePunctualLight(light);
+  } catch (std::runtime_error const &error) {
+    invalid(error.what());
+  }
+  return light;
+}
+
 ImportedScene load(std::filesystem::path const &path,
                    cgltf_file_type expected) {
   cgltf_options options{};
@@ -537,7 +570,8 @@ ImportedScene load(std::filesystem::path const &path,
   auto supported = [](std::string_view extension) {
     return extension == "KHR_texture_transform" ||
            extension == "KHR_mesh_quantization" ||
-           extension == "KHR_materials_specular";
+           extension == "KHR_materials_specular" ||
+           extension == "KHR_lights_punctual";
   };
   ImportedScene result;
   for (std::size_t i = 0; i < data->extensions_required_count; ++i)
@@ -553,6 +587,8 @@ ImportedScene load(std::filesystem::path const &path,
         "load buffers");
   validateStorage(*data);
   check(cgltf_validate(data.get()), "validate");
+  for (std::size_t i = 0; i < data->lights_count; ++i)
+    (void)importLight(data->lights[i]);
   for (std::size_t i = 0; i < data->materials_count; ++i)
     result.materials.push_back(material(data->materials[i], path));
   std::optional<MaterialId> defaultId;
@@ -613,6 +649,23 @@ ImportedScene load(std::filesystem::path const &path,
       for (int r = 0; r < 4; ++r)
         if (!std::isfinite(world[c][r]))
           invalid("non-finite node transform.");
+    if (node.light) {
+      auto const &source = *node.light;
+      auto light = importLight(source);
+      if (!source.name && node.name)
+        light.name = node.name;
+      light.position = glm::vec3(world * glm::vec4(0, 0, 0, 1));
+      light.direction = glm::vec3(world * glm::vec4(0, 0, -1, 0));
+      try {
+        validatePunctualLight(light);
+      } catch (std::runtime_error const &error) {
+        invalid(error.what());
+      }
+      if (light.type != PunctualLightType::Point)
+        light.direction =
+            glm::vec3(glm::normalize(glm::dvec3(light.direction)));
+      result.lights.push_back(std::move(light));
+    }
     if (node.mesh)
       for (auto const &ref : refs.at(node.mesh - data->meshes)) {
         SceneObject object;

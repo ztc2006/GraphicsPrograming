@@ -15,7 +15,7 @@
 
 ## 已实现的导入适配层
 
-`deps/cgltf` 固定 v1.15 / `bbeb5b0b070ddacddac6852fb72143eb68454937`，保留许可证和 `provenance.json` SHA256；上游文件未修改。CMake 建独立库，依赖源码纳入测量 source fingerprint。UI/Renderer 不接收 cgltf 类型。
+`deps/cgltf` 固定 v1.15 / `bbeb5b0b070ddacddac6852fb72143eb68454937`，保留许可证和 `provenance.json` SHA256；M1-C 当时未修改上游文件；M4-A 的灯光属性存在性补丁见 [记录](../deps/cgltf/LOCAL_PATCHES.md)，provenance 同时保留原始和本地哈希。CMake 建独立库，依赖源码纳入测量 source fingerprint。UI/Renderer 不接收 cgltf 类型。
 
 `gltf_loader.cpp` 替换手写 JSON、GLB、buffer/accessor 解析。RAII 释放解析结果；项目层在 accessor 解包前校验 bufferView 范围、stride、alignment、sparse 顺序和索引边界，再调用库验证。减法/除法检查避免 offset/count 溢出。
 

@@ -95,14 +95,60 @@ int main() {
                 material.specularFactor == 1 &&
                 material.specularColorFactor == glm::vec3(1),
             "Absent extension/extension field defaults changed core material");
-    for (auto const *name :
-         {"required_extension.gltf", "specular_bad_strength.gltf",
-          "specular_negative_color.gltf", "specular_nonfinite_color.gltf",
-          "specular_missing_uv.gltf", "specular_missing_image.gltf",
-          "specular_unlit.gltf", "specular_specgloss.gltf", "short_view.gltf",
-          "overflow_view.gltf", "cycle.gltf", "bad_sparse_index.gltf",
-          "duplicate_sparse_index.gltf", "bad_triangle_index.gltf",
-          "bad_color_alpha.gltf", "bad_color_rgb.gltf"}) {
+    for (auto extension :
+         {"punctual_semantics.gltf", "punctual_semantics.glb"}) {
+      auto path = std::filesystem::path{TEST_ADAPTER_FIXTURES} / extension;
+      auto lightsScene = path.extension() == ".glb"
+                             ? loadStaticGlbScene(path, {})
+                             : loadStaticGltfScene(path, {});
+      auto const &ls = lightsScene.lights;
+      require(lightsScene.warnings.empty() && ls.size() == 4 &&
+                  ls[0].type == PunctualLightType::Directional &&
+                  ls[1].type == PunctualLightType::Spot &&
+                  ls[2].type == PunctualLightType::Point,
+              "Selected-scene light instances/type/required extension failed");
+      require(glm::length(ls[0].direction - glm::vec3(-1, 0, 0)) < 1e-5f &&
+                  ls[1].position == glm::vec3(1, 2, 7) &&
+                  ls[1].direction == glm::vec3(0, 0, -1) && ls[1].range == 12 &&
+                  ls[1].intensity == 32 && near(ls[1].innerCone, .2f) &&
+                  near(ls[1].outerCone, .6f),
+              "World light transform scaled photometric units/range/cones or "
+              "lost local -Z");
+      require(ls[2].position == glm::vec3(4, 5, 6) &&
+                  ls[3].position == glm::vec3(-4, -5, -6) &&
+                  ls[2].color == glm::vec3(1, .25f, .5f) && ls[2].range == 8 &&
+                  ls[2].intensity == 16,
+              "Shared light definition was not instantiated per selected node");
+    }
+    auto ld = fixture("punctual_defaults.gltf").lights;
+    require(ld.size() == 3 && ld[0].range == 0 && ld[0].intensity == 1 &&
+                ld[0].color == glm::vec3(1) && ld[1].innerCone == 0 &&
+                near(ld[1].outerCone, .78539816f) && ld[2].range == 0,
+            "Absent punctual fields failed Khronos defaults");
+    for (auto const *name : {"punctual_zero_range.gltf",
+                             "punctual_negative_range.gltf",
+                             "punctual_negative_intensity.gltf",
+                             "punctual_bad_color.gltf",
+                             "punctual_missing_spot.gltf",
+                             "punctual_equal_cones.gltf",
+                             "punctual_oversized_cone.gltf",
+                             "punctual_degenerate_direction.gltf",
+                             "required_extension.gltf",
+                             "specular_bad_strength.gltf",
+                             "specular_negative_color.gltf",
+                             "specular_nonfinite_color.gltf",
+                             "specular_missing_uv.gltf",
+                             "specular_missing_image.gltf",
+                             "specular_unlit.gltf",
+                             "specular_specgloss.gltf",
+                             "short_view.gltf",
+                             "overflow_view.gltf",
+                             "cycle.gltf",
+                             "bad_sparse_index.gltf",
+                             "duplicate_sparse_index.gltf",
+                             "bad_triangle_index.gltf",
+                             "bad_color_alpha.gltf",
+                             "bad_color_rgb.gltf"}) {
       bool rejected = false;
       try {
         (void)fixture(name);

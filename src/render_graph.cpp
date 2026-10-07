@@ -1,6 +1,7 @@
 #include "render_graph.hpp"
 #include <algorithm>
 #include <optional>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 
@@ -102,6 +103,46 @@ void applyUse(G::Image const &image, G::State &state, G::Use const &use,
                     (use.load == vk::AttachmentLoadOp::eClear ||
                      use.load == vk::AttachmentLoadOp::eLoad || use.fullOverwrite);
 }
+G::BufferState desired(G::BufferUsage usage) {
+  using S = vk::PipelineStageFlagBits2;
+  using A = vk::AccessFlagBits2;
+  switch (usage) {
+  case G::BufferUsage::ComputeRead: return {S::eComputeShader, A::eShaderStorageRead};
+  case G::BufferUsage::ComputeWrite: return {S::eComputeShader, A::eShaderStorageWrite};
+  case G::BufferUsage::VertexRead: return {S::eVertexShader, A::eShaderStorageRead};
+  case G::BufferUsage::FragmentRead: return {S::eFragmentShader, A::eShaderStorageRead};
+  }
+  throw std::runtime_error("Unknown graph buffer usage");
+}
+void applyBuffer(G::Buffer const &buffer, G::BufferState &state, G::BufferUse use,
+                 std::vector<vk::BufferMemoryBarrier2> &barriers) {
+  if (!(buffer.usage & vk::BufferUsageFlagBits::eStorageBuffer))
+    throw std::runtime_error("Graph buffer lacks storage usage: " + buffer.name);
+  auto next = desired(use.usage);
+  if (!writes(next.access) && !state.defined)
+    throw std::runtime_error("Graph read of undefined buffer: " + buffer.name);
+  if (use.fullOverwrite && !writes(next.access))
+    throw std::runtime_error("Overwrite on read-only buffer use");
+  next.defined = state.defined || (writes(next.access) && use.fullOverwrite);
+  bool newReadStage = !writes(next.access) && bool(state.writerAccess) &&
+      (state.stages & next.stages) != next.stages;
+  if (writes(state.access) || writes(next.access) || newReadStage)
+    barriers.push_back(vk::BufferMemoryBarrier2{
+        .srcStageMask = state.stages | state.writerStages,
+        .srcAccessMask = state.access | state.writerAccess,
+        .dstStageMask = next.stages, .dstAccessMask = next.access,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .buffer = buffer.buffer, .offset = buffer.offset, .size = buffer.size});
+  if (writes(next.access)) {
+    next.writerStages = next.stages; next.writerAccess = next.access;
+  } else {
+    next.writerStages = writes(state.access) ? state.stages : state.writerStages;
+    next.writerAccess = writes(state.access) ? state.access : state.writerAccess;
+    if (!writes(state.access)) { next.stages |= state.stages; next.access |= state.access; }
+  }
+  state = next;
+}
 void emit(vk::CommandBuffer command, std::vector<vk::ImageMemoryBarrier2> const &barriers) {
   if (!barriers.empty())
     command.pipelineBarrier2(vk::DependencyInfo{
@@ -125,12 +166,24 @@ RenderGraph::ImageId RenderGraph::importImage(Image image) {
   images_.push_back(std::move(image));
   return id;
 }
-RenderGraph::PassId RenderGraph::addPass(std::string name, std::vector<Use> uses) {
+RenderGraph::BufferId RenderGraph::importBuffer(Buffer buffer) {
+  if (buffer.name.empty() || !buffer.buffer || !buffer.size || buffer.size == VK_WHOLE_SIZE ||
+      buffer.offset > std::numeric_limits<vk::DeviceSize>::max() - buffer.size)
+    throw std::runtime_error("Invalid graph buffer description");
+  for (auto const &existing : buffers_)
+    if (existing.buffer == buffer.buffer || existing.name == buffer.name)
+      throw std::runtime_error("Duplicate graph buffer/identity: " + buffer.name);
+  BufferId id{std::uint32_t(buffers_.size())};
+  buffers_.push_back(std::move(buffer));
+  return id;
+}
+RenderGraph::PassId RenderGraph::addPass(std::string name, std::vector<Use> uses,
+                                       std::vector<BufferUse> buffers) {
   if (name.empty()) throw std::runtime_error("Graph pass requires a name");
   for (auto const &p : passes_)
     if (p.name == name) throw std::runtime_error("Duplicate graph pass name: " + name);
   PassId id{std::uint32_t(passes_.size())};
-  passes_.push_back({id, std::move(name), std::move(uses), {}, {}});
+  passes_.push_back({id, std::move(name), std::move(uses), {}, {}, std::move(buffers), {}});
   return id;
 }
 void RenderGraph::dependsOn(PassId pass, PassId predecessor) {
@@ -148,9 +201,12 @@ void RenderGraph::exportImage(ImageId image, Usage usage) {
 RenderGraph::Plan RenderGraph::compile() const {
   Plan plan;
   plan.images_ = images_;
+  plan.buffers_ = buffers_;
   std::vector<std::vector<bool>> edges(passes_.size(), std::vector<bool>(passes_.size()));
   std::vector<std::optional<PassId>> writer(images_.size());
   std::vector<std::vector<PassId>> readers(images_.size());
+  std::vector<std::optional<PassId>> bufferWriter(buffers_.size());
+  std::vector<std::vector<PassId>> bufferReaders(buffers_.size());
   for (auto const &pass : passes_) {
     unsigned colors = 0, depths = 0;
     std::optional<vk::Extent2D> extent;
@@ -179,10 +235,24 @@ RenderGraph::Plan RenderGraph::compile() const {
         writer[index] = pass.id;
       } else readers[index].push_back(pass.id);
     }
-    if (colors > 1 || depths > 1) throw std::runtime_error("Minimal graph supports one color and one depth attachment");
+    std::vector<bool> seenBuffers(buffers_.size());
+    for (auto const &use : pass.bufferUses) {
+      if (use.buffer.value >= buffers_.size()) throw std::runtime_error("Invalid graph buffer ID");
+      auto index = use.buffer.value;
+      if (seenBuffers[index]) throw std::runtime_error("Duplicate graph buffer use");
+      seenBuffers[index] = true;
+      if (bufferWriter[index]) edges[bufferWriter[index]->value][pass.id.value] = true;
+      if (writes(desired(use.usage).access)) {
+        for (auto reader : bufferReaders[index]) edges[reader.value][pass.id.value] = true;
+        bufferReaders[index].clear(); bufferWriter[index] = pass.id;
+      } else bufferReaders[index].push_back(pass.id);
+    }
+    if (colors > 4 || depths > 1) throw std::runtime_error("Minimal graph supports up to four colors and one depth attachment");
   }
   std::vector<State> states;
   for (auto const &image : images_) states.push_back(image.initial);
+  std::vector<BufferState> bufferStates;
+  for (auto const &buffer : buffers_) bufferStates.push_back(buffer.initial);
   std::vector<bool> emitted(passes_.size());
   for (std::size_t count = 0; count < passes_.size(); ++count) {
     std::optional<std::size_t> ready;
@@ -200,6 +270,8 @@ RenderGraph::Plan RenderGraph::compile() const {
       if (edges[j][*ready]) pass.dependencies.push_back(PassId{std::uint32_t(j)});
     for (auto const &use : pass.uses)
       applyUse(images_[use.image.value], states[use.image.value], use, pass.barriers);
+    for (auto const &use : pass.bufferUses)
+      applyBuffer(buffers_[use.buffer.value], bufferStates[use.buffer.value], use, pass.bufferBarriers);
     plan.passes_.push_back(std::move(pass));
     emitted[*ready] = true;
   }
@@ -209,6 +281,7 @@ RenderGraph::Plan RenderGraph::compile() const {
     transition(images_[image.value], states[image.value], usage, plan.exports_);
   }
   plan.final_ = states;
+  plan.bufferFinal_ = bufferStates;
   for (auto const &image : images_) plan.recorded_.push_back(image.initial);
   return plan;
 }
@@ -220,12 +293,20 @@ RenderGraph::State const &RenderGraph::Plan::recordedState(ImageId id) const {
   if (id.value >= recorded_.size()) throw std::runtime_error("Invalid graph state ID");
   return recorded_[id.value];
 }
+RenderGraph::BufferState const &RenderGraph::Plan::finalBufferState(BufferId id) const {
+  if (id.value >= bufferFinal_.size()) throw std::runtime_error("Invalid graph buffer state ID");
+  return bufferFinal_[id.value];
+}
 void RenderGraph::Plan::record(vk::CommandBuffer command,
                              std::function<void(Pass const &, Event)> const &callback) {
   if (!command || started_) throw std::runtime_error("Invalid/reused graph recording");
   started_ = true;
   for (auto const &pass : passes_) {
     emit(command, pass.barriers);
+    if (!pass.bufferBarriers.empty())
+      command.pipelineBarrier2(vk::DependencyInfo{
+          .bufferMemoryBarrierCount = std::uint32_t(pass.bufferBarriers.size()),
+          .pBufferMemoryBarriers = pass.bufferBarriers.data()});
     for (auto const &use : pass.uses) {
       auto next = desired(use.usage);
       next.defined = recorded_[use.image.value].defined;
@@ -237,8 +318,9 @@ void RenderGraph::Plan::record(vk::CommandBuffer command,
       recorded_[use.image.value] = next;
     }
     callback(pass, Event::Begin);
-    vk::RenderingAttachmentInfo color{}, depth{};
-    bool hasColor = false, hasDepth = false;
+    std::vector<vk::RenderingAttachmentInfo> colors;
+    vk::RenderingAttachmentInfo depth{};
+    bool hasDepth = false;
     vk::Extent2D extent{};
     for (auto const &use : pass.uses) {
       if (!attachment(use.usage)) continue;
@@ -247,20 +329,20 @@ void RenderGraph::Plan::record(vk::CommandBuffer command,
           .imageView = image.view, .imageLayout = desired(use.usage).layout,
           .loadOp = use.load, .storeOp = use.store, .clearValue = use.clear};
       extent = image.extent;
-      if (use.usage == Usage::ColorAttachment) { color = info; hasColor = true; }
+      if (use.usage == Usage::ColorAttachment) colors.push_back(info);
       else { depth = info; hasDepth = true; }
     }
-    if (hasColor || hasDepth) {
+    if (!colors.empty() || hasDepth) {
       command.beginRendering(vk::RenderingInfo{
           .renderArea = {{0, 0}, extent}, .layerCount = 1,
-          .colorAttachmentCount = hasColor ? 1u : 0u,
-          .pColorAttachments = hasColor ? &color : nullptr,
+          .colorAttachmentCount = std::uint32_t(colors.size()),
+          .pColorAttachments = colors.data(),
           .pDepthAttachment = hasDepth ? &depth : nullptr});
       command.setViewport(0, {vk::Viewport{0, 0, float(extent.width), float(extent.height), 0, 1}});
       command.setScissor(0, {vk::Rect2D{{0, 0}, extent}});
     }
     callback(pass, Event::Draw);
-    if (hasColor || hasDepth) command.endRendering();
+    if (!colors.empty() || hasDepth) command.endRendering();
     for (auto const &use : pass.uses)
       if (attachment(use.usage))
         recorded_[use.image.value].defined = use.store == vk::AttachmentStoreOp::eStore &&
@@ -299,6 +381,13 @@ std::string RenderGraph::Plan::dump() const {
       out << '\n';
     }
     barriers(pass.barriers);
+    for (auto const &use : pass.bufferUses)
+      out << "  buffer " << buffers_[use.buffer.value].name << " usage=" << int(use.usage)
+          << " full=" << use.fullOverwrite << '\n';
+    for (auto const &barrier : pass.bufferBarriers)
+      out << "  buffer barrier src=" << vk::to_string(barrier.srcStageMask) << '/'
+          << vk::to_string(barrier.srcAccessMask) << " dst=" << vk::to_string(barrier.dstStageMask)
+          << '/' << vk::to_string(barrier.dstAccessMask) << " bytes=" << barrier.size << '\n';
   }
   out << "exports\n";
   barriers(exports_);

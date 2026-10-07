@@ -2,6 +2,7 @@
 
 #include <array>
 #include <vector>
+#include <span>
 
 #include "glm_include.hpp"
 #include "hdr_image.hpp"
@@ -39,5 +40,6 @@ void validateEnvironmentBakeSettings(EnvironmentBakeSettings const &);
 glm::vec3 environmentCubeDirection(unsigned face, float s, float t);
 glm::vec2 integrateEnvironmentBrdf(float noV, float roughness,
                                    std::uint32_t samples);
+HdrImage environmentCubeToEquirectangular(std::span<float const> rgba, unsigned faceSize);
 BakedEnvironment bakeEnvironment(HdrImage const &,
                                  EnvironmentBakeSettings const & = {});

@@ -1,4 +1,6 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
+#include "indoor_lighting.glsl"
 
 layout(set = 0, binding = 0) uniform FrameUbo {
   mat4 viewProj;
@@ -16,6 +18,7 @@ layout(push_constant) uniform PushConstants {
   vec4 materialTint;
   vec4 surfaceParams;
   vec4 alphaParams;
+  ivec4 shadowPass;
 } pushConstants;
 
 layout(location = 0) in vec3 inPosition;
@@ -26,7 +29,10 @@ layout(location = 0) out vec2 outUv;
 layout(location = 1) out float outAlpha;
 
 void main() {
-  gl_Position = ubo.lightViewProj * pushConstants.transform *
+  int index = pushConstants.shadowPass.x;
+  mat4 lightMatrix = index >= 0 ? indoor.spotViewProj[index]
+      : index == -1 ? ubo.lightViewProj : indoor.sunViewProj[-index - 2];
+  gl_Position = lightMatrix * pushConstants.transform *
                 vec4(inPosition, 1.0);
   outUv = inUv;
   outAlpha = inAlpha;
