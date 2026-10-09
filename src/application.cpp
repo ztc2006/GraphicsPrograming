@@ -1,8 +1,10 @@
 #include "pch.hpp"
 
 #include "application.hpp"
-#include "lighting_presets.hpp"
 #include "build_info.hpp"
+#include "frustum.hpp"
+#include "lighting_presets.hpp"
+#include "viewer_scene_prepare.hpp"
 
 #include <algorithm>
 #include <array>
@@ -41,10 +43,6 @@ constexpr bool kEnableValidationLayers = true;
 #endif
 
 using RenderQueueItem = Renderer::DrawItem;
-
-struct Frustum {
-  std::array<glm::vec4, 6> planes{};
-};
 
 struct RenderQueueBuckets {
   std::vector<RenderQueueItem> opaque;
@@ -115,6 +113,8 @@ RenderQueueBuckets buildRenderQueues(SceneEcs const &sceneEcs,
       item.sortDepthSq = glm::dot(delta, delta);
     }
 
+    item.primaryVisible = renderable.primaryVisible;
+    item.shadowCaster = renderable.shadowCaster;
     Material const &material = assets.materials[renderable.materialId];
     switch (material.alphaMode) {
     case AlphaMode::Opaque:
@@ -130,54 +130,6 @@ RenderQueueBuckets buildRenderQueues(SceneEcs const &sceneEcs,
   });
 
   return buckets;
-}
-
-glm::vec4 matrixRow(glm::mat4 const &matrix, int row) {
-  return {matrix[0][row], matrix[1][row], matrix[2][row], matrix[3][row]};
-}
-
-glm::vec4 normalizePlane(glm::vec4 plane) {
-  float const length = glm::length(glm::vec3{plane});
-  if (length <= 0.0f) {
-    return plane;
-  }
-  return plane / length;
-}
-
-Frustum extractFrustum(glm::mat4 const &viewProjMatrix) {
-  glm::vec4 const row0 = matrixRow(viewProjMatrix, 0);
-  glm::vec4 const row1 = matrixRow(viewProjMatrix, 1);
-  glm::vec4 const row2 = matrixRow(viewProjMatrix, 2);
-  glm::vec4 const row3 = matrixRow(viewProjMatrix, 3);
-
-  return Frustum{{
-      normalizePlane(row3 + row0),
-      normalizePlane(row3 - row0),
-      normalizePlane(row3 + row1),
-      normalizePlane(row3 - row1),
-      normalizePlane(row2),
-      normalizePlane(row3 - row2),
-  }};
-}
-
-bool intersectsFrustum(Frustum const &frustum, Aabb const &bounds) {
-  if (!bounds.valid) {
-    return true;
-  }
-
-  for (glm::vec4 const &plane : frustum.planes) {
-    glm::vec3 const positiveVertex{
-        plane.x >= 0.0f ? bounds.max.x : bounds.min.x,
-        plane.y >= 0.0f ? bounds.max.y : bounds.min.y,
-        plane.z >= 0.0f ? bounds.max.z : bounds.min.z,
-    };
-
-    if (glm::dot(glm::vec3{plane}, positiveVertex) + plane.w < 0.0f) {
-      return false;
-    }
-  }
-
-  return true;
 }
 
 std::vector<RenderQueueItem>
@@ -291,7 +243,9 @@ struct Application::SceneLoad {
 };
 
 Application::Application(ViewerOptions options)
-    : options_(std::move(options)), startupScenePath_(options_.scene) {}
+    : options_(std::move(options)), startupScenePath_(options_.scene) {
+  frustumCullingEnabled_=options_.cameraCulling;
+}
 
 Application::~Application() = default;
 
@@ -366,7 +320,17 @@ void Application::initVulkan() {
                                            options_.present);
   renderer_ = std::make_unique<Renderer>(*device_, options_.framesInFlight);
   renderer_->recreateForSwapChain(*swapChain_);
+  if (options_.renderMethod == "ray-tracing")
+    renderer_->setRenderMethod(Renderer::RenderMethod::RayTracing);
+  renderer_->setAoSettings({.enabled = options_.ao,
+                            .radius = options_.aoRadius,
+                            .strength = options_.aoStrength,
+                            .debug = options_.aoDebug == "raw" ? AoDebug::Raw
+                                     : options_.aoDebug == "filtered"
+                                         ? AoDebug::Filtered
+                                         : AoDebug::None});
   renderer_->setTaaEnabled(options_.taa);
+  renderer_->setShadowCasterCullingEnabled(options_.shadowCulling);
   renderer_->setTaaHistoryFilter(options_.taaHistory=="bilinear"?TaaHistoryFilter::Bilinear:TaaHistoryFilter::CatmullRom);
   auto loadStart = std::chrono::steady_clock::now();
   if (startupScenePath_) {
@@ -469,6 +433,9 @@ void Application::mainLoop() {
   benchmarkMetadata_.punctualLightCount=std::count_if(scene_.lighting.punctualLights.begin(),scene_.lighting.punctualLights.end(),[](auto const &l){return l.enabled;});
   benchmarkMetadata_.spotShadowCount=renderer_->spotShadowsAssigned();
   benchmarkMetadata_.localProbeValid=scene_.lighting.localProbe.enabled && renderer_->localProbeValid();
+  benchmarkMetadata_.detailReflectionProbeValid =
+      scene_.lighting.detailReflectionProbe.enabled &&
+      renderer_->detailReflectionProbeValid();
   benchmarkStart_ = lastFrameTime_ = std::chrono::steady_clock::now();
   double lastMemorySample = -1;
   auto temporalCameraIndex = scene_.activeCameraIndex;
@@ -819,6 +786,14 @@ void Application::drawImGui() {
       ImGui::DragFloat3("Probe position", &probe.position.x,.05f);
       ImGui::DragFloat3("Room minimum", &probe.minimum.x,.05f);
       ImGui::DragFloat3("Room maximum", &probe.maximum.x,.05f);
+      auto &detail = scene_.lighting.detailReflectionProbe;
+      ImGui::Checkbox("Small reflection region", &detail.enabled);
+      ImGui::DragFloat3("Reflection position", &detail.position.x, .01f);
+      ImGui::DragFloat3("Reflection minimum", &detail.minimum.x, .01f);
+      ImGui::DragFloat3("Reflection maximum", &detail.maximum.x, .01f);
+      ImGui::Text("Small reflection: %s",
+                  renderer_->detailReflectionProbeValid() ? "captured"
+                                                          : "not captured");
       if (ImGui::Button("Capture / refresh probe")) {probe.enabled=true;probeCaptureRequested_=true;}
       ImGui::Text("Probe: %s", !renderer_->localProbeValid() ? "not captured (global sky fallback)" :
         renderer_->localProbeMatches(scene_.lighting) ? "ready" : "scene/lighting/bounds changed - refresh required");
@@ -1068,7 +1043,14 @@ void Application::drawImGui() {
                                    ? "alpha from base color"
                                    : material.alphaPath.c_str());
       ImGui::Text("Mode: %s", alphaModeLabel(material.alphaMode));
+      if(material.optical.enabled) {
+        ImGui::Text("Dielectric IOR %.3f / transmission %.3f",material.optical.ior,material.optical.transmission);
+        ImGui::TextUnformatted("Raster: captured-probe refraction approximation");
+      }
       ImGui::Text("Double-sided: %s", material.doubleSided ? "Yes" : "No");
+      if (material.sourceAreaLight)
+        ImGui::TextWrapped("Imported light card: retained in probe "
+                           "illumination, hidden from the camera and shadows.");
       if (ImGui::ColorEdit4("Tint", &material.tint.x)) {
         renderer_->setMaterialTint(
             static_cast<MaterialId>(selectedMaterialIndex_), material.tint);
@@ -1123,6 +1105,34 @@ void Application::drawImGui() {
   ImGui::End();
 
   if (ImGui::Begin("Render Debug")) {
+    int method = int(renderer_->renderMethod());
+    char const *methods[] = {"Raster", "Ray tracing"};
+    if (ImGui::Combo("Rendering method", &method, methods, 2))
+      if (method == 0 || renderer_->rayTracingAvailable())
+        renderer_->setRenderMethod(Renderer::RenderMethod(method));
+    if (!renderer_->rayTracingAvailable())
+      ImGui::TextWrapped("Ray tracing unavailable: %s", renderer_->rayTracingUnavailableReason().c_str());
+    else if (renderer_->renderMethod() == Renderer::RenderMethod::RayTracing) {
+      ImGui::TextUnformatted("RT-B: path tracing / still-frame accumulation");
+      ImGui::Text("RT samples: %u", renderer_->rayTracingSamples());
+    }
+    auto ao = renderer_->aoSettings();
+    bool aoChanged = ImGui::Checkbox("GTAO", &ao.enabled);
+    aoChanged |=
+        ImGui::SliderFloat("AO world radius", &ao.radius, .01f, 5.f, "%.2f");
+    aoChanged |=
+        ImGui::SliderFloat("AO strength", &ao.strength, 0.f, 2.f, "%.2f");
+    int aoDebug = int(ao.debug);
+    char const *aoViews[] = {"Lighting", "Raw AO", "Filtered AO"};
+    aoChanged |= ImGui::Combo("AO view", &aoDebug, aoViews, 3);
+    ao.debug = AoDebug(aoDebug);
+    if (aoChanged)
+      renderer_->setAoSettings(ao);
+    ImGui::Text("AO GPU %.3f ms (horizon %.3f / filter %.3f / composite %.3f)",
+                renderer_->gpuTimings().aoMs,
+                renderer_->gpuTimings().aoHorizonMs,
+                renderer_->gpuTimings().aoFilterMs,
+                renderer_->gpuTimings().aoCompositeMs);
     bool taa=renderer_->taaEnabled();
     if(ImGui::Checkbox("TAA",&taa))renderer_->setTaaEnabled(taa);
     int filter=int(renderer_->taaHistoryFilter());
@@ -1161,6 +1171,8 @@ void Application::drawImGui() {
     auto const &sync = renderer_->cpuSyncTimes();
     ImGui::Text("CPU fence / acquire / present call: %.3f / %.3f / %.3f ms",
                 sync.fenceMs, sync.acquireMs, sync.presentMs);
+    if(sync.acquireMs>100)
+      ImGui::TextWrapped("Long acquire wait. Hidden or occluded windows may be paced by the compositor; keep the viewer visible when measuring performance.");
     ImGui::Text("Device: %s",
                 device_->physicalDevice().getProperties().deviceName.data());
     if (ImGui::CollapsingHeader("Render Graph"))
@@ -1172,6 +1184,11 @@ void Application::drawImGui() {
     ImGui::Checkbox("Normal/Bump Mapping", &normalMapDebugEnabled_);
     ImGui::Checkbox("Parallax Mapping", &parallaxDebugEnabled_);
     ImGui::Checkbox("Frustum Culling", &frustumCullingEnabled_);
+    bool shadowCulling=renderer_->shadowCasterCullingEnabled();
+    if(ImGui::Checkbox("Shadow caster culling", &shadowCulling))
+      renderer_->setShadowCasterCullingEnabled(shadowCulling);
+    auto const &draws=renderer_->drawStatistics();
+    ImGui::Text("Shadow candidates / culled: %u / %u",draws.shadowCandidates,draws.shadowCulled);
     ImGui::Checkbox("Show AABBs", &showAabbDebug_);
     ImGui::Text("Objects: %zu", sceneEcs_.entityCount());
     ImGui::Text("ECS Entities: %zu", sceneEcs_.entityCount());
@@ -1606,6 +1623,7 @@ void Application::loadScene(std::filesystem::path const &path) {
     if (!std::filesystem::is_regular_file(path))
       throw std::runtime_error("Scene file not found: " + path.string());
     ImportedScene loaded = loadStaticModelScene(path, {});
+    prepareImportedSceneForViewer(loaded);
     // Check the actual device limit before preparing GPU assets or publishing a
     // candidate; an oversized scene must preserve the current scene and lights.
     (void)packPunctualLights(loaded.lights, lightLimit);
@@ -1690,6 +1708,7 @@ void Application::advanceSceneLoad(bool waitForStartup) {
   sceneEcs_ = std::move(next.ecs);
   scene_.cameras.swap(next.cameras);
   scene_.lighting.localProbe.enabled=false;
+  scene_.lighting.detailReflectionProbe.enabled = false;
   probeCaptureRequested_=false;
   probeCaptureError_.clear();
   activeLightingPreset_="asset";
@@ -1734,6 +1753,7 @@ void Application::useAssetLighting() {
   scene_.lighting.punctualLights=assetLights_;
   scene_.lighting.sunEnabled=assetLights_.empty();
   scene_.lighting.localProbe.enabled=false;
+  scene_.lighting.detailReflectionProbe.enabled = false;
   activeLightingPreset_="asset";
   probeCaptureRequested_=false;
 }
@@ -1913,6 +1933,16 @@ void Application::finishBenchmark() {
   benchmarkMetadata_.validationWarnings = validationWarnings_;
   benchmarkMetadata_.engineResources = renderer_->resourceSnapshot();
   benchmarkMetadata_.taaHistoryFilter=renderer_->taaHistoryFilter()==TaaHistoryFilter::CatmullRom?"catmull-rom":"bilinear";
+  benchmarkMetadata_.cameraCulling=frustumCullingEnabled_;
+  benchmarkMetadata_.shadowCulling=renderer_->shadowCasterCullingEnabled();
+  benchmarkMetadata_.aoEnabled = renderer_->aoActive();
+  benchmarkMetadata_.aoRadius = renderer_->aoSettings().radius;
+  benchmarkMetadata_.aoStrength = renderer_->aoSettings().strength;
+  benchmarkMetadata_.aoDebug =
+      renderer_->aoSettings().debug == AoDebug::Raw        ? "raw"
+      : renderer_->aoSettings().debug == AoDebug::Filtered ? "filtered"
+                                                           : "none";
+  benchmarkMetadata_.renderMethod=renderer_->renderMethod()==Renderer::RenderMethod::RayTracing?"ray-tracing":"raster";
   benchmarkMetadata_.taaEnabled=renderer_->taaActive();
   benchmarkMetadata_.temporalJitterEnabled=renderer_->temporalJitterEnabled();
   benchmarkMetadata_.temporalHistoryValid=renderer_->temporalCamera().previousCamera.w>.5f;

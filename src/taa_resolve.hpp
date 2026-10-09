@@ -23,7 +23,8 @@ public:
   static constexpr vk::Format colorFormat = vk::Format::eR16G16B16A16Sfloat;
   static constexpr vk::Format depthFormat = vk::Format::eR32Sfloat;
   TaaResolve(Device const &, vk::Extent2D, vk::ImageView color,
-             vk::ImageView depth, vk::ImageView motion);
+             vk::ImageView depth, vk::ImageView motion,
+             vk::ImageView alternativeColor = {});
   struct Frame {
     RenderGraph::ImageId color[2], depth[2];
     RenderGraph::PassId resolve;
@@ -31,7 +32,7 @@ public:
   };
   Frame addPass(RenderGraph &, RenderGraph::ImageId color,
                 RenderGraph::ImageId depth, RenderGraph::ImageId motion) const;
-  void draw(vk::CommandBuffer, TaaPush) const;
+  void draw(vk::CommandBuffer, TaaPush, bool alternative = false) const;
   void submitted(RenderGraph::Plan const &, Frame const &);
   void reset() { ready_ = false; }
   bool ready() const { return ready_; }
@@ -54,7 +55,7 @@ private:
   vk::raii::Sampler nearest_ = nullptr, linear_ = nullptr;
   vk::raii::DescriptorSetLayout setLayout_ = nullptr;
   vk::raii::DescriptorPool pool_ = nullptr;
-  std::array<vk::DescriptorSet, 2> sets_;
+  std::array<vk::DescriptorSet, 4> sets_;
   vk::raii::PipelineLayout layout_ = nullptr;
   vk::raii::Pipeline pipeline_ = nullptr;
   std::array<RenderGraph::State, 2> colorStates_, depthStates_;

@@ -15,6 +15,8 @@ layout(set = 1, binding = 7) uniform MaterialUbo {
   vec4 pbrParams;
   vec4 emissiveFactor;
   vec4 specularColorAndWeight;
+  vec4 optical;
+  vec4 absorptionThickness;
 } material;
 layout(set = 1, binding = 8) uniform sampler2D baseAlbedoTexture;
 layout(set = 1, binding = 9) uniform sampler2D baseAlphaMaskTexture;
@@ -26,6 +28,7 @@ layout(push_constant) uniform PushConstants {
   vec4 materialTint;
   vec4 surfaceParams;
   vec4 alphaParams;
+  ivec4 passData;
 }
 pushConstants;
 
@@ -80,39 +83,13 @@ layout(location=12) in vec4 inCurrentClip;
 layout(location=13) in vec4 inPreviousClip;
 layout(location=14) flat in float inMotionValid;
 layout(location=1) out vec4 outMotion;
+layout(location=2) out vec4 outIndirectDiffuse;
 layout(location = 0) out vec4 outFragColor;
 
 const float PI = 3.14159265359;
 
-float distributionGGX(vec3 N, vec3 H, float roughness) {
-  float alpha = roughness * roughness;
-  float alphaSquared = alpha * alpha;
-  float nDotH = max(dot(N, H), 0.0);
-  float denominator = nDotH * nDotH * (alphaSquared - 1.0) + 1.0;
-  return alphaSquared / max(PI * denominator * denominator, 0.000001);
-}
-
-float geometrySchlickGGX(float nDotDirection, float roughness) {
-  float remapped = roughness + 1.0;
-  float k = remapped * remapped / 8.0;
-  return nDotDirection /
-         max(nDotDirection * (1.0 - k) + k, 0.000001);
-}
-
-float geometrySmith(vec3 N, vec3 V, vec3 L, float roughness) {
-  return geometrySchlickGGX(max(dot(N, V), 0.0), roughness) *
-         geometrySchlickGGX(max(dot(N, L), 0.0), roughness);
-}
-
-vec3 fresnelSchlick(float cosTheta, vec3 F0, float F90) {
-  return F0 + (F90 - F0) *
-                  pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
-}
-
-vec3 fresnelSchlickRoughness(float cosTheta, vec3 F0, float roughness) {
-  return F0 + (max(vec3(1.0 - roughness), F0) - F0) *
-                  pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
-}
+#include "pbr_shared.glsl"
+#include "dielectric_shared.glsl"
 
 vec3 rotateEnvironmentDirection(vec3 direction) {
   float rotation = ubo.environmentParams.y;
@@ -392,6 +369,7 @@ vec3 punctualDirect(vec3 N, vec3 V, vec3 albedo, float metallic,
 }
 
 void main() {
+  outIndirectDiffuse=vec4(0);
   outMotion = temporalMotion(inCurrentClip, inPreviousClip, inMotionValid);
   // Compute derivatives before discard and divergent cascade selection.
   receiverDx = dFdx(inWorldPos); receiverDy = dFdy(inWorldPos);
@@ -419,6 +397,8 @@ void main() {
   vec2 uv = parallaxOcclusionUv(inUv, tangentViewDirection);
 
   int alphaMode = int(round(pushConstants.alphaParams.x));
+  bool glass=(uint(material.optical.w)&1u)!=0u;
+  int coverageMode=glass ? int((uint(material.optical.w)>>1)&3u) : alphaMode;
   bool useBase = pushConstants.alphaParams.z > 1.5 ||
                  (alphaMode == 1 && (pushConstants.alphaParams.z != 1.0 ||
                                      pushConstants.alphaParams.w < 0.5));
@@ -426,12 +406,13 @@ void main() {
   vec4 alphaTexel = useBase ? texture(baseAlphaMaskTexture, uv) : texture(alphaMaskTexture, uv);
   float alpha =
       texel.a * alphaTexel.r * pushConstants.materialTint.a * inColor.a;
-  if (alphaMode == 1 && alpha < pushConstants.alphaParams.y) {
+  if (coverageMode == 1 && alpha < pushConstants.alphaParams.y) {
     discard;
   }
-  if (alphaMode == 0) {
+  if (coverageMode == 0) {
     alpha = 1.0;
   }
+  outIndirectDiffuse.a=alpha;
   if (alphaMode == 2) outMotion = vec4(0,0,0,alpha);
 
   vec3 albedo = texel.rgb * inColor.rgb * pushConstants.materialTint.rgb;
@@ -468,7 +449,9 @@ void main() {
   vec3 specularColor = material.specularColorAndWeight.rgb *
       texture(specularColorTexture, inSpecularColorUv + (uv - inUv)).rgb;
   // Clamp the reflectance product before weighting; author color may exceed 1.
-  vec3 dielectricF0 = min(vec3(0.04) * specularColor, vec3(1.0));
+  float ior=material.optical.x>0 ? material.optical.x : 1.5;
+  float baseF0=pow((ior-1)/(ior+1),2);
+  vec3 dielectricF0 = min(vec3(baseF0) * specularColor, vec3(1.0));
   vec3 F0 = mix(dielectricF0 * specularWeight, albedo, metallic);
   float F90 = mix(specularWeight, 1.0, metallic);
 
@@ -485,19 +468,21 @@ void main() {
   vec3 diffuseIbl = environmentDiffuseWeight * albedo * irradiance / PI;
 
   vec3 reflectionDirection = reflect(-V, N);
-  vec3 environmentReflection =
-      rotateEnvironmentDirection(reflectionDirection);
-  if (local) {
-    vec3 boundary = mix(indoor.probeMin.xyz, indoor.probeMax.xyz, greaterThan(reflectionDirection, vec3(0)));
-    vec3 t = vec3(1e20);
-    for (int axis=0; axis<3; ++axis)
-      if (abs(reflectionDirection[axis]) > 1e-6)
-        t[axis] = (boundary[axis] - inWorldPos[axis]) / reflectionDirection[axis];
-    float distance = max(min(t.x, min(t.y, t.z)), 0.0);
-    environmentReflection = inWorldPos + reflectionDirection * distance - indoor.probePosition.xyz;
+  vec3 environmentReflection=rotateEnvironmentDirection(reflectionDirection);
+  bool detail=(indoor.counts.w & 4u)!=0u &&
+      all(greaterThanEqual(inWorldPos,indoor.detailMin.xyz)) && all(lessThanEqual(inWorldPos,indoor.detailMax.xyz));
+  float reflectionLayer=detail?2.0:local?1.0:0.0;
+  if(local || detail){
+    vec3 lo=detail?indoor.detailMin.xyz:indoor.probeMin.xyz;
+    vec3 hi=detail?indoor.detailMax.xyz:indoor.probeMax.xyz;
+    vec3 origin=detail?indoor.detailPosition.xyz:indoor.probePosition.xyz;
+    vec3 boundary=mix(lo,hi,greaterThan(reflectionDirection,vec3(0)));
+    vec3 t=vec3(1e20);for(int axis=0;axis<3;++axis)if(abs(reflectionDirection[axis])>1e-6)t[axis]=(boundary[axis]-inWorldPos[axis])/reflectionDirection[axis];
+    float distance=max(min(t.x,min(t.y,t.z)),0.0);
+    environmentReflection=inWorldPos+reflectionDirection*distance-origin;
   }
-  float environmentLod = roughness * float(textureQueryLevels(environmentPrefilter) - 1);
-  vec3 prefilteredRadiance = textureLod(environmentPrefilter, vec4(environmentReflection, local ? 1.0 : 0.0), environmentLod).rgb;
+  float environmentLod=roughness*float(textureQueryLevels(environmentPrefilter)-1);
+  vec3 prefilteredRadiance=textureLod(environmentPrefilter,vec4(environmentReflection,reflectionLayer),environmentLod).rgb;
   vec2 environmentBrdf = textureLod(environmentBrdfLut, vec2(nDotV, roughness), 0.0).rg;
   vec3 specularIbl = prefilteredRadiance * (F0 * environmentBrdf.x + F90 * environmentBrdf.y);
 
@@ -619,7 +604,35 @@ void main() {
     outFragColor = count == 0xffffffffu ? vec4(1, 0, 1, alpha) : vec4(vec3(float(count) / 64.0), alpha);
     return;
   }
+  if (pbrDebugMode==0 && alphaMode!=2) outIndirectDiffuse.rgb=diffuseIbl;
   vec3 lit = pbrDebugMode == 14 ? direct : diffuseIbl + specularIbl + direct + emissive;
 
+  if(glass && pbrDebugMode==0) {
+    float cosine=max(dot(N,V),0);
+    bool solid=pushConstants.passData.w!=0;
+    float F=solid ? dielectricFresnel(cosine,1,ior) : thinDielectricReflection(cosine,ior);
+    float thickness=max(intBitsToFloat(pushConstants.passData.z),0);
+    vec3 direction=solid ? refract(-V,N,1/ior) : -V;
+    direction=safeNormalize(direction,-V);
+    vec3 sampleDirection=rotateEnvironmentDirection(direction);
+    float layer=local ? 1.0 : 0.0;
+    if(local) {
+      vec3 boundary=mix(indoor.probeMin.xyz,indoor.probeMax.xyz,greaterThan(direction,vec3(0)));
+      vec3 t=vec3(1e20);for(int axis=0;axis<3;++axis)if(abs(direction[axis])>1e-6)t[axis]=(boundary[axis]-inWorldPos[axis])/direction[axis];
+      sampleDirection=inWorldPos+direction*max(min(t.x,min(t.y,t.z)),0)-indoor.probePosition.xyz;
+    }
+    vec3 transmitted=textureLod(environmentPrefilter,vec4(sampleDirection,layer),0).rgb*ubo.environmentParams.x;
+    float eta=1/ior,cosT=sqrt(max(0,1-eta*eta*(1-cosine*cosine)));
+    vec3 attenuation=dielectricAttenuation(material.absorptionThickness.rgb,thickness/max(cosT,1e-4));
+    vec3 reflected=prefilteredRadiance*ubo.environmentParams.x*F;
+    if((indoor.counts.w&2u)!=0u) {
+      // Capture is direct-only: alpha proxy excludes recursive probe reads.
+      float opacity=clamp(F+(1-F)*(1-material.optical.y),0,1);
+      outFragColor=vec4(opacity>1e-6 ? (direct*(1-material.optical.y)+emissive)/opacity : vec3(0),opacity*alpha);
+      return;
+    }
+    lit=reflected+(1-F)*material.optical.y*transmitted*attenuation*albedo+
+        (1-material.optical.y)*(diffuseIbl+direct)+emissive;
+  }
   outFragColor = vec4(lit, alpha);
 }

@@ -1,7 +1,9 @@
 #include "gltf_loader.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cgltf.h>
+#include <charconv>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -293,6 +295,139 @@ void image(cgltf_texture_view const &view, std::filesystem::path const &path,
     imagePath = resolved.string();
   }
 }
+// Inspect only the explicit converter extras.pbrt object. Unknown extras stay
+// ordinary geometry; emissiveFactor alone never makes an object a light card.
+std::size_t jsonStringEnd(std::string_view s, std::size_t p) {
+  ++p;
+  while (p < s.size()) {
+    if (s[p] == char(0x5c)) {
+      p += 2;
+      continue;
+    }
+    if (s[p] == char(0x22))
+      return p + 1;
+    ++p;
+  }
+  return s.size();
+}
+std::string_view jsonMember(std::string_view s, std::string_view name) {
+  auto space = [&](std::size_t &p) {
+    while (p < s.size() && std::isspace(static_cast<unsigned char>(s[p])))
+      ++p;
+  };
+  std::size_t p = 0;
+  space(p);
+  if (p == s.size() || s[p++] != '{')
+    return {};
+  while (p < s.size()) {
+    space(p);
+    if (p >= s.size())
+      return {};
+    if (s[p] == '}')
+      return {};
+    if (s[p] != '"')
+      return {};
+    auto end = jsonStringEnd(s, p);
+    auto key = s.substr(p + 1, end - p - 2);
+    p = end;
+    space(p);
+    if (p == s.size() || s[p++] != ':')
+      return {};
+    space(p);
+    auto start = p;
+    unsigned depth = 0;
+    while (p < s.size()) {
+      char c = s[p];
+      if (c == '"') {
+        p = jsonStringEnd(s, p);
+        continue;
+      }
+      if (c == '{' || c == '[') {
+        ++depth;
+        ++p;
+        continue;
+      }
+      if (c == '}' || c == ']') {
+        if (!depth)
+          break;
+        --depth;
+        ++p;
+        continue;
+      }
+      if (c == ',' && !depth)
+        break;
+      ++p;
+    }
+    if (key == name)
+      return s.substr(start, p - start);
+    if (p < s.size() && s[p] == ',') {
+      ++p;
+      continue;
+    }
+    return {};
+  }
+  return {};
+}
+bool sourceAreaLight(cgltf_material const &m) {
+  if (!m.extras.data)
+    return false;
+  auto pbrt = jsonMember(m.extras.data, "pbrt"),
+       radiance = jsonMember(pbrt, "area_light_radiance_rgb");
+  if (radiance.empty() || radiance.front() != '[')
+    return false;
+  std::size_t p = 1;
+  for (unsigned i = 0; i < 3; ++i) {
+    while (p < radiance.size() &&
+           std::isspace(static_cast<unsigned char>(radiance[p])))
+      ++p;
+    float value = 0;
+    auto [end, error] = std::from_chars(
+        radiance.data() + p, radiance.data() + radiance.size(), value);
+    if (error != std::errc{} || !std::isfinite(value) || value < 0)
+      return false;
+    p = std::size_t(end - radiance.data());
+    while (p < radiance.size() &&
+           std::isspace(static_cast<unsigned char>(radiance[p])))
+      ++p;
+    if (p == radiance.size() || radiance[p++] != (i == 2 ? ']' : ','))
+      return false;
+  }
+  return true;
+}
+OpticalMaterial opticalMaterial(cgltf_material const &m) {
+  OpticalMaterial o;
+  if(m.has_ior){o.ior=m.ior.ior;if(o.ior==0)invalid("KHR_materials_ior zero-IOR special case is unsupported");}
+  if(m.has_transmission){
+    if(m.unlit||m.has_pbr_specular_glossiness)invalid("Transmission cannot coexist with unlit/specular-glossiness");
+    if(m.transmission.transmission_texture.texture)invalid("Textured transmission is unsupported in RT-C factor-only profile");
+    o.transmission=m.transmission.transmission_factor;o.enabled=o.transmission>0 && m.pbr_metallic_roughness.metallic_factor<1;
+    if(o.enabled && m.pbr_metallic_roughness.metallic_factor>0)invalid("Mixed-metal transmission is unsupported in RT-C smooth dielectric profile");
+    o.coverage=unsigned(m.alpha_mode);
+  }
+  if(m.has_volume){
+    if(m.volume.thickness_texture.texture)invalid("Textured thickness is unsupported in RT-C factor-only profile");
+    o.thickness=m.volume.thickness_factor;o.solid=o.thickness>0;
+    auto distance=m.volume.attenuation_distance;
+    if(std::isfinite(distance)&&distance<=0)invalid("Volume attenuationDistance must be positive");
+    for(unsigned c=0;c<3;++c){auto color=m.volume.attenuation_color[c];
+      if(!std::isfinite(color)||color<0||color>1)invalid("Volume attenuationColor must be in [0,1]");
+      if(distance>0&&std::isfinite(distance))o.absorption[c]=float(std::min(-std::log(std::max(double(color),1e-30))/double(distance),double(std::numeric_limits<float>::max())));
+    }
+  }
+  if(m.extras.data){auto p=jsonMember(m.extras.data,"pbrt");
+    if(jsonMember(p,"type")=="\"dielectric\""){
+      auto eta=jsonMember(p,"eta");
+      while(!eta.empty() && std::isspace(static_cast<unsigned char>(eta.back())))eta.remove_suffix(1);
+      if(!eta.empty()){
+        auto [end,error]=std::from_chars(eta.data(),eta.data()+eta.size(),o.ior);
+        if(error!=std::errc{}||end!=eta.data()+eta.size())invalid("PBRT dielectric eta must be numeric");
+      }
+      o.enabled=true;o.transmission=1;o.solid=true;o.coverage=0;
+    }
+  }
+  try{validateOpticalMaterial(o);}catch(std::runtime_error const &e){invalid(e.what());}
+  return o;
+}
 Material material(cgltf_material const &m, std::filesystem::path const &path) {
   Material result;
   result.name = m.name ? m.name : "";
@@ -306,6 +441,8 @@ Material material(cgltf_material const &m, std::filesystem::path const &path) {
       m.occlusion_texture.texture ? m.occlusion_texture.scale : 1.0f;
   result.alphaCutoff = m.alpha_cutoff;
   result.doubleSided = m.double_sided;
+  result.sourceAreaLight = sourceAreaLight(m);
+  result.optical=opticalMaterial(m);
   switch (m.alpha_mode) {
   case cgltf_alpha_mode_opaque:
     result.alphaMode = AlphaMode::Opaque;
@@ -319,6 +456,7 @@ Material material(cgltf_material const &m, std::filesystem::path const &path) {
   default:
     invalid("invalid alpha mode.");
   }
+  if(result.optical.enabled) {result.alphaMode=AlphaMode::Blend;result.doubleSided=true;}
   auto bind = [&](cgltf_texture_view const &view, std::string &file,
                   std::vector<std::byte> &bytes,
                   TextureSamplerDescription &description, int &set) {
@@ -571,7 +709,7 @@ ImportedScene load(std::filesystem::path const &path,
     return extension == "KHR_texture_transform" ||
            extension == "KHR_mesh_quantization" ||
            extension == "KHR_materials_specular" ||
-           extension == "KHR_lights_punctual";
+           extension == "KHR_lights_punctual" || extension=="KHR_materials_transmission" || extension=="KHR_materials_volume" || extension=="KHR_materials_ior";
   };
   ImportedScene result;
   for (std::size_t i = 0; i < data->extensions_required_count; ++i)
@@ -589,8 +727,11 @@ ImportedScene load(std::filesystem::path const &path,
   check(cgltf_validate(data.get()), "validate");
   for (std::size_t i = 0; i < data->lights_count; ++i)
     (void)importLight(data->lights[i]);
-  for (std::size_t i = 0; i < data->materials_count; ++i)
-    result.materials.push_back(material(data->materials[i], path));
+  for (std::size_t i=0;i<data->materials_count;++i) {
+    result.materials.push_back(material(data->materials[i],path));
+    if(result.materials.back().optical.enabled && result.materials.back().roughnessFactor>.02f)
+      result.warnings.push_back("RT-C smooth dielectric profile: rough transmission not implemented; material "+std::to_string(i));
+  }
   std::optional<MaterialId> defaultId;
   auto defaultMaterial = [&] {
     if (!defaultId) {

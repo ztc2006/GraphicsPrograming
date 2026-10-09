@@ -217,7 +217,12 @@ MaterialGpuStore::createMaterialResources(
         .specularColorAndWeight =
             glm::vec4(material.specularColorFactor, material.specularFactor),
     };
+    materialUbo.optical={material.optical.ior,material.optical.transmission,float(material.optical.solid),
+      float(material.optical.enabled ? 1u|(material.optical.coverage<<1) : 0u)};
+    materialUbo.absorptionThickness=glm::vec4(material.optical.absorption,material.optical.thickness);
     resources.uniform.write(std::as_bytes(std::span{&materialUbo, 1}));
+    validateOpticalMaterial(material.optical);
+    resources.optical = material.optical;
     resources.tint = material.tint;
     resources.surfaceParams = {
         material.normalScale,
@@ -226,10 +231,11 @@ MaterialGpuStore::createMaterialResources(
                                                                     : 1.0f,
         material.heightPath.empty() ? 0.0f : 1.0f,
     };
-    resources.alphaMode = material.alphaMode;
-    resources.doubleSided = material.doubleSided;
+    resources.alphaMode = material.optical.enabled ? AlphaMode::Blend : material.alphaMode;
+    resources.doubleSided = material.optical.enabled ? true : material.doubleSided;
+    resources.sourceAreaLight = material.sourceAreaLight;
     resources.alphaParams = {
-        static_cast<float>(material.alphaMode),
+        static_cast<float>(resources.alphaMode),
         material.alphaCutoff,
         0.0f,
         0.0f,

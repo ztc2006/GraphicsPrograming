@@ -18,6 +18,10 @@ void applyKitchenLightingPreset(LightingSettings &settings, Camera &camera) {
   settings.sunEnabled = true;
   settings.localProbe = {
       true, {-2.45f, .01f, -2.44f}, {3.5f, 3.21f, 5.35f}, {.6f, 1.8f, 1.8f}};
+  settings.detailReflectionProbe = {true,
+                                    {-2.334f, 1.036f, -2.158f},
+                                    {-1.895f, 1.367f, -1.78f},
+                                    {-2.11f, 1.21f, -1.95f}};
   camera.position = {1.8f, 1.6f, 2.9f};
   camera.target = {-2.f, 1.2f, 0.f};
   camera.fovRadians = glm::radians(55.f);

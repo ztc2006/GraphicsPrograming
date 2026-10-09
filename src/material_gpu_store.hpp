@@ -17,8 +17,10 @@ public:
     glm::vec4 pbrParams{0.0f, 1.0f, 1.0f, 0.0f};
     glm::vec4 emissiveFactor{0.0f};
     glm::vec4 specularColorAndWeight{1.0f};
+    glm::vec4 optical{1.5f,1.f,0,0};
+    glm::vec4 absorptionThickness{0};
   };
-  static_assert(sizeof(MaterialUniformBufferObject) == 48 &&
+  static_assert(sizeof(MaterialUniformBufferObject) == 80 &&
                 offsetof(MaterialUniformBufferObject, specularColorAndWeight) ==
                     32);
 
@@ -37,8 +39,9 @@ public:
     glm::vec4 tint{1.0f};
     glm::vec4 surfaceParams{1.0f, 0.04f, 0.0f, 0.0f};
     glm::vec4 alphaParams{0.0f, 0.5f, 0.0f, 0.0f};
+    OpticalMaterial optical;
     AlphaMode alphaMode = AlphaMode::Opaque;
-    bool doubleSided = false;
+    bool doubleSided = false, sourceAreaLight = false;
     bool hasCoverageMips = false;
     float coverageCutoff = 0.5f, coverageFactor = 1.0f;
   };

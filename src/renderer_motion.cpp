@@ -4,6 +4,7 @@
 void Renderer::invalidateTemporalHistory() {
   if (activeFrame_)
     throw std::runtime_error("Cannot reset temporal history during recording");
+  if (rayTracing_) rayTracing_->resetAccumulation();
   temporalHistory_.reset();
   if (taa_)
     taa_->reset();
@@ -97,4 +98,15 @@ Renderer::createMotionResources(vk::Extent2D extent) const {
           .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}});
   r.accounting = scope.track({.imageViews = 1});
   return r;
+}
+
+void Renderer::setAoSettings(AoSettings const &settings) {
+  if (activeFrame_)
+    throw std::runtime_error("Cannot change AO during frame recording");
+  validateAoSettings(settings);
+  if (settings != aoSettings_) {
+    aoSettings_ = settings;
+    if (taa_)
+      taa_->reset();
+  }
 }

@@ -14,8 +14,13 @@ struct ViewerOptions {
   double warmupSeconds = 30, durationSeconds = 120;
   std::string cameraPath = "static", lightCulling = "clustered", lightingPreset = "auto", gpu;
   std::string present = "auto", presentSync = "auto";
+  std::string renderMethod="raster";
   std::string taaHistory="catmull-rom";
   bool taa=true;
+  bool ao = true;
+  float aoRadius = .5f, aoStrength = 1.f;
+  std::string aoDebug = "none";
+  bool cameraCulling=true, shadowCulling=true;
   bool ui = true, validation = false, help = false;
 };
 

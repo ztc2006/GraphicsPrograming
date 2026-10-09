@@ -38,11 +38,15 @@ file(GLOB SHADER_SOURCE_FILES CONFIGURE_DEPENDS
   "${CMAKE_SOURCE_DIR}/shaders/*.vert"
   "${CMAKE_SOURCE_DIR}/shaders/*.frag"
   "${CMAKE_SOURCE_DIR}/shaders/*.comp"
+  "${CMAKE_SOURCE_DIR}/shaders/*.rgen"
+  "${CMAKE_SOURCE_DIR}/shaders/*.rmiss"
+  "${CMAKE_SOURCE_DIR}/shaders/*.rchit"
+  "${CMAKE_SOURCE_DIR}/shaders/*.rahit"
 )
 
 # Fingerprint the actual project code used for an A/B measurement. Reconfigure
 # when code changes so incremental builds cannot keep a stale fingerprint.
-file(GLOB_RECURSE BASELINE_INPUTS CONFIGURE_DEPENDS "src/*.cpp" "src/*.hpp" "shaders/*.vert" "shaders/*.frag" "shaders/*.comp" "shaders/*.glsl")
+file(GLOB_RECURSE BASELINE_INPUTS CONFIGURE_DEPENDS "src/*.cpp" "src/*.hpp" "shaders/*.vert" "shaders/*.frag" "shaders/*.comp" "shaders/*.glsl" "shaders/*.rgen" "shaders/*.rmiss" "shaders/*.rchit" "shaders/*.rahit")
 list(APPEND BASELINE_INPUTS "${CMAKE_SOURCE_DIR}/deps/cgltf/cgltf.h" "${CMAKE_SOURCE_DIR}/deps/cgltf/cgltf.cpp" "${CMAKE_SOURCE_DIR}/deps/vma/vk_mem_alloc.h" "${CMAKE_SOURCE_DIR}/deps/vma/vma.cpp" "${CMAKE_SOURCE_DIR}/deps/mikktspace/mikktspace.c" "${CMAKE_SOURCE_DIR}/deps/mikktspace/mikktspace.h")
 list(SORT BASELINE_INPUTS)
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${BASELINE_INPUTS})
@@ -95,6 +99,16 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
 )
 
 if(BUILD_TESTING)
+  add_executable(dielectric_test tests/dielectric_test.cpp src/dielectric.cpp)
+  target_include_directories(dielectric_test PRIVATE src)
+  target_compile_definitions(dielectric_test PRIVATE VULKAN_HPP_NO_CONSTRUCTORS)
+  target_link_libraries(dielectric_test PRIVATE Vulkan::Vulkan glm)
+  add_test(NAME dielectric COMMAND dielectric_test)
+  add_executable(viewer_scene_prepare_test tests/viewer_scene_prepare_test.cpp src/viewer_scene_prepare.cpp src/dielectric.cpp)
+  target_include_directories(viewer_scene_prepare_test PRIVATE src)
+  target_compile_definitions(viewer_scene_prepare_test PRIVATE VULKAN_HPP_NO_CONSTRUCTORS)
+  target_link_libraries(viewer_scene_prepare_test PRIVATE Vulkan::Vulkan glm)
+  add_test(NAME viewer_scene_prepare COMMAND viewer_scene_prepare_test)
   add_executable(temporal_motion_test tests/temporal_motion_test.cpp src/temporal_motion.cpp)
   target_include_directories(temporal_motion_test PRIVATE src)
   target_link_libraries(temporal_motion_test PRIVATE glm)
@@ -129,10 +143,10 @@ if(BUILD_TESTING)
   option(VULKAN_GPU_TESTS "Build graphical scene transaction regression" OFF)
   if(VULKAN_GPU_TESTS)
     add_executable(gpu_scene_transaction_test
-      tests/gpu_scene_transaction_test.cpp tests/temporal_motion_regression.cpp tests/taa_resolve_regression.cpp tests/hdr_output_regression.cpp tests/frame_context_regression.cpp tests/presentation_regression.cpp tests/texture_mip_regression.cpp
-      src/resource_ledger.cpp src/gpu_allocator.cpp src/device.cpp src/presentation.cpp src/swap_chain.cpp src/renderer.cpp src/renderer_frame_graph.cpp src/renderer_clusters.cpp src/renderer_indoor.cpp src/renderer_motion.cpp src/taa_resolve.cpp src/temporal_motion.cpp src/sun_cascades.cpp src/indoor_lighting.cpp src/lighting_presets.cpp src/cluster_grid.cpp src/render_graph.cpp src/hdr_output.cpp src/material_gpu_store.cpp
+      tests/gpu_scene_transaction_test.cpp tests/temporal_motion_regression.cpp tests/taa_resolve_regression.cpp tests/gtao_regression.cpp tests/ray_tracing_regression.cpp tests/ray_transport_regression.cpp tests/hdr_output_regression.cpp tests/frame_context_regression.cpp tests/presentation_regression.cpp tests/texture_mip_regression.cpp
+      src/resource_ledger.cpp src/gpu_allocator.cpp src/device.cpp src/presentation.cpp src/swap_chain.cpp src/renderer.cpp src/ray_tracing.cpp src/renderer_ray_tracing.cpp src/renderer_frame_graph.cpp src/renderer_clusters.cpp src/renderer_indoor.cpp src/renderer_motion.cpp src/taa_resolve.cpp src/gtao.cpp src/temporal_motion.cpp src/sun_cascades.cpp src/indoor_lighting.cpp src/lighting_presets.cpp src/cluster_grid.cpp src/render_graph.cpp src/hdr_output.cpp src/material_gpu_store.cpp
       src/texture.cpp src/texture_cache.cpp src/texture_mip.cpp src/upload_batch.cpp src/hdr_image.cpp src/hdr_ibl.cpp src/hdr_ibl_cache.cpp src/stb_image.cpp
-      src/mesh.cpp src/gltf_loader.cpp src/punctual_lights.cpp)
+      src/mesh.cpp src/gltf_loader.cpp src/punctual_lights.cpp src/frustum.cpp src/viewer_scene_prepare.cpp src/dielectric.cpp)
     target_include_directories(gpu_scene_transaction_test PRIVATE src deps/stb)
     target_compile_definitions(gpu_scene_transaction_test PRIVATE
       VULKAN_HPP_NO_CONSTRUCTORS
@@ -161,7 +175,37 @@ if(BUILD_TESTING)
     set_tests_properties(viewer_async_scene viewer_async_scene_two_frames viewer_async_scene_legacy PROPERTIES
       LABELS gpu SKIP_RETURN_CODE 77 TIMEOUT 90
       WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
+    if(EXISTS "${CMAKE_SOURCE_DIR}/assets/models/pbr_kitchen/source/kitchen_core.gltf")
+      add_test(NAME gpu_ray_tracing_kitchen COMMAND gpu_scene_transaction_test 2 auto rt-kitchen
+        "${CMAKE_SOURCE_DIR}/assets/models/pbr_kitchen/source/kitchen_core.gltf" "${CMAKE_BINARY_DIR}/Testing/rt-kitchen")
+      set_tests_properties(gpu_ray_tracing_kitchen PROPERTIES LABELS gpu SKIP_RETURN_CODE 77 TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
+      add_test(NAME gpu_kitchen_preview_repair COMMAND gpu_scene_transaction_test 1 auto kitchen-fix
+        "${CMAKE_SOURCE_DIR}/assets/models/pbr_kitchen/source/kitchen_core.gltf" "${CMAKE_BINARY_DIR}/Testing/kitchen-repair-one")
+      add_test(NAME gpu_kitchen_preview_repair_two_frames COMMAND gpu_scene_transaction_test 2 auto kitchen-fix
+        "${CMAKE_SOURCE_DIR}/assets/models/pbr_kitchen/source/kitchen_core.gltf" "${CMAKE_BINARY_DIR}/Testing/kitchen-repair-two")
+      set_tests_properties(gpu_kitchen_preview_repair gpu_kitchen_preview_repair_two_frames PROPERTIES
+        LABELS gpu SKIP_RETURN_CODE 77 TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
+    endif()
+    add_test(NAME gpu_ray_glass COMMAND gpu_scene_transaction_test 1 auto rt-glass)
+    add_test(NAME gpu_raster_glass COMMAND gpu_scene_transaction_test 1 auto raster-glass)
+    add_test(NAME gpu_raster_glass_two_frames COMMAND gpu_scene_transaction_test 2 auto raster-glass)
+    set_tests_properties(gpu_raster_glass gpu_raster_glass_two_frames PROPERTIES LABELS gpu SKIP_RETURN_CODE 77 TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
+    add_test(NAME gpu_ray_glass_two_frames COMMAND gpu_scene_transaction_test 2 auto rt-glass)
+    set_tests_properties(gpu_ray_glass gpu_ray_glass_two_frames PROPERTIES LABELS gpu SKIP_RETURN_CODE 77 TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
+    add_test(NAME gpu_ray_transport COMMAND gpu_scene_transaction_test 1 auto rt-transport)
+    add_test(NAME gpu_ray_transport_two_frames COMMAND gpu_scene_transaction_test 2 auto rt-transport)
+    set_tests_properties(gpu_ray_transport gpu_ray_transport_two_frames PROPERTIES LABELS gpu SKIP_RETURN_CODE 77 TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
+    add_test(NAME gpu_ray_tracing_disabled COMMAND gpu_scene_transaction_test 2 auto rt-disabled)
+    set_tests_properties(gpu_ray_tracing_disabled PROPERTIES LABELS gpu SKIP_RETURN_CODE 77 TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
+    add_test(NAME gpu_ray_tracing COMMAND gpu_scene_transaction_test 1 auto rt)
+    add_test(NAME gpu_ray_tracing_two_frames COMMAND gpu_scene_transaction_test 2 auto rt)
+    set_tests_properties(gpu_ray_tracing gpu_ray_tracing_two_frames PROPERTIES LABELS gpu SKIP_RETURN_CODE 77 TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
+    add_test(NAME gpu_gtao COMMAND gpu_scene_transaction_test 1 auto ao)
+    add_test(NAME gpu_gtao_two_frames COMMAND gpu_scene_transaction_test 2 auto ao)
+    set_tests_properties(gpu_gtao gpu_gtao_two_frames PROPERTIES LABELS gpu SKIP_RETURN_CODE 77 TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
     add_test(NAME gpu_taa_resolve COMMAND gpu_scene_transaction_test 1 auto taa)
+    add_test(NAME gpu_visibility_culling COMMAND gpu_scene_transaction_test 2 auto visibility)
+    set_tests_properties(gpu_visibility_culling PROPERTIES LABELS gpu SKIP_RETURN_CODE 77 TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
     set_tests_properties(gpu_taa_resolve PROPERTIES LABELS gpu SKIP_RETURN_CODE 77 TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
     add_test(NAME gpu_temporal_motion COMMAND gpu_scene_transaction_test 1 auto motion)
     add_test(NAME gpu_temporal_motion_two_frames COMMAND gpu_scene_transaction_test 2 auto motion)
@@ -183,6 +227,11 @@ if(BUILD_TESTING)
       WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
   endif()
   add_executable(presentation_test tests/presentation_test.cpp src/presentation.cpp)
+  add_executable(frustum_test tests/frustum_test.cpp src/frustum.cpp)
+  target_include_directories(frustum_test PRIVATE src)
+  target_compile_definitions(frustum_test PRIVATE VULKAN_HPP_NO_CONSTRUCTORS)
+  target_link_libraries(frustum_test PRIVATE Vulkan::Vulkan glm)
+  add_test(NAME frustum_visibility COMMAND frustum_test)
   target_include_directories(presentation_test PRIVATE src)
   target_compile_definitions(presentation_test PRIVATE VULKAN_HPP_NO_CONSTRUCTORS)
   target_link_libraries(presentation_test PRIVATE Vulkan::Vulkan)
@@ -204,13 +253,13 @@ if(BUILD_TESTING)
   if(BASH_EXECUTABLE AND UNIX)
     add_test(NAME run_launcher COMMAND "${BASH_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/run_launcher_test.sh" "${CMAKE_SOURCE_DIR}")
   endif()
-  add_executable(gltf_geometry_regression_test tests/gltf_geometry_regression_test.cpp src/gltf_loader.cpp src/punctual_lights.cpp src/mesh.cpp)
+  add_executable(gltf_geometry_regression_test tests/gltf_geometry_regression_test.cpp src/gltf_loader.cpp src/punctual_lights.cpp src/mesh.cpp src/dielectric.cpp)
   target_include_directories(gltf_geometry_regression_test PRIVATE src)
   target_compile_definitions(gltf_geometry_regression_test PRIVATE VULKAN_HPP_NO_CONSTRUCTORS TEST_FIXTURE="${CMAKE_SOURCE_DIR}/tests/fixtures/uv_transform.gltf")
   target_link_libraries(gltf_geometry_regression_test PRIVATE Vulkan::Vulkan glm cgltf mikktspace)
   add_test(NAME gltf_geometry_regression COMMAND gltf_geometry_regression_test)
 
-  add_executable(gltf_adapter_test tests/gltf_adapter_test.cpp src/gltf_loader.cpp src/punctual_lights.cpp src/mesh.cpp)
+  add_executable(gltf_adapter_test tests/gltf_adapter_test.cpp src/gltf_loader.cpp src/punctual_lights.cpp src/mesh.cpp src/dielectric.cpp)
   target_include_directories(gltf_adapter_test PRIVATE src)
   target_compile_definitions(gltf_adapter_test PRIVATE VULKAN_HPP_NO_CONSTRUCTORS
     TEST_ADAPTER_FIXTURES="${CMAKE_SOURCE_DIR}/tests/fixtures/cgltf")
@@ -219,6 +268,7 @@ if(BUILD_TESTING)
 
   add_executable(gltf_material_semantics_test
     tests/gltf_material_semantics_test.cpp
+    src/dielectric.cpp
     src/gltf_loader.cpp src/punctual_lights.cpp
     src/mesh.cpp
   )
@@ -281,10 +331,14 @@ file(GLOB SHADER_INCLUDE_FILES CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/shaders/*.
 foreach(SHADER_SOURCE ${SHADER_SOURCE_FILES})
   get_filename_component(SHADER_NAME "${SHADER_SOURCE}" NAME)
   set(SHADER_OUTPUT "${CMAKE_BINARY_DIR}/shaders/${SHADER_NAME}.spv")
+  set(SHADER_TARGET_ARGS)
+  if(SHADER_SOURCE MATCHES "\\.(rgen|rmiss|rchit|rahit)$")
+    set(SHADER_TARGET_ARGS --target-env vulkan1.3)
+  endif()
   add_custom_command(
     OUTPUT "${SHADER_OUTPUT}"
     COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_BINARY_DIR}/shaders"
-    COMMAND "${GLSLANG_VALIDATOR}" -V "${SHADER_SOURCE}" -o "${SHADER_OUTPUT}"
+    COMMAND "${GLSLANG_VALIDATOR}" -V ${SHADER_TARGET_ARGS} "${SHADER_SOURCE}" -o "${SHADER_OUTPUT}"
     DEPENDS "${SHADER_SOURCE}" ${SHADER_INCLUDE_FILES}
     COMMENT "Compiling shader ${SHADER_NAME}"
     VERBATIM

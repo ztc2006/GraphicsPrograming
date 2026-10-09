@@ -27,6 +27,28 @@ template <class F> void expectFailure(F &&operation, char const *message) {
   }
   require(failed, message);
 }
+std::uint64_t blasPayload(Device const &device, AssetLibrary const &assets) {
+  if (!device.rayTracingSupported()) return 0;
+  auto query=reinterpret_cast<PFN_vkGetAccelerationStructureBuildSizesKHR>(vkGetDeviceProcAddr(VkDevice(device.deviceHandle()),"vkGetAccelerationStructureBuildSizesKHR"));
+  require(query!=nullptr,"AS size query missing");
+  std::uint64_t bytes=0;
+  for(auto const &mesh:assets.meshes) {
+    VkAccelerationStructureGeometryKHR geometry{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR};
+    geometry.geometryType=VK_GEOMETRY_TYPE_TRIANGLES_KHR;
+    auto &triangles=geometry.geometry.triangles;
+    triangles.sType=VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
+    triangles.vertexFormat=VK_FORMAT_R32G32B32_SFLOAT;triangles.vertexStride=sizeof(Vertex);
+    triangles.maxVertex=mesh.vertices.size()-1;triangles.indexType=VK_INDEX_TYPE_UINT32;
+    VkAccelerationStructureBuildGeometryInfoKHR info{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR};
+    info.type=VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;info.flags=VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
+    info.mode=VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;info.geometryCount=1;info.pGeometries=&geometry;
+    VkAccelerationStructureBuildSizesInfoKHR sizes{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR};
+    std::uint32_t count=mesh.indices.size()/3;
+    query(VkDevice(device.deviceHandle()),VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,&info,&count,&sizes);
+    bytes+=sizes.accelerationStructureSize;
+  }
+  return bytes;
+}
 void checkAllocationStatistics(Device const &device) {
   auto snapshot = device.resourceLedger().snapshot();
   auto stats = device.gpuAllocationStatistics();
@@ -588,7 +610,7 @@ void exerciseCanceledUpload(Renderer &renderer, Device const &device,
             "Cancellation changed live assets or waited for upload completion");
     auto held = renderer.resourceSnapshot();
     require(held.at(ResourceLedger::Domain::PreparedScene).buffers ==
-                    assets.meshes.size() * 2 + assets.materials.size() &&
+                    assets.meshes.size() * (device.rayTracingSupported() ? 3 : 2) + assets.materials.size() &&
                 held.at(ResourceLedger::Domain::Staging).suballocatedBytes > 0,
             "Canceled pending upload vanished from the resource ledger");
     release();
@@ -613,7 +635,9 @@ void exerciseCanceledUpload(Renderer &renderer, Device const &device,
 void exercise(Renderer &renderer, Device const &device,
               AssetLibrary const &assets) {
   auto initial = renderer.resourceStatistics();
-  require(initial.environmentUploads == 1 && initial.pipelineBuilds == 13 + (renderer.clusterSupported() ? 1 : 0),
+  require(initial.environmentUploads == 1 &&
+              initial.pipelineBuilds ==
+                  16 + (renderer.clusterSupported() ? 1 : 0),
           "Initial environment and material pipelines are missing");
   unsigned uiCalls = 0, releases = 0;
   renderer.setUiDrawCallback([&](vk::CommandBuffer) { ++uiCalls; });
@@ -657,7 +681,7 @@ void exercise(Renderer &renderer, Device const &device,
     geometryBytes += mesh.vertices.size() * sizeof(Vertex) +
                      mesh.indices.size() * sizeof(std::uint32_t);
   auto privateBytes =
-      geometryBytes + assets.materials.size() *
+      geometryBytes + blasPayload(device, assets) + assets.materials.size() *
                           sizeof(MaterialGpuStore::MaterialUniformBufferObject);
   auto candidate = renderer.prepareScene(assets);
   auto preparedLedger = renderer.resourceSnapshot();
@@ -666,7 +690,7 @@ void exercise(Renderer &renderer, Device const &device,
   require(prepared.payloadBytes == privateBytes &&
               prepared.suballocatedBytes >= privateBytes &&
               prepared.buffers ==
-                  assets.meshes.size() * 2 + assets.materials.size() &&
+                  assets.meshes.size() * (device.rayTracingSupported() ? 3 : 2) + assets.materials.size() &&
               prepared.descriptorPools == 1 &&
               prepared.descriptorSets == assets.materials.size(),
           "Prepared geometry/UBO/descriptors do not match physical resources");
@@ -836,7 +860,11 @@ int main(int argc, char **argv) {
   glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
   glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
   GLFWwindow *window = glfwCreateWindow(
-      320, 240, "GPU scene transaction regression", nullptr, nullptr);
+      std::getenv("GPU_TEST_WIDTH") ? std::stoi(std::getenv("GPU_TEST_WIDTH"))
+                                    : 320,
+      std::getenv("GPU_TEST_HEIGHT") ? std::stoi(std::getenv("GPU_TEST_HEIGHT"))
+                                     : 240,
+      "GPU scene transaction regression", nullptr, nullptr);
   if (!window) {
     glfwTerminate();
     return 77;
@@ -876,7 +904,7 @@ int main(int argc, char **argv) {
             "Surface creation failed");
     vk::raii::SurfaceKHR surface(instance, rawSurface);
     Device device(instance, surface, {vk::KHRSwapchainExtensionName}, {}, false,
-                  presentationInstance, policy);
+                  presentationInstance, policy, !(argc>3 && std::string_view(argv[3])=="rt-disabled"));
     if (extOnly &&
         device.presentationSupport().backend != PresentationBackend::ExtFence) {
       status = 77;
@@ -888,7 +916,32 @@ int main(int argc, char **argv) {
               << " (" << device.presentationSupport().reason << ")\n";
     SwapChain swapchain(device, surface, window);
     unsigned framesInFlight = argc > 1 ? std::stoul(argv[1]) : 1;
-    if (argc > 3 && std::string_view(argv[3]) == "taa") {
+    if (argc > 3 && std::string_view(argv[3]) == "raster-glass") {
+      exerciseDielectricRaster(device,swapchain,framesInFlight);
+    } else if (argc > 3 && std::string_view(argv[3]) == "rt-glass") {
+      if(!device.rayTracingSupported()){status=77;throw std::runtime_error("SKIP RT: required features unavailable");}
+      exerciseDielectricRT(device,swapchain,framesInFlight);
+    } else if (argc > 3 && std::string_view(argv[3]) == "rt-transport") {
+      if (!device.rayTracingSupported()) { status=77; throw std::runtime_error("SKIP RT: required device features unavailable"); }
+      exerciseRayTransport(device,swapchain,framesInFlight);
+    } else if (argc > 3 && std::string_view(argv[3]) == "rt-disabled") {
+      exerciseRayTracingDisabled(device,swapchain,framesInFlight);
+    } else if (argc > 5 && std::string_view(argv[3]) == "rt-kitchen") {
+      if (!device.rayTracingSupported()) { status=77; throw std::runtime_error("SKIP RT: device features unavailable"); }
+      exerciseRayTracingKitchen(device,swapchain,framesInFlight,argv[4],argv[5]);
+    } else if (argc > 3 && std::string_view(argv[3]) == "rt") {
+      if (!device.rayTracingSupported()) { status=77; throw std::runtime_error("SKIP RT: required device features unavailable"); }
+      exerciseRayTracing(device, swapchain, framesInFlight);
+    } else if (argc > 5 && (std::string_view(argv[3]) == "kitchen-geometry" ||
+                     std::string_view(argv[3]) == "kitchen-fix")) {
+      exerciseKitchenGeometry(device, swapchain, framesInFlight, argv[4],
+                              argv[5],
+                              std::string_view(argv[3]) == "kitchen-fix");
+    } else if (argc > 3 && std::string_view(argv[3]) == "ao") {
+      exerciseGtao(device, swapchain, framesInFlight);
+    } else if (argc > 3 && std::string_view(argv[3]) == "visibility") {
+      exerciseVisibilityCulling(device,swapchain,framesInFlight);
+    } else if (argc > 3 && std::string_view(argv[3]) == "taa") {
       exerciseTaaResolve(device,swapchain,framesInFlight);
     } else if (argc > 3 && std::string_view(argv[3]) == "motion") {
       exerciseTemporalMotion(device, swapchain, framesInFlight);
@@ -898,132 +951,141 @@ int main(int argc, char **argv) {
       exerciseFrameContexts(device, swapchain);
     } else if (argc > 3 && std::string_view(argv[3]) == "indoor") {
       exerciseIndoorLighting(device, swapchain, framesInFlight);
-    } else if (argc>5 && (std::string_view(argv[3])=="kitchen" || std::string_view(argv[3])=="kitchen-colour")) {
-      exerciseKitchenScene(device,swapchain,framesInFlight,argv[4],argv[5],std::string_view(argv[3])=="kitchen-colour");
+    } else if (argc > 5 && (std::string_view(argv[3]) == "kitchen" ||
+                            std::string_view(argv[3]) == "kitchen-colour" ||
+                            std::string_view(argv[3]) == "kitchen-visibility" ||
+                            std::string_view(argv[3]) == "kitchen-ao")) {
+      exerciseKitchenScene(device, swapchain, framesInFlight, argv[4], argv[5],
+                           std::string_view(argv[3]) == "kitchen-colour",
+                           std::string_view(argv[3]) == "kitchen-visibility",
+                           std::string_view(argv[3]) == "kitchen-ao");
     } else {
-    exerciseGpuAllocator(device);
-    exerciseImageAllocator(device);
-    exerciseHdrAllocation(device);
-    exerciseTextureMips(device);
-    exerciseHdrOutput(device);
-    exercisePresentation(device, swapchain, framesInFlight);
-    exerciseHdrScene(device, swapchain, framesInFlight);
-    exerciseMaterialContract(device, swapchain, framesInFlight);
-    exerciseEnvironmentIbl(device, swapchain, framesInFlight);
-    exerciseSpecularExtension(device, swapchain, framesInFlight);
-    exerciseSpecularAa(device, swapchain, framesInFlight);
-    exercisePunctualLights(device, swapchain, framesInFlight);
-    exerciseFrameContexts(device, swapchain);
-    {
-      std::unique_ptr<SwapChain> resized;
-      Renderer renderer(device, framesInFlight);
-      renderer.recreateForSwapChain(swapchain);
-      auto imported = loadStaticGltfScene(TEST_FIXTURE, {});
-      AssetLibrary assets{.meshes = std::move(imported.meshes),
-                          .materials = std::move(imported.materials)};
-      try {
-        exerciseTextureCache(device);
-        exercise(renderer, device, assets);
-        verifyDrainedFrameContexts(renderer);
-        renderer.setUiDrawCallback({});
-        auto baseline = renderer.resourceSnapshot();
-        auto sceneStats = renderer.resourceStatistics();
-        for (auto size : {vk::Extent2D{400, 300}, vk::Extent2D{640, 360},
-                          swapchain.extent()}) {
-          device.logicalDevice()
-              .waitIdle(); // Test-only, matching resize's drain.
-          glfwSetWindowSize(window, size.width, size.height);
-          auto deadline =
-              std::chrono::steady_clock::now() + std::chrono::seconds(5);
-          int width = 0, height = 0;
-          do {
-            glfwPollEvents();
-            glfwGetFramebufferSize(window, &width, &height);
-            require(std::chrono::steady_clock::now() < deadline,
-                    "Resize event did not arrive");
-            if (width != int(size.width) || height != int(size.height))
-              std::this_thread::sleep_for(std::chrono::milliseconds(1));
-          } while (width != int(size.width) || height != int(size.height));
-          auto const beforeResizeFrame = renderer.submittedFrameId();
-          auto beforeResizeResult = renderer.renderFrame(
-              {.sky = true}, glm::mat4(1), {0, 0, 2}, {}, false);
-          std::cout << "Resize old-generation acquire/present result: "
-                    << int(beforeResizeResult) << ", submitted delta="
-                    << (renderer.submittedFrameId() - beforeResizeFrame)
-                    << '\n';
-          auto &old = resized ? *resized : swapchain;
-          old.drainPresentations();
-          require(old.presentationStatistics().pendingFences == 0 &&
-                      old.presentationReleaseProven() ==
-                          device.presentationSupport().fencesEnabled(),
-                  "Old generation was not drained before replacement");
-          auto candidate = std::make_unique<SwapChain>(
-              device, surface, window,
-              resized ? *resized->handle() : *swapchain.handle());
-          require(candidate->extent() == size,
-                  "Swapchain extent differs from resized framebuffer");
-          renderer.recreateForSwapChain(*candidate);
-          resized = std::move(candidate);
-          auto snapshot = renderer.resourceSnapshot();
-          auto before = baseline.at(ResourceLedger::Domain::Persistent);
-          auto after = snapshot.at(ResourceLedger::Domain::Persistent);
-          auto expected = before.payloadBytes -
-                          std::uint64_t(swapchain.extent().width) *
-                              swapchain.extent().height * 44 +
-                          std::uint64_t(size.width) * size.height * 44;
-          if (after.payloadBytes != expected || after.images != before.images ||
-              after.imageViews != before.imageViews)
-            std::cerr << "Resize " << size.width << 'x' << size.height
-                      << " initial=" << swapchain.extent().width << 'x'
-                      << swapchain.extent().height
-                      << " persistent payload before=" << before.payloadBytes
-                      << " after=" << after.payloadBytes
-                      << " expected=" << expected << " images=" << before.images
-                      << "->" << after.images << " views=" << before.imageViews
-                      << "->" << after.imageViews << '\n';
-          require(after.payloadBytes == expected &&
-                      after.images == before.images &&
-                      after.imageViews == before.imageViews,
-                  "Resize retained old depth payload/image/view");
-          require(snapshot.at(ResourceLedger::Domain::SharedTextures) ==
-                      baseline.at(ResourceLedger::Domain::SharedTextures),
-                  "Resize changed shared textures");
-          require(snapshot.at(ResourceLedger::Domain::LiveScene) ==
-                      baseline.at(ResourceLedger::Domain::LiveScene),
-                  "Resize changed live scene");
-          Camera camera;
-          camera.position = {0, 0, 4};
-          camera.target = {0, 0, 0};
-          require(renderer.beginFrame(
-                      camera.viewProj(float(size.width) / size.height),
-                      camera.position, {},
-                      false) == Renderer::FrameResult::eSuccess,
-                  "Frame failed after resize");
-          renderer.drawEnvironment();
-          renderer.drawObject(0, 0, glm::mat4(1));
-          require(renderer.endFrame() !=
-                      Renderer::FrameResult::eSwapChainOutOfDate,
-                  "Resized rendering unexpectedly out of date");
+      exerciseGpuAllocator(device);
+      exerciseImageAllocator(device);
+      exerciseHdrAllocation(device);
+      exerciseTextureMips(device);
+      exerciseHdrOutput(device);
+      exercisePresentation(device, swapchain, framesInFlight);
+      exerciseHdrScene(device, swapchain, framesInFlight);
+      exerciseMaterialContract(device, swapchain, framesInFlight);
+      exerciseEnvironmentIbl(device, swapchain, framesInFlight);
+      exerciseSpecularExtension(device, swapchain, framesInFlight);
+      exerciseSpecularAa(device, swapchain, framesInFlight);
+      exercisePunctualLights(device, swapchain, framesInFlight);
+      exerciseFrameContexts(device, swapchain);
+      {
+        std::unique_ptr<SwapChain> resized;
+        Renderer renderer(device, framesInFlight);
+        renderer.recreateForSwapChain(swapchain);
+        auto imported = loadStaticGltfScene(TEST_FIXTURE, {});
+        AssetLibrary assets{.meshes = std::move(imported.meshes),
+                            .materials = std::move(imported.materials)};
+        try {
+          exerciseTextureCache(device);
+          exercise(renderer, device, assets);
+          verifyDrainedFrameContexts(renderer);
+          renderer.setUiDrawCallback({});
+          auto baseline = renderer.resourceSnapshot();
+          auto sceneStats = renderer.resourceStatistics();
+          for (auto size : {vk::Extent2D{400, 300}, vk::Extent2D{640, 360},
+                            swapchain.extent()}) {
+            device.logicalDevice()
+                .waitIdle(); // Test-only, matching resize's drain.
+            glfwSetWindowSize(window, size.width, size.height);
+            auto deadline =
+                std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            int width = 0, height = 0;
+            do {
+              glfwPollEvents();
+              glfwGetFramebufferSize(window, &width, &height);
+              require(std::chrono::steady_clock::now() < deadline,
+                      "Resize event did not arrive");
+              if (width != int(size.width) || height != int(size.height))
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            } while (width != int(size.width) || height != int(size.height));
+            auto const beforeResizeFrame = renderer.submittedFrameId();
+            auto beforeResizeResult = renderer.renderFrame(
+                {.sky = true}, glm::mat4(1), {0, 0, 2}, {}, false);
+            std::cout << "Resize old-generation acquire/present result: "
+                      << int(beforeResizeResult) << ", submitted delta="
+                      << (renderer.submittedFrameId() - beforeResizeFrame)
+                      << '\n';
+            auto &old = resized ? *resized : swapchain;
+            old.drainPresentations();
+            require(old.presentationStatistics().pendingFences == 0 &&
+                        old.presentationReleaseProven() ==
+                            device.presentationSupport().fencesEnabled(),
+                    "Old generation was not drained before replacement");
+            auto candidate = std::make_unique<SwapChain>(
+                device, surface, window,
+                resized ? *resized->handle() : *swapchain.handle());
+            require(candidate->extent() == size,
+                    "Swapchain extent differs from resized framebuffer");
+            renderer.recreateForSwapChain(*candidate);
+            resized = std::move(candidate);
+            auto snapshot = renderer.resourceSnapshot();
+            auto before = baseline.at(ResourceLedger::Domain::Persistent);
+            auto after = snapshot.at(ResourceLedger::Domain::Persistent);
+            auto pixelBytes = renderer.rayTracingAvailable() ? 80u : 64u;
+            auto expected = before.payloadBytes -
+                            std::uint64_t(swapchain.extent().width) *
+                                swapchain.extent().height * pixelBytes +
+                            std::uint64_t(size.width) * size.height * pixelBytes;
+            if (after.payloadBytes != expected ||
+                after.images != before.images ||
+                after.imageViews != before.imageViews)
+              std::cerr << "Resize " << size.width << 'x' << size.height
+                        << " initial=" << swapchain.extent().width << 'x'
+                        << swapchain.extent().height
+                        << " persistent payload before=" << before.payloadBytes
+                        << " after=" << after.payloadBytes
+                        << " expected=" << expected
+                        << " images=" << before.images << "->" << after.images
+                        << " views=" << before.imageViews << "->"
+                        << after.imageViews << '\n';
+            require(after.payloadBytes == expected &&
+                        after.images == before.images &&
+                        after.imageViews == before.imageViews,
+                    "Resize retained old depth payload/image/view");
+            require(snapshot.at(ResourceLedger::Domain::SharedTextures) ==
+                        baseline.at(ResourceLedger::Domain::SharedTextures),
+                    "Resize changed shared textures");
+            require(snapshot.at(ResourceLedger::Domain::LiveScene) ==
+                        baseline.at(ResourceLedger::Domain::LiveScene),
+                    "Resize changed live scene");
+            Camera camera;
+            camera.position = {0, 0, 4};
+            camera.target = {0, 0, 0};
+            require(renderer.beginFrame(
+                        camera.viewProj(float(size.width) / size.height),
+                        camera.position, {},
+                        false) == Renderer::FrameResult::eSuccess,
+                    "Frame failed after resize");
+            renderer.drawEnvironment();
+            renderer.drawObject(0, 0, glm::mat4(1));
+            require(renderer.endFrame() !=
+                        Renderer::FrameResult::eSwapChainOutOfDate,
+                    "Resized rendering unexpectedly out of date");
+            device.logicalDevice().waitIdle();
+            checkAllocationStatistics(device);
+          }
+          require(renderer.resourceStatistics().environmentUploads ==
+                          sceneStats.environmentUploads &&
+                      renderer.resourceStatistics().sceneCommits ==
+                          sceneStats.sceneCommits &&
+                      renderer.resourceSnapshot().current.suballocatedBytes ==
+                          baseline.current.suballocatedBytes,
+                  "Resize reuploaded assets or retained old depth ranges");
+          std::cout << "PASS resize: 400x300, 640x360, original "
+                    << swapchain.extent().width << 'x'
+                    << swapchain.extent().height
+                    << "; renders after each, depth ranges restored, "
+                       "scene/shared storage stable\n";
+        } catch (...) {
           device.logicalDevice().waitIdle();
-          checkAllocationStatistics(device);
+          throw;
         }
-        require(renderer.resourceStatistics().environmentUploads ==
-                        sceneStats.environmentUploads &&
-                    renderer.resourceStatistics().sceneCommits ==
-                        sceneStats.sceneCommits &&
-                    renderer.resourceSnapshot().current.suballocatedBytes ==
-                        baseline.current.suballocatedBytes,
-                "Resize reuploaded assets or retained old depth ranges");
-        std::cout << "PASS resize: 400x300, 640x360, original "
-                  << swapchain.extent().width << 'x'
-                  << swapchain.extent().height
-                  << "; renders after each, depth ranges restored, "
-                     "scene/shared storage stable\n";
-      } catch (...) {
-        device.logicalDevice().waitIdle();
-        throw;
       }
-    }
     }
     require(device.resourceLedger().snapshot().current ==
                 ResourceLedger::Footprint{},

@@ -116,7 +116,7 @@ private:
   bool shadowDebugEnabled_ = true;
   bool normalMapDebugEnabled_ = true;
   bool parallaxDebugEnabled_ = true;
-  bool frustumCullingEnabled_ = false;
+  bool frustumCullingEnabled_ = true;
   bool animateScene_ = false;
   bool probeCaptureRequested_ = false;
   std::string probeCaptureError_, activeLightingPreset_ = "asset";

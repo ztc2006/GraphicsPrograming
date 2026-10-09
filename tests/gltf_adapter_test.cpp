@@ -159,6 +159,20 @@ int main() {
       }
       require(rejected, name);
     }
+    auto roles = fixture("area_light_metadata.gltf");
+    require(roles.materials.size() == 6,
+            "Area-light metadata material count changed");
+    for (unsigned i = 0; i < 6; ++i)
+      require(roles.materials[i].sourceAreaLight == (i == 0 || i == 5),
+              "Light-card role confused metadata with emissive/string/invalid "
+              "array");
+    auto glass=fixture("dielectric_uniform.gltf");
+    require(glass.materials[0].optical.enabled && glass.materials[0].optical.solid && near(glass.materials[0].optical.ior,1.33f) && near(glass.materials[0].optical.transmission,.8f),"Uniform dielectric factors lost");
+    require(near(glass.materials[0].optical.absorption.x,float(-std::log(.5)/.5)) && near(glass.materials[0].optical.absorption.y,float(-std::log(.25)/.5)),"Attenuation semantics lost");
+    require(glass.materials[1].optical.enabled && glass.materials[1].optical.coverage==0 && near(glass.materials[1].optical.ior,1.5f),"PBRT conversion alpha mistaken for optical coverage");
+    require(!glass.materials[2].optical.enabled,"Plain alpha BLEND guessed as glass");
+    bool invalidDielectric=false;try{fixture("dielectric_invalid.gltf");}catch(std::runtime_error const &){invalidDielectric=true;}
+    require(invalidDielectric,"Invalid PBRT eta accepted");
     std::cout << "Adapter semantics: "
                  "sparse/interleaved/normalized/tangent/default/UV "
                  "transform/extension/error cases passed\n";

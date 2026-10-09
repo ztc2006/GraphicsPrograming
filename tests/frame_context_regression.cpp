@@ -70,7 +70,7 @@ struct RendererFrameTestAccess {
         std::abs(ga.previousModel[3].x-.2f)<1e-6f,"Pending motion storage/identity overwritten");
   }
   static void submit(Renderer &r, unsigned slot, float debugMode,
-                     GpuBuffer const &readback, unsigned lights = 0, bool clustered = false, bool cascades = false, bool motionCase = false) {
+                     GpuBuffer const &readback, unsigned lights = 0, bool clustered = false, bool cascades = false, bool motionCase = false, bool aoCase = false) {
     auto &frame = r.frames_[slot]; auto &command = r.commandBuffers_[slot];
     require(!frame.submitted && frame.inFlightFence.getStatus() == vk::Result::eSuccess,
             "Test attempted pending slot reuse");
@@ -104,7 +104,7 @@ struct RendererFrameTestAccess {
       point.intensity = std::numbers::pi_v<float> / lights;
       lighting.punctualLights.assign(lights, point);
     }
-    if (cascades) {
+    if (cascades || aoCase) {
       camera = {0,0,3};
       Camera c; c.position=camera; c.target={0,0,0}; c.farPlane=50;
       view=c.viewProj(float(extent.width)/extent.height);
@@ -133,23 +133,41 @@ struct RendererFrameTestAccess {
     r.updateFrameUniformBuffer(frame, view, camera, lighting);
     command.begin(vk::CommandBufferBeginInfo{.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit});
     if (*frame.timestamps) command.resetQueryPool(*frame.timestamps, 0, 12);
+    frame.aoEnabled = aoCase;
+    if (aoCase && *frame.aoTimestamps)
+      command.resetQueryPool(*frame.aoTimestamps, 0, 6);
+    GtaoPush aoPush{
+        .inverseRaster = glm::inverse(view),
+        .camera = glm::vec4(camera, 1),
+        .settings = {.5f, 1, slot == 0 ? 1.f : 0.f, 128},
+        .screen = {float(extent.width), float(extent.height), 0, 0}};
     r.activeFrame_ = Renderer::ActiveFrameState{slot, 0, vk::Result::eSuccess};
     frame.shadowEnabled = frame.uiEnabled = false;
     using G = RenderGraph;
     G graph;
     auto depthUsage = vk::ImageUsageFlagBits::eDepthStencilAttachment |
-                      vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eTransferSrc;
-    auto shadow = graph.importImage({"Shared shadow", *r.shadowResources_.storage.image,
-        *r.shadowResources_.imageView, Renderer::kDepthFormat,
-        {Renderer::kShadowAtlasWidth, Renderer::kShadowMapSize}, vk::ImageAspectFlagBits::eDepth,
-        depthUsage, false, r.imageStates_.shadow});
-    auto depth = graph.importImage({"Shared depth", *r.depthResources_.storage.image,
-        *r.depthResources_.imageView, Renderer::kDepthFormat, r.swapChain_->extent(),
-        vk::ImageAspectFlagBits::eDepth, depthUsage, false, r.imageStates_.depth});
+                      vk::ImageUsageFlagBits::eSampled |
+                      vk::ImageUsageFlagBits::eTransferSrc;
+    auto shadow = graph.importImage(
+        {"Shared shadow",
+         *r.shadowResources_.storage.image,
+         *r.shadowResources_.imageView,
+         Renderer::kDepthFormat,
+         {Renderer::kShadowAtlasWidth, Renderer::kShadowMapSize},
+         vk::ImageAspectFlagBits::eDepth,
+         depthUsage,
+         false,
+         r.imageStates_.shadow});
+    auto depth = graph.importImage(
+        {"Shared depth", *r.depthResources_.storage.image,
+         *r.depthResources_.imageView, Renderer::kDepthFormat,
+         r.swapChain_->extent(), vk::ImageAspectFlagBits::eDepth, depthUsage,
+         false, r.imageStates_.depth});
     auto hdr = graph.importImage({"Shared HDR", r.hdrOutput_->sceneImage(), r.hdrOutput_->sceneView(),
         HdrOutput::sceneFormat, r.swapChain_->extent(), vk::ImageAspectFlagBits::eColor,
         vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled |
             vk::ImageUsageFlagBits::eTransferSrc, false, r.imageStates_.hdr});
+    auto diffuse = r.gtao_->importDiffuse(graph);
     auto motion = graph.importImage({"Shared motion", *r.motionResources_.storage.image,
         *r.motionResources_.imageView, Renderer::kMotionFormat, r.swapChain_->extent(),
         vk::ImageAspectFlagBits::eColor, vk::ImageUsageFlagBits::eColorAttachment |
@@ -181,44 +199,85 @@ struct RendererFrameTestAccess {
     vk::ClearValue farDepth{.depthStencil = {1, 0}};
     vk::ClearValue black{.color = vk::ClearColorValue{std::array<float, 4>{0, 0, 0, 1}}};
     if (!r.imageStates_.shadow.defined)
-      graph.addPass("Initialize shadow", {{shadow, G::Usage::DepthAttachment,
-          vk::AttachmentLoadOp::eClear, vk::AttachmentStoreOp::eStore, false, farDepth}});
-    auto main = graph.addPass("Uniform race probe", {
-        {shadow, G::Usage::SampledDepth}, {hdr, G::Usage::ColorAttachment,
-         vk::AttachmentLoadOp::eClear, vk::AttachmentStoreOp::eStore, false, black},
-        {motion, G::Usage::ColorAttachment, vk::AttachmentLoadOp::eClear,
-         vk::AttachmentStoreOp::eStore, false, black},
-        {depth, G::Usage::DepthAttachment, vk::AttachmentLoadOp::eClear,
-         vk::AttachmentStoreOp::eStore, false, farDepth}}, std::move(reads));
-    auto copy = graph.addPass("Readback", {{motionCase ? motion : hdr, G::Usage::TransferSource}});
+      graph.addPass(
+          "Initialize shadow",
+          {{shadow, G::Usage::DepthAttachment, vk::AttachmentLoadOp::eClear,
+            vk::AttachmentStoreOp::eStore, false, farDepth}});
+    auto main = graph.addPass(
+        "Uniform race probe",
+        {{shadow, G::Usage::SampledDepth},
+         {hdr, G::Usage::ColorAttachment, vk::AttachmentLoadOp::eClear,
+          vk::AttachmentStoreOp::eStore, false, black},
+         {motion, G::Usage::ColorAttachment, vk::AttachmentLoadOp::eClear,
+          vk::AttachmentStoreOp::eStore, false, black},
+         {diffuse, G::Usage::ColorAttachment, vk::AttachmentLoadOp::eClear,
+          vk::AttachmentStoreOp::eStore, false, black},
+         {depth, G::Usage::DepthAttachment, vk::AttachmentLoadOp::eClear,
+          vk::AttachmentStoreOp::eStore, false, farDepth}},
+        std::move(reads));
+    std::optional<Gtao::Frame> ao;
+    if (aoCase)
+      ao = r.gtao_->addPasses(graph, hdr, depth, diffuse);
+    auto copy = graph.addPass("Readback", {{ao ? ao->images[Gtao::Composite]
+                                            : motionCase ? motion
+                                                         : hdr,
+                                            G::Usage::TransferSource}});
+    if (ao)
+      graph.exportImage(ao->images[Gtao::Composite], G::Usage::SampledColor);
     graph.exportImage(hdr, G::Usage::SampledColor);
     graph.exportImage(depth, G::Usage::SampledDepth);
     auto plan = graph.compile();
-    for (unsigned i = 0; i < 3; ++i) r.timestamp(command, i);
+    for (unsigned i = 0; i < 3; ++i)
+      r.timestamp(command, i);
     plan.record(*command, [&](G::Pass const &pass, G::Event event) {
-      if (cull && pass.id == *cull) {
+      int aoPass = !ao                        ? -1
+                   : pass.id == ao->horizon   ? 0
+                   : pass.id == ao->filter    ? 1
+                   : pass.id == ao->composite ? 2
+                                              : -1;
+      if (aoPass >= 0) {
+        if (event == G::Event::Begin && *frame.aoTimestamps)
+          command.writeTimestamp2(vk::PipelineStageFlagBits2::eBottomOfPipe,
+                                  *frame.aoTimestamps, unsigned(aoPass) * 2);
+        else if (event == G::Event::End && *frame.aoTimestamps)
+          command.writeTimestamp2(vk::PipelineStageFlagBits2::eBottomOfPipe,
+                                  *frame.aoTimestamps,
+                                  unsigned(aoPass) * 2 + 1);
+        else if (event == G::Event::Draw)
+          r.gtao_->draw(*command, unsigned(aoPass), aoPush);
+      } else if (cull && pass.id == *cull) {
         if (event == G::Event::Begin) {
           r.timestamp(command, 10);
-          command.bindPipeline(vk::PipelineBindPoint::eCompute, *r.clusterPipeline_);
-          command.bindDescriptorSets(vk::PipelineBindPoint::eCompute, *r.clusterPipelineLayout_,
-                                    0, {frame.descriptorSet}, {});
+          command.bindPipeline(vk::PipelineBindPoint::eCompute,
+                               *r.clusterPipeline_);
+          command.bindDescriptorSets(vk::PipelineBindPoint::eCompute,
+                                     *r.clusterPipelineLayout_, 0,
+                                     {frame.descriptorSet}, {});
         } else if (event == G::Event::Draw)
           command.dispatch((frame.clusterGrid.grid.w + 63) / 64, 1, 1);
-        else r.timestamp(command, 11);
+        else
+          r.timestamp(command, 11);
       } else if (pass.id == main) {
         if (event == G::Event::Begin) {
-          r.timestamp(command, 3); r.activePass_ = Renderer::ActivePass::eMain;
-          command.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *r.pipelineLayout_, 0,
+          r.timestamp(command, 3);
+          r.activePass_ = Renderer::ActivePass::eMain;
+          command.bindDescriptorSets(vk::PipelineBindPoint::eGraphics,
+                                     *r.pipelineLayout_, 0,
                                      {frame.descriptorSet}, {});
         } else if (event == G::Event::Draw)
           r.recordObject(0, lights ? 1 : 0, model, motionCase ? 1 : 0);
-        else { r.timestamp(command, 4); r.activePass_ = Renderer::ActivePass::eNone; }
+        else {
+          r.timestamp(command, 4);
+          r.activePass_ = Renderer::ActivePass::eNone;
+        }
       } else if (pass.id == copy) {
-        if (event == G::Event::Begin) r.timestamp(command, 5);
-        else if (event == G::Event::End) r.timestamp(command, 6);
+        if (event == G::Event::Begin)
+          r.timestamp(command, 5);
+        else if (event == G::Event::End)
+          r.timestamp(command, 6);
         else {
           auto extent = r.swapChain_->extent();
-          command.copyImageToBuffer(motionCase ? *r.motionResources_.storage.image : r.hdrOutput_->sceneImage(), vk::ImageLayout::eTransferSrcOptimal,
+          command.copyImageToBuffer(ao?r.gtao_->image(Gtao::Composite):motionCase ? *r.motionResources_.storage.image : r.hdrOutput_->sceneImage(), vk::ImageLayout::eTransferSrcOptimal,
               *readback.buffer, {vk::BufferImageCopy{
                 .imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
                 .imageOffset = {int(extent.width / 2), int(extent.height / 2), 0},
@@ -247,6 +306,7 @@ struct RendererFrameTestAccess {
     r.imageStates_.depth = plan.finalState(depth);
     r.imageStates_.hdr = plan.finalState(hdr);
     r.imageStates_.motion = plan.finalState(motion);
+    r.gtao_->submitted(plan,diffuse,ao?&*ao:nullptr);
     if (frame.clusterEnabled) frame.clusterState = plan.finalBufferState(indices);
     r.activeFrame_.reset();
   }
@@ -401,6 +461,18 @@ void exerciseFrameContexts(Device const &device, SwapChain const &swapchain) {
       require(samples.size()==10 && renderer.gpuTimings().frameId==10,"Motion query IDs regressed");
       RendererFrameTestAccess::verifyDrained(renderer);
       std::cout<<"PASS two blocked motion slots: reversed slot order, first invalid then +.1 UV, independent 160/320B previous transforms, ten exact query callbacks\n";
+
+      value=5;released=false;
+      device.graphicsQueue().submit({vk::SubmitInfo{.pNext=&timeline,.waitSemaphoreCount=1,
+          .pWaitSemaphores=&raw,.pWaitDstStageMask=&stages}},nullptr);
+      RendererFrameTestAccess::submit(renderer,0,2,a,0,false,false,false,true);
+      RendererFrameTestAccess::submit(renderer,1,2,b,0,false,false,false,true);
+      renderer.collectCompletedWork();require(samples.size()==10,"AO query completed before timeline release");
+      release();renderer.collectCompletedWork();
+      require(glm::length(color(a)-glm::vec3(1))<.04f && glm::length(color(b)-glm::vec3(.25f))<.001f,"Pending AO push/debug mode overwritten or shared targets raced");
+      require(samples.size()==12 && samples[10].aoMs>0 && samples[11].aoMs>0,"Pending AO query lost/duplicated");
+      RendererFrameTestAccess::verifyDrained(renderer);
+      std::cout<<"PASS two timeline-blocked AO slots: raw white / HDR .25, immutable pushes, shared graph targets, independent six-query pools\n";
 
       std::cout << "PASS two blocked frame slots: distinct uniforms -> HDR .25/.75, pending scene/UI retained, "
                    "all queries delivered once, reuse/reverse collection preserves latest ID, zero stale fences\n";

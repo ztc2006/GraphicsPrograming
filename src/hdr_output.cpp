@@ -192,14 +192,41 @@ vk::raii::Pipeline HdrOutput::createPipeline(vk::Format displayFormat) const {
                                       .layout = *pipelineLayout_};
   return vk::raii::Pipeline(device_.logicalDevice(), nullptr, info);
 }
-void HdrOutput::configureTemporalViews(std::array<vk::ImageView,2> views) {
-  vk::DescriptorPoolSize size{vk::DescriptorType::eCombinedImageSampler,2};
-  temporalPool_=vk::raii::DescriptorPool(device_.logicalDevice(),vk::DescriptorPoolCreateInfo{.maxSets=2,.poolSizeCount=1,.pPoolSizes=&size});
-  std::array layouts{*descriptorLayout_,*descriptorLayout_};
-  auto sets=(*device_.logicalDevice()).allocateDescriptorSets(vk::DescriptorSetAllocateInfo{.descriptorPool=*temporalPool_,.descriptorSetCount=2,.pSetLayouts=layouts.data()});
-  for(unsigned i=0;i<2;++i){temporalDescriptors_[i]=sets[i];vk::DescriptorImageInfo info{*sampler_,views[i],vk::ImageLayout::eShaderReadOnlyOptimal};
-    device_.logicalDevice().updateDescriptorSets({vk::WriteDescriptorSet{.dstSet=sets[i],.dstBinding=0,.descriptorCount=1,.descriptorType=vk::DescriptorType::eCombinedImageSampler,.pImageInfo=&info}},{});}
-  temporalAccounting_=device_.resourceLedger().scope(ResourceLedger::Domain::Persistent).track({.descriptorPools=1,.descriptorSets=2});
+void HdrOutput::configureRayTracingView(vk::ImageView view) {
+  vk::DescriptorPoolSize size{vk::DescriptorType::eCombinedImageSampler, 1};
+  rtPool_ = vk::raii::DescriptorPool(device_.logicalDevice(),
+      vk::DescriptorPoolCreateInfo{.maxSets=1,.poolSizeCount=1,.pPoolSizes=&size});
+  auto layout=*descriptorLayout_;
+  auto set=(*device_.logicalDevice()).allocateDescriptorSets(vk::DescriptorSetAllocateInfo{
+      .descriptorPool=*rtPool_,.descriptorSetCount=1,.pSetLayouts=&layout}).front();
+  vk::DescriptorImageInfo info{*sampler_,view,vk::ImageLayout::eShaderReadOnlyOptimal};
+  device_.logicalDevice().updateDescriptorSets({vk::WriteDescriptorSet{
+      .dstSet=set,.dstBinding=0,.descriptorCount=1,.descriptorType=vk::DescriptorType::eCombinedImageSampler,.pImageInfo=&info}},{});
+  temporalDescriptors_[3]=set;
+  rtAccounting_=device_.resourceLedger().scope(ResourceLedger::Domain::Persistent).track({.descriptorPools=1,.descriptorSets=1});
+}
+void HdrOutput::configureTemporalViews(std::array<vk::ImageView, 3> views) {
+  vk::DescriptorPoolSize size{vk::DescriptorType::eCombinedImageSampler, 3};
+  temporalPool_ = vk::raii::DescriptorPool(
+      device_.logicalDevice(),
+      vk::DescriptorPoolCreateInfo{
+          .maxSets = 3, .poolSizeCount = 1, .pPoolSizes = &size});
+  std::array layouts{*descriptorLayout_, *descriptorLayout_,
+                     *descriptorLayout_};
+  auto sets = (*device_.logicalDevice())
+                  .allocateDescriptorSets(vk::DescriptorSetAllocateInfo{
+                      .descriptorPool = *temporalPool_,
+                      .descriptorSetCount = 3,
+                      .pSetLayouts = layouts.data()});
+  for (unsigned i = 0; i < 3; ++i) {
+    temporalDescriptors_[i] = sets[i];
+    vk::DescriptorImageInfo info{*sampler_, views[i],
+                                 vk::ImageLayout::eShaderReadOnlyOptimal};
+    device_.logicalDevice().updateDescriptorSets({vk::WriteDescriptorSet{.dstSet=sets[i],.dstBinding=0,.descriptorCount=1,.descriptorType=vk::DescriptorType::eCombinedImageSampler,.pImageInfo=&info}},{});
+  }
+  temporalAccounting_ = device_.resourceLedger()
+                            .scope(ResourceLedger::Domain::Persistent)
+                            .track({.descriptorPools = 1, .descriptorSets = 3});
 }
 void HdrOutput::drawDisplay(vk::CommandBuffer command, DisplaySettings settings,int temporalIndex) {
   validateDisplaySettings(settings);

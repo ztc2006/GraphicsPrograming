@@ -1,0 +1,18 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "primary_common.glsl"
+hitAttributeEXT vec2 hit;
+void main(){
+  InstanceData data=objects[gl_InstanceCustomIndexEXT];
+  bool front=gl_HitKindEXT==gl_HitKindFrontFacingTriangleEXT;
+  if(frame.options.z!=0)front=!front;
+  if((uint(data.optical.w)&1u)==0 && data.surface.z==0 && ((frame.options.y==2 && !front)||(frame.options.y==1 && front)))ignoreIntersectionEXT;
+  float alpha=surfaceColor(data,hit,uint(gl_PrimitiveID)).a;
+  uint coverage=(uint(data.optical.w)&1u)!=0 ? ((uint(data.optical.w)>>1)&3u) : uint(data.surface.y);
+  if(coverage==1 && alpha<data.surface.x)ignoreIntersectionEXT;
+  if(coverage==2){
+    uint h=hash(gl_LaunchIDEXT.x+gl_LaunchIDEXT.y*gl_LaunchSizeEXT.x+gl_InstanceCustomIndexEXT*7459u+gl_PrimitiveID*5227u);
+    h=hash(h^lighting.sampling.y^floatBitsToUint(gl_WorldRayDirectionEXT.x)^floatBitsToUint(gl_WorldRayDirectionEXT.z));
+    if(alpha<=float(h>>8)*0.000000059604644775390625)ignoreIntersectionEXT;
+  }
+}

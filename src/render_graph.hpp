@@ -13,7 +13,7 @@ public:
   struct ImageId { std::uint32_t value; bool operator==(ImageId const &) const = default; };
   struct BufferId { std::uint32_t value; bool operator==(BufferId const &) const = default; };
   struct PassId { std::uint32_t value; bool operator==(PassId const &) const = default; };
-  enum class Usage { ColorAttachment, DepthAttachment, SampledColor, SampledDepth, TransferSource, Present };
+  enum class Usage { ColorAttachment, DepthAttachment, SampledColor, SampledDepth, TransferSource, RayTracingWrite, RayTracingReadWrite, Present };
   struct State {
     vk::ImageLayout layout = vk::ImageLayout::eUndefined;
     vk::PipelineStageFlags2 stages{};

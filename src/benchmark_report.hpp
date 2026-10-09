@@ -18,12 +18,16 @@ struct BenchmarkMetadata {
   std::string projectSourceSha256;
   std::string gpu, deviceType, driver, api, scene, cameraPath, lightCulling, presentMode,
       buildType;
+  std::string renderMethod = "raster";
   std::string lightingPreset = "asset";
   unsigned punctualLightCount = 0, spotShadowCount = 0, sunCascadeCount = 0;
   float sunShadowDistance = 0;
-  bool localProbeValid = false;
+  bool localProbeValid = false, detailReflectionProbeValid = false;
+  bool cameraCulling=true, shadowCulling=true;
   std::string taaHistoryFilter="catmull-rom";
-  bool taaEnabled=false;
+  bool taaEnabled = false, aoEnabled = false;
+  float aoRadius = .5f, aoStrength = 1.f;
+  std::string aoDebug = "none";
   bool temporalJitterEnabled = false, temporalHistoryValid = false;
   unsigned width = 0, height = 0;
   unsigned framesInFlight = 1, swapchainImageCount = 0;

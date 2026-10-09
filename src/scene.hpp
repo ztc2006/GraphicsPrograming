@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "camera.hpp"
+#include "dielectric.hpp"
 #include "glm_include.hpp"
 #include "punctual_lights.hpp"
 #include "indoor_lighting.hpp"
@@ -31,6 +32,7 @@ inline char const *alphaModeLabel(AlphaMode mode) {
 }
 
 struct Material {
+  OpticalMaterial optical;
   std::string name;
   std::string albedoPath;
   std::vector<std::byte> albedoBytes;
@@ -69,10 +71,14 @@ struct Material {
   AlphaMode alphaMode = AlphaMode::Opaque;
   float alphaCutoff = 0.5f;
   bool doubleSided = false;
+  bool sourceAreaLight =
+      false; // Explicit imported light-card metadata, not any emissive.
 };
 
 struct LightingSettings {
   LocalProbeSettings localProbe;
+  LocalProbeSettings
+      detailReflectionProbe; // Optional small specular-only region.
   SunCascadeSettings sunCascades;
   unsigned localShadowDebugIndex = 0;
   glm::vec3 direction{-0.4f, 1.0f, 0.3f};

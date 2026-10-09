@@ -15,7 +15,8 @@ std::vector<std::uint32_t> shader(char const *p) {
 }
 } // namespace
 TaaResolve::TaaResolve(Device const &d, vk::Extent2D e, vk::ImageView color,
-                       vk::ImageView depth, vk::ImageView motion)
+                       vk::ImageView depth, vk::ImageView motion,
+                       vk::ImageView alternativeColor)
     : device_(d), extent_(e) {
   auto scope = d.resourceLedger().scope(ResourceLedger::Domain::Persistent);
   auto target = [&](GpuImage &image, vk::raii::ImageView &view,
@@ -73,21 +74,22 @@ TaaResolve::TaaResolve(Device const &d, vk::Extent2D e, vk::ImageView color,
                    .stageFlags = vk::ShaderStageFlagBits::eFragment};
   setLayout_ = vk::raii::DescriptorSetLayout(
       d.logicalDevice(), {.bindingCount = 5, .pBindings = bindings.data()});
-  vk::DescriptorPoolSize size{vk::DescriptorType::eCombinedImageSampler, 10};
+  vk::DescriptorPoolSize size{vk::DescriptorType::eCombinedImageSampler, 20};
   pool_ = vk::raii::DescriptorPool(
       d.logicalDevice(),
-      {.maxSets = 2, .poolSizeCount = 1, .pPoolSizes = &size});
-  std::array layouts{*setLayout_, *setLayout_};
+      {.maxSets = 4, .poolSizeCount = 1, .pPoolSizes = &size});
+  std::array layouts{*setLayout_, *setLayout_, *setLayout_, *setLayout_};
   auto allocated = (*d.logicalDevice())
                        .allocateDescriptorSets({.descriptorPool = *pool_,
-                                                .descriptorSetCount = 2,
+                                                .descriptorSetCount = 4,
                                                 .pSetLayouts = layouts.data()});
-  for (unsigned w = 0; w < 2; ++w) {
+  for (unsigned w = 0; w < 4; ++w) {
     sets_[w] = allocated[w];
-    unsigned prev = 1 - w;
+    unsigned prev = 1 - w % 2;
     std::array infos{
-        vk::DescriptorImageInfo{*nearest_, color,
-                                vk::ImageLayout::eShaderReadOnlyOptimal},
+        vk::DescriptorImageInfo{
+            *nearest_, w >= 2 && alternativeColor ? alternativeColor : color,
+            vk::ImageLayout::eShaderReadOnlyOptimal},
         vk::DescriptorImageInfo{*nearest_, depth,
                                 vk::ImageLayout::eDepthReadOnlyOptimal},
         vk::DescriptorImageInfo{*nearest_, motion,
@@ -167,7 +169,7 @@ TaaResolve::TaaResolve(Device const &d, vk::Extent2D e, vk::ImageView color,
   accounting_ = scope.track({.imageViews = 4,
                              .samplers = 2,
                              .descriptorPools = 1,
-                             .descriptorSets = 2});
+                             .descriptorSets = 4});
   d.nameObject(*pipeline_, "TAA linear HDR resolve");
 }
 TaaResolve::Frame TaaResolve::addPass(RenderGraph &g,
@@ -213,11 +215,12 @@ TaaResolve::Frame TaaResolve::addPass(RenderGraph &g,
         vk::AttachmentLoadOp::eDontCare, vk::AttachmentStoreOp::eStore, true}});
   return f;
 }
-void TaaResolve::draw(vk::CommandBuffer cmd, TaaPush p) const {
+void TaaResolve::draw(vk::CommandBuffer cmd, TaaPush p,
+                      bool alternative) const {
   p.options.x *= ready_ ? 1.f : 0.f;
   cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *pipeline_);
   cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *layout_, 0,
-                         {sets_[write_]}, {});
+                         {sets_[write_ + (alternative ? 2 : 0)]}, {});
   cmd.pushConstants<TaaPush>(*layout_, vk::ShaderStageFlagBits::eFragment, 0,
                              p);
   cmd.draw(3, 1, 0, 0);

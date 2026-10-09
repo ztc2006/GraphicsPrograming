@@ -241,10 +241,34 @@ void motionMrt() {
   limit.addPass("Too many targets",std::move(uses));
   rejects([&]{limit.compile();},"Graph exceeded guaranteed four color targets");
 }
+void rayTracingStorage() {
+  G g;auto description=image(1);description.usage|=vk::ImageUsageFlagBits::eStorage;
+  auto target=g.importImage(description);
+  auto trace=g.addPass("RT write",{{target,G::Usage::RayTracingWrite,vk::AttachmentLoadOp::eDontCare,vk::AttachmentStoreOp::eStore,true}});
+  g.addPass("RT display",{{target,G::Usage::SampledColor}});
+  auto plan=g.compile();auto const &read=plan.passes()[1];
+  require(read.dependencies==std::vector{trace} && read.barriers.size()==1,"RT storage write did not order sampled read");
+  auto const &barrier=read.barriers[0];
+  require(barrier.srcStageMask==vk::PipelineStageFlagBits2::eRayTracingShaderKHR && barrier.srcAccessMask==vk::AccessFlagBits2::eShaderStorageWrite &&
+      barrier.oldLayout==vk::ImageLayout::eGeneral && barrier.newLayout==vk::ImageLayout::eShaderReadOnlyOptimal,"RT image barrier scopes incorrect");
+  require(plan.finalState(target).defined,"RT full write did not define image");
+  G partial;auto p=partial.importImage(description);partial.addPass("bad",{{p,G::Usage::RayTracingWrite}});
+  rejects([&]{partial.compile();},"Partial undefined RT storage write accepted");
+}
+void rayReadWrite() {
+  G g;auto d=image(7);d.usage|=vk::ImageUsageFlagBits::eStorage;
+  d.initial={vk::ImageLayout::eShaderReadOnlyOptimal,vk::PipelineStageFlagBits2::eRayTracingShaderKHR|vk::PipelineStageFlagBits2::eFragmentShader,
+      vk::AccessFlagBits2::eShaderStorageWrite|vk::AccessFlagBits2::eShaderSampledRead,true};
+  auto id=g.importImage(d);g.addPass("mean",{{id,G::Usage::RayTracingReadWrite,vk::AttachmentLoadOp::eDontCare,vk::AttachmentStoreOp::eStore,true}});
+  auto plan=g.compile();auto const &barrier=plan.passes()[0].barriers[0];
+  require(bool(barrier.dstAccessMask&vk::AccessFlagBits2::eShaderStorageRead) && bool(barrier.srcAccessMask&vk::AccessFlagBits2::eShaderStorageWrite),"Running mean lost read/write dependency");
+  G invalid;d.initial={};auto unknown=invalid.importImage(d);invalid.addPass("bad",{{unknown,G::Usage::RayTracingReadWrite,vk::AttachmentLoadOp::eDontCare,vk::AttachmentStoreOp::eStore,true}});
+  rejects([&]{invalid.compile();},"Undefined storage image was accepted for read-modify-write");
+}
 } // namespace
 int main() {
   try {
-    sceneGraph(); dependencies(); contentContracts(); validation(); bufferContracts(); motionMrt();
+    sceneGraph(); dependencies(); contentContracts(); validation(); bufferContracts(); motionMrt(); rayTracingStorage(); rayReadWrite();
     std::cout << "PASS graph compiler: RAW/WAR/WAW, stable topology/cycle rejection, "
                  "depth scopes, UI same-layout LOAD, content validity, exports, pure compile\n";
     return 0;

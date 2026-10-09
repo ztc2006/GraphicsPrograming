@@ -52,6 +52,23 @@ ViewerOptions parseViewerOptions(std::span<std::string_view const> args) {
       o.lightCulling = value();
     else if (!positionalOnly && arg == "--lighting-preset")
       o.lightingPreset = value();
+    else if (!positionalOnly && (arg == "--camera-culling" || arg == "--shadow-culling")) {
+      auto mode=value();
+      if(mode!="on" && mode!="off")throw std::invalid_argument("Geometry culling: on or off");
+      (arg=="--camera-culling" ? o.cameraCulling : o.shadowCulling)=mode=="on";
+    } else if (!positionalOnly && arg == "--render-method")
+      o.renderMethod = value();
+    else if (!positionalOnly && arg == "--ao") {
+      auto mode = value();
+      if (mode != "on" && mode != "off")
+        throw std::invalid_argument("AO: on or off");
+      o.ao = mode == "on";
+    } else if (!positionalOnly && arg == "--ao-radius")
+      o.aoRadius = float(number(value()));
+    else if (!positionalOnly && arg == "--ao-strength")
+      o.aoStrength = float(number(value()));
+    else if (!positionalOnly && arg == "--ao-debug")
+      o.aoDebug = value();
     else if (!positionalOnly && arg == "--taa-history")
       o.taaHistory = value();
     else if (!positionalOnly && arg == "--gpu")
@@ -87,6 +104,13 @@ ViewerOptions parseViewerOptions(std::span<std::string_view const> args) {
       o.scene = std::filesystem::absolute(arg);
     }
   }
+  if (!std::isfinite(o.aoRadius) || o.aoRadius < .001f || o.aoRadius > 100.f ||
+      !std::isfinite(o.aoStrength) || o.aoStrength < 0 || o.aoStrength > 2)
+    throw std::invalid_argument("AO radius: .001..100; strength: 0..2");
+  if (o.aoDebug != "none" && o.aoDebug != "raw" && o.aoDebug != "filtered")
+    throw std::invalid_argument("AO debug: none, raw or filtered");
+  if (o.renderMethod != "raster" && o.renderMethod != "ray-tracing")
+    throw std::invalid_argument("Render method must be raster or ray-tracing");
   if (o.taaHistory != "bilinear" && o.taaHistory != "catmull-rom")
     throw std::invalid_argument("TAA history filter: bilinear or catmull-rom");
   if (o.warmupSeconds < 0 || o.durationSeconds <= 0)
@@ -120,6 +144,9 @@ ViewerOptions parseViewerOptions(std::span<std::string_view const> args) {
 std::string_view viewerUsage() {
   return "Usage: vulkan [options] [scene.gltf|scene.glb|scene.obj]\n"
          "  --taa-history bilinear|catmull-rom (default catmull-rom)\n"
+         "  --ao on|off --ao-radius R --ao-strength S (default on, .5, 1)\n"
+         "  --ao-debug none|raw|filtered\n"
+         "  --render-method raster|ray-tracing (default raster)\n"
          "  --no-taa           Disable temporal resolve and jitter\n"
          "  --benchmark DIR    Save frames.csv and summary.json; then exit\n"
          "  --warmup SECONDS   Default 30; excluded from measurement\n"
@@ -127,6 +154,7 @@ std::string_view viewerUsage() {
          "  --size WIDTHxHEIGHT (benchmark default: 1920x1080)\n"
          "  --camera-path static|orbit (default static)\n"
          "  --light-culling full|clustered (default clustered)\n"
+         "  --camera-culling on|off --shadow-culling on|off (default on)\n"
          "  --lighting-preset auto|asset|kitchen (auto: kitchen preview for "
          "known fixture)\n"
          "  --present auto|fifo|mailbox|immediate\n"

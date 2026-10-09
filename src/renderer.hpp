@@ -11,30 +11,36 @@
 
 #include "asset_ids.hpp"
 #include "asset_library.hpp"
-#include "device.hpp"
 #include "cluster_grid.hpp"
+#include "device.hpp"
+#include "gtao.hpp"
 #include "hdr_ibl.hpp"
 #include "hdr_output.hpp"
-#include "temporal_motion.hpp"
-#include "taa_resolve.hpp"
 #include "material_gpu_store.hpp"
 #include "measurement.hpp"
 #include "mesh.hpp"
 #include "render_graph.hpp"
+#include "ray_tracing.hpp"
 #include "scene.hpp"
 #include "scene_object.hpp"
 #include "swap_chain.hpp"
+#include "taa_resolve.hpp"
+#include "temporal_motion.hpp"
 #include "texture.hpp"
 
 class Renderer {
+  friend struct RendererTransportTestAccess;
+  friend struct RendererRtTestAccess;
+  friend struct RendererAoTestAccess;
   friend struct RendererMotionTestAccess;
   friend struct RendererHdrTestAccess;
   friend struct RendererFrameTestAccess;
   const unsigned framesInFlight_;
   struct MeshGpuResources {
     Device::BufferResources vertex, index;
-    std::uint32_t indexCount = 0;
+    std::uint32_t indexCount = 0, vertexCount = 0;
     bool unitVertexAlpha = true;
+    DielectricGeometry dielectric;
   };
 
 public:
@@ -42,11 +48,15 @@ public:
   // background task while frames render. Candidates must not outlive Renderer.
   class SceneAssets {
     friend class Renderer;
+    friend struct RendererTransportTestAccess;
+    friend struct RendererRtTestAccess;
     SceneAssets() = default;
     Renderer const *owner_ = nullptr;
     ResourceLedger::Scope resourceScope_;
     std::vector<MeshGpuResources> meshes_;
     std::unique_ptr<MaterialGpuStore> materials_;
+    std::unique_ptr<RayTracingGeometry> rtGeometry_;
+    std::size_t materialCount_ = 0, rtTextureCount_ = 0;
     // Destroy command/staging storage before destination resources on fallback.
     std::unique_ptr<UploadBatch> uploads_;
 
@@ -99,6 +109,7 @@ public:
     glm::mat4 modelMatrix{1.0f};
     Aabb worldBounds{};
     float sortDepthSq = 0.0f;
+    bool primaryVisible = true, shadowCaster = true;
   };
   struct SceneDrawList {
     std::span<DrawItem const> opaque, mask, transparent;
@@ -108,12 +119,30 @@ public:
   };
   struct DrawStatistics {
     std::uint32_t shadow = 0, main = 0, debug = 0;
+    std::uint32_t shadowCandidates = 0, shadowCulled = 0;
   };
   FrameResult renderFrame(SceneDrawList const &scene, glm::mat4 const &viewProj,
                           glm::vec3 const &camera,
                           LightingSettings const &lighting, bool shadows);
+  enum class RenderMethod { Raster, RayTracing };
+  void setRenderMethod(RenderMethod);
+  std::uint32_t rayTracingSamples() const { return rayTracing_ ? rayTracing_->accumulatedSamples() : 0; }
+  RenderMethod renderMethod() const { return renderMethod_; }
+  bool rayTracingAvailable() const {
+    return bool(rayTracing_) && (!sceneAssets_ || sceneAssets_->materialCount_ <= RayTracingRenderer::textureCapacity / 2 && sceneAssets_->rtTextureCount_ <= RayTracingRenderer::textureCapacity);
+  }
+  std::string const &rayTracingUnavailableReason() const {
+    static std::string const limit = "Scene exceeds RT-A capacity of 256 materials / 512 unique textures; raster remains available";
+    return rayTracing_ && sceneAssets_ && (sceneAssets_->materialCount_ > RayTracingRenderer::textureCapacity / 2 || sceneAssets_->rtTextureCount_ > RayTracingRenderer::textureCapacity)
+        ? limit : rtUnavailableReason_;
+  }
   void setTemporalJitterEnabled(bool enabled);
+  void setAoSettings(AoSettings const &);
+  AoSettings const &aoSettings() const { return aoSettings_; }
+  bool aoActive() const { return lastAoActive_; }
   void setTaaEnabled(bool);
+  void setShadowCasterCullingEnabled(bool);
+  bool shadowCasterCullingEnabled() const { return shadowCasterCullingEnabled_; }
   void setTaaHistoryFilter(TaaHistoryFilter);
   TaaHistoryFilter taaHistoryFilter() const {return taaHistoryFilter_;}
   bool taaEnabled() const {return taaEnabled_;}
@@ -126,6 +155,9 @@ public:
   // before capture/publication and never acquires or presents a swapchain image.
   void captureLocalProbe(SceneDrawList const &, LightingSettings const &);
   bool localProbeValid() const { return probeValid_; }
+  bool detailReflectionProbeValid() const {
+    return probeValid_ && detailProbeValid_;
+  }
   unsigned sunCascadesAssigned() const { return unsigned(lastIndoor_.sun.params.x); }
   SunCascadeGpu const &sunCascades() const { return lastIndoor_.sun; }
   unsigned spotShadowsAssigned() const { return lastIndoor_.counts.x; }
@@ -202,12 +234,15 @@ private:
     std::optional<TemporalSnapshot> temporal;
     Device::BufferResources indoorBuffer;
     IndoorLightingGpu indoor;
+    glm::vec3 cameraPosition{};
+    bool shadowReceiverCullingAllowed=false;
     std::size_t clusterCapacityBytes = 4;
     ClusterGrid clusterGrid;
     RenderGraph::BufferState clusterState;
     vk::DescriptorSet descriptorSet = nullptr;
-    vk::raii::QueryPool timestamps = nullptr,taaTimestamps=nullptr;
-    bool taaEnabled=false;
+    vk::raii::QueryPool timestamps = nullptr, taaTimestamps = nullptr,
+                        aoTimestamps = nullptr;
+    bool taaEnabled = false, aoEnabled = false, rayTracing = false;
     std::uint64_t frameId = 0;
     bool submitted = false;
     bool shadowEnabled = false, uiEnabled = false, clusterEnabled = false;
@@ -324,16 +359,23 @@ private:
 
   struct FrameGraph {
     RenderGraph::Plan plan;
-    RenderGraph::ImageId shadow{}, depth{}, hdr{}, motion{}, output{};
-    std::optional<RenderGraph::PassId> shadowPass, uiPass, clusterPass;
+    RenderGraph::ImageId shadow{}, depth{}, hdr{}, motion{}, diffuse{},
+        output{};
+    std::optional<RenderGraph::PassId> shadowPass, uiPass, clusterPass, rtBuildPass;
+    bool rayTracing = false;
     RenderGraph::BufferId clusterIndices{};
     RenderGraph::PassId mainPass{}, outputPass{};
     std::optional<TaaResolve::Frame> taa;
+    std::optional<Gtao::Frame> ao;
   };
   struct ImageStates {
     RenderGraph::State shadow, depth, hdr, motion;
     std::vector<RenderGraph::State> output;
   } imageStates_;
+  void prepareRayTracing(SceneDrawList const &);
+  std::vector<vk::DescriptorImageInfo> rtTextures(std::vector<glm::uvec4> *main=nullptr,
+      std::vector<glm::uvec4> *more=nullptr, std::vector<glm::uvec4> *maps=nullptr, MaterialGpuStore const *store=nullptr, std::size_t count=0) const;
+  FrameGraph buildRayTracingGraph(std::uint32_t imageIndex) const;
   FrameGraph buildFrameGraph(std::uint32_t imageIndex, bool shadows) const;
   FrameResult finishFrame(SceneDrawList const &scene);
   void recordGraph(SceneDrawList const &scene);
@@ -348,7 +390,8 @@ private:
   BakedEnvironment globalEnvironment_;
   EnvironmentSh probeSh_;
   bool probeValid_ = false;
-  LocalProbeSettings capturedProbe_;
+  LocalProbeSettings capturedProbe_, capturedDetailProbe_;
+  bool detailProbeValid_ = false;
   std::vector<std::byte> capturedLightingKey_, capturedGeometryKey_;
   bool probeGeometryDirty_ = false, probeMaterialsDirty_ = false;
   std::vector<std::byte> probeGeometryKey(SceneDrawList const &) const;
@@ -359,6 +402,7 @@ private:
   std::optional<FrameGraph> activeGraph_;
   std::string lastGraphDump_;
   DrawStatistics drawStatistics_;
+  bool shadowCasterCullingEnabled_ = true;
   bool requestedShadows_ = false, queuedSky_ = false;
   std::vector<DrawItem> queuedObjects_, queuedCasters_;
   struct DebugBox {
@@ -381,10 +425,22 @@ private:
                        vk::CullModeFlagBits cullMode) const;
 
 private:
+  RenderMethod renderMethod_ = RenderMethod::Raster;
+  std::unique_ptr<RayTracingRenderer> rayTracing_;
+  std::string rtUnavailableReason_ = "RT resources not initialized";
+  RtPush rtPush_{.options={3,2,0,0}};
+  LightingSettings rtLighting_;
+  bool rtShadows_ = false;
+  unsigned rtMaxBounces_ = 8, rtSpp_ = 1;
+  bool rtAccumulate_ = true;
   TaaHistoryFilter taaHistoryFilter_=TaaHistoryFilter::CatmullRom;
   bool taaEnabled_=false,lastTaaActive_=false;
   std::unique_ptr<TaaResolve> taa_;
   TaaPush taaPush_;
+  AoSettings aoSettings_;
+  bool lastAoActive_ = false;
+  std::unique_ptr<Gtao> gtao_;
+  GtaoPush aoPush_;
   TemporalMotionHistory temporalHistory_;
   TemporalCamera lastTemporalCamera_;
   bool temporalJitterEnabled_ = false;

@@ -134,7 +134,9 @@ public:
       auto const &stats = app.renderer_->resourceStatistics();
       require(stats.sceneUploadFenceWaits == 0,
               "Runtime load waited an upload fence");
-      require(stats.environmentUploads == 1 && stats.pipelineBuilds == 13 + (app.renderer_->clusterSupported() ? 1 : 0),
+      require(stats.environmentUploads == 1 &&
+                  stats.pipelineBuilds ==
+                      16 + (app.renderer_->clusterSupported() ? 1 : 0),
               "Runtime load rebuilt persistent renderer resources");
       std::cout << "PASS cancellation before and after upload submission, zero "
                    "upload waits\n";
@@ -237,7 +239,7 @@ public:
               afterRestore.sceneCommits == beforeRestore.sceneCommits &&
               afterRestore.environmentUploads ==
                   beforeRestore.environmentUploads &&
-              afterRestore.pipelineBuilds == beforeRestore.pipelineBuilds + 13,
+              afterRestore.pipelineBuilds == beforeRestore.pipelineBuilds + 16,
           "Restore rebuilt scene/shared assets or lost graph output pipelines");
       std::cout << (iconified ? "PASS native minimize/restore"
                               : "SKIP native iconify: window manager did not "

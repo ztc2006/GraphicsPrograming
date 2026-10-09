@@ -90,6 +90,8 @@ struct GpuAllocator::State {
         static_cast<VkPhysicalDevice>(device.physicalDeviceHandle());
     info.device = static_cast<VkDevice>(device.deviceHandle());
     info.vulkanApiVersion = VK_API_VERSION_1_3;
+    if (device.rayTracingSupported())
+      info.flags |= VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
     info.pDeviceMemoryCallbacks = &callbacks;
     // A conservative initial block size; allocation policy tuning needs
     // measurement.

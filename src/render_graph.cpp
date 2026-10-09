@@ -34,6 +34,10 @@ G::State desired(G::Usage usage) {
     return {vk::ImageLayout::eDepthReadOnlyOptimal, S::eFragmentShader, A::eShaderSampledRead};
   case G::Usage::TransferSource:
     return {vk::ImageLayout::eTransferSrcOptimal, S::eCopy, A::eTransferRead};
+  case G::Usage::RayTracingReadWrite:
+    return {vk::ImageLayout::eGeneral, S::eRayTracingShaderKHR, A::eShaderStorageRead | A::eShaderStorageWrite};
+  case G::Usage::RayTracingWrite:
+    return {vk::ImageLayout::eGeneral, S::eRayTracingShaderKHR, A::eShaderStorageWrite};
   case G::Usage::Present:
     return {vk::ImageLayout::ePresentSrcKHR, {}, {}};
   }
@@ -54,6 +58,8 @@ void validate(G::Image const &image, G::Usage usage) {
     aspect = image.aspect == vk::ImageAspectFlagBits::eDepth
                  ? vk::ImageAspectFlagBits::eDepth : vk::ImageAspectFlagBits::eColor;
     break;
+  case G::Usage::RayTracingReadWrite:
+  case G::Usage::RayTracingWrite: required = vk::ImageUsageFlagBits::eStorage; break;
   case G::Usage::Present:
     required = vk::ImageUsageFlagBits::eColorAttachment;
     if (!image.presentable) throw std::runtime_error("Graph image is not presentable: " + image.name);
@@ -94,10 +100,12 @@ void applyUse(G::Image const &image, G::State &state, G::Use const &use,
       throw std::runtime_error("Unsupported graph store operation: " + image.name);
     if (use.load == vk::AttachmentLoadOp::eLoad && !state.defined)
       throw std::runtime_error("Graph LOAD of undefined contents: " + image.name);
-  } else if (!state.defined) {
+  } else if (use.usage != G::Usage::RayTracingWrite && !state.defined) {
     throw std::runtime_error("Graph read of undefined contents: " + image.name);
   }
   transition(image, state, use.usage, barriers);
+  if ((use.usage == G::Usage::RayTracingWrite || use.usage == G::Usage::RayTracingReadWrite))
+    state.defined = use.fullOverwrite;
   if (attachment(use.usage))
     state.defined = use.store == vk::AttachmentStoreOp::eStore &&
                     (use.load == vk::AttachmentLoadOp::eClear ||
@@ -224,12 +232,15 @@ RenderGraph::Plan RenderGraph::compile() const {
         if (use.usage == Usage::ColorAttachment) ++colors; else ++depths;
         if (extent && *extent != image.extent) throw std::runtime_error("Graph attachment extents differ");
         extent = image.extent;
+      } else if ((use.usage == Usage::RayTracingWrite || use.usage == Usage::RayTracingReadWrite)) {
+        if (!use.fullOverwrite || use.load != vk::AttachmentLoadOp::eDontCare || use.store != vk::AttachmentStoreOp::eStore)
+          throw std::runtime_error("RT image write must fully overwrite contents");
       } else if (use.load != vk::AttachmentLoadOp::eDontCare ||
                  use.store != vk::AttachmentStoreOp::eStore || use.fullOverwrite) {
         throw std::runtime_error("Load/store contract on non-attachment use");
       }
       if (writer[index]) edges[writer[index]->value][pass.id.value] = true;
-      if (attachment(use.usage)) {
+      if (attachment(use.usage) || (use.usage == Usage::RayTracingWrite || use.usage == Usage::RayTracingReadWrite)) {
         for (auto reader : readers[index]) edges[reader.value][pass.id.value] = true;
         readers[index].clear();
         writer[index] = pass.id;
@@ -344,7 +355,7 @@ void RenderGraph::Plan::record(vk::CommandBuffer command,
     callback(pass, Event::Draw);
     if (!colors.empty() || hasDepth) command.endRendering();
     for (auto const &use : pass.uses)
-      if (attachment(use.usage))
+      if (attachment(use.usage) || (use.usage == Usage::RayTracingWrite || use.usage == Usage::RayTracingReadWrite))
         recorded_[use.image.value].defined = use.store == vk::AttachmentStoreOp::eStore &&
             (use.load == vk::AttachmentLoadOp::eClear || use.load == vk::AttachmentLoadOp::eLoad || use.fullOverwrite);
     callback(pass, Event::End);

@@ -28,6 +28,8 @@ public:
   void copyImage(std::span<std::byte const> data, vk::Image destination,
                  std::span<TextureMipLevel const> levels,
                  std::size_t texelBytes, std::uint32_t arrayLayers = 1);
+  // Scene AS builds share this batch and its staging/fence lifetime.
+  vk::CommandBuffer recordingCommand() const;
   void submit();
   bool ready();
   bool submitted() const { return submitted_; }

@@ -1,0 +1,244 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "primary_common.glsl"
+#include "dielectric_shared.glsl"
+layout(set=0,binding=0) uniform accelerationStructureEXT scene;
+layout(set=0,binding=1,rgba32f) uniform image2D target;
+layout(set=0,binding=4) uniform samplerCubeArray environmentMap;
+struct Punctual {vec4 positionRange;vec4 directionType;vec4 colorIntensity;vec4 cones;};
+layout(set=0,binding=6,std430) readonly buffer Punctuals {Punctual lights[];};
+struct Area {vec4 p0Area;vec4 p1Probability;vec4 p2Cdf;vec4 normal;uvec4 ids;};
+layout(set=0,binding=7,std430) readonly buffer Areas {Area areas[];};
+layout(location=0) rayPayloadEXT Surface result;
+layout(location=1) rayPayloadEXT uint visible;
+vec3 environmentRadiance(vec3 direction){
+  float c=cos(lighting.environment.y),s=sin(lighting.environment.y);
+  direction.xz=mat2(c,-s,s,c)*direction.xz;
+  return textureLod(environmentMap,vec4(direction,0),0).rgb*lighting.environment.x;
+}
+vec3 offsetOrigin(Surface s,vec3 direction){
+  float scale=max(1.0,max(max(abs(s.position.x),abs(s.position.y)),abs(s.position.z)));
+  return s.position+s.geometricNormal*(dot(s.geometricNormal,direction)>=0?1:-1)*(scale*2e-6+1e-6);
+}
+uint shadowMedium=0xffffffffu;
+vec3 shadowSigma=vec3(0);
+bool isDielectric(Surface s){return (uint(s.optical.w)&1u)!=0;}
+vec3 visibilityRay(Surface source,vec3 origin,vec3 direction,float distance){
+  vec3 throughput=vec3(1),physical=source.position;
+  uint medium=shadowMedium;vec3 sigma=shadowSigma;
+  for(uint step=0;step<32;++step){
+    result.found=0;
+    traceRayEXT(scene,gl_RayFlagsNoneEXT,4,0,0,0,origin,0,direction,distance,0);
+    if(result.found==0){if(medium!=0xffffffffu)throughput*=dielectricAttenuation(sigma,distance);return throughput;}
+    Surface hit=result;
+    if(!isDielectric(hit))return vec3(0);
+    bool solid=hit.optical.z>.5,enter=hit.unused!=0;
+    if(medium==0xffffffffu && solid && !enter){medium=hit.ids.x;sigma=hit.absorptionThickness.rgb;}
+    if(medium!=0xffffffffu)throughput*=dielectricAttenuation(sigma,length(hit.position-physical));
+    // Straight-line colored visibility is an explicit no-caustics approximation.
+    float f=solid?dielectricFresnel(abs(dot(direction,hit.geometricNormal)),1,hit.optical.x):thinDielectricReflection(abs(dot(direction,hit.geometricNormal)),hit.optical.x);
+    throughput*=(1-f)*hit.optical.y;
+    if(enter || !solid)throughput*=hit.albedo;
+    if(solid){
+      if(enter){if(medium!=0xffffffffu && medium!=hit.ids.x)return vec3(0);medium=hit.ids.x;sigma=hit.absorptionThickness.rgb;}
+      else if(medium==hit.ids.x){medium=0xffffffffu;sigma=vec3(0);}
+    } else throughput*=dielectricAttenuation(hit.absorptionThickness.rgb,hit.absorptionThickness.w/max(abs(dot(direction,hit.geometricNormal)),1e-4));
+    vec3 next=offsetOrigin(hit,direction);distance-=length(next-origin);if(distance<=0)return throughput;
+    physical=hit.position;origin=next;
+  }
+  return vec3(0);
+}
+vec3 visibility(Surface s,vec3 direction,float distance){return visibilityRay(s,offsetOrigin(s,direction),direction,max(distance-1e-5,0));}
+vec3 visibilityTo(Surface s,vec3 point){
+  vec3 initial=point-s.position;float length0=length(initial);if(length0<=1e-8)return vec3(0);
+  vec3 origin=offsetOrigin(s,initial/length0),delta=point-origin;float distance=length(delta);
+  if(distance<=1e-8)return vec3(0);
+  return visibilityRay(s,origin,delta/distance,max(distance-1e-5,0));
+}
+float powerWeight(float a,float b){float k=max(a,b);if(k<=0)return 0; a/=k;b/=k;return a*a/(a*a+b*b);}
+float ggxDensity(float nh,float roughness){
+  float a=roughness*roughness,a2=a*a;
+  float d=(1-nh*nh)+nh*nh*a2;
+  return a2/max(PI*d*d,1e-20);
+}
+float specularProbability(Surface s){
+  vec3 f0=mix(s.dielectricF0*s.specularWeight,s.albedo,s.metallic);
+  float spec=max(max(f0.x,f0.y),f0.z),diff=max(max(s.albedo.x,s.albedo.y),s.albedo.z)*(1-s.metallic);
+  if(spec<=0)return 0;if(diff<=0)return 1;
+  return clamp(spec/(spec+diff),.05,.95);
+}
+void brdf(Surface s,vec3 V,vec3 L,bool legacy,out vec3 diffuse,out vec3 specular){
+  diffuse=specular=vec3(0);
+  float nl=max(dot(s.normal,L),0),nv=max(dot(s.normal,V),0);
+  if(nl<=0 || nv<=0 || dot(s.geometricNormal,L)<=0)return;
+  if(isDielectric(s)) {
+    float f=s.optical.z>.5?dielectricFresnel(nv,1,s.optical.x):thinDielectricReflection(nv,s.optical.x);
+    diffuse=nl*(1-f)*(1-s.optical.y)*s.albedo/PI;return;
+  }
+  vec3 H=safeUnit(L+V,s.normal);
+  float vh=max(dot(V,H),0);
+  vec3 F=fresnelSchlick(vh,mix(s.dielectricF0*s.specularWeight,s.albedo,s.metallic),s.F90);
+  vec3 dF=fresnelSchlick(vh,s.dielectricF0*s.specularWeight,s.specularWeight);
+  diffuse=nl*(1-max(max(dF.x,dF.y),dF.z))*(1-s.metallic)*s.albedo/PI;
+  float D=legacy?distributionGGX(s.normal,H,s.roughness):ggxDensity(max(dot(s.normal,H),0),s.roughness);
+  specular=nl*D*geometrySmith(s.normal,V,L,s.roughness)*F/max(4*nv*nl,.0001);
+}
+float bsdfPdf(Surface s,vec3 V,vec3 L){
+  float nl=max(dot(s.normal,L),0);if(nl<=0)return 0;
+  if(isDielectric(s)) {float f=s.optical.z>.5?dielectricFresnel(max(dot(s.normal,V),0),1,s.optical.x):thinDielectricReflection(max(dot(s.normal,V),0),s.optical.x);
+    return (1-f)*(1-s.optical.y)*nl/PI;}
+  vec3 H=safeUnit(L+V,s.normal);float nh=max(dot(s.normal,H),0),vh=max(dot(V,H),0);
+  float p=specularProbability(s);
+  return (1-p)*nl/PI+p*ggxDensity(nh,s.roughness)*nh/max(4*vh,1e-20);
+}
+vec3 toWorld(vec3 n,vec3 v){vec3 t=safeUnit(cross(abs(n.y)<.99?vec3(0,1,0):vec3(1,0,0),n),vec3(1,0,0));return t*v.x+cross(n,t)*v.y+n*v.z;}
+vec3 sampleBsdf(Surface s,vec3 V,inout uint rng){
+  float p=specularProbability(s),choice=random(rng),u=random(rng),v=random(rng);
+  float phi=2*PI*u;
+  if(choice<p){float a=s.roughness*s.roughness;float cosTheta=sqrt((1-v)/(1+(a*a-1)*v));
+    vec3 h=toWorld(s.normal,vec3(sqrt(max(0,1-cosTheta*cosTheta))*vec2(cos(phi),sin(phi)),cosTheta));
+    return reflect(-V,h);
+  }
+  return toWorld(s.normal,vec3(sqrt(v)*vec2(cos(phi),sin(phi)),sqrt(1-v)));
+}
+vec3 deltaLights(Surface s,vec3 V){
+  vec3 total=vec3(0),d,f;
+  if(lighting.sunColor.w>0 && lighting.sunDirection.w>0){
+    vec3 L=lighting.sunDirection.xyz;brdf(s,V,L,true,d,f);
+    vec3 shadow=lighting.environment.z!=0 ? visibility(s,L,1e6) : vec3(1);
+    total+=(d*lighting.strengths.x+f*lighting.strengths.y)*lighting.sunColor.rgb*lighting.sunDirection.w*shadow;
+  }
+  for(uint i=0;i<lighting.counts.x;++i){Punctual light=lights[i];int type=int(light.directionType.w);
+    vec3 L=-light.directionType.xyz;float attenuation=1,dist=1e6;
+    if(type!=0){vec3 delta=light.positionRange.xyz-s.position;float d2=dot(delta,delta);if(d2<1e-8)continue;
+      dist=sqrt(d2);L=delta/dist;
+      float fade=light.positionRange.w>0?clamp(1-pow(dist/light.positionRange.w,4),0,1):1;
+      attenuation=fade/max(d2,1e-8);
+      if(type==2){float cosine=dot(light.directionType.xyz,-L);
+        float ramp=light.cones.x<=light.cones.y ? (cosine>=light.cones.x?1:0) : clamp((cosine-light.cones.y)/(light.cones.x-light.cones.y),0,1);
+        attenuation*=ramp*ramp;
+      }
+    }
+    if(attenuation<=0)continue;brdf(s,V,L,true,d,f);
+    vec3 shadow=lighting.environment.z!=0 && light.cones.w!=0 ? (type==0 ? visibility(s,L,dist) : visibilityTo(s,light.positionRange.xyz)) : vec3(1);
+    total+=(d*lighting.strengths.x+f*lighting.strengths.y)*light.colorIntensity.rgb*light.colorIntensity.w*attenuation*shadow;
+  }
+  return total;
+}
+float areaPdf(Area a,vec3 origin,vec3 target){
+  vec3 delta=target-origin;float d2=dot(delta,delta);if(d2<1e-16 || a.p0Area.w<=0)return 0;
+  float cosine=dot(a.normal.xyz,-delta*inversesqrt(d2));if(a.ids.z!=0)cosine=abs(cosine);
+  return cosine>0 ? a.p1Probability.w*d2/(a.p0Area.w*cosine) : 0;
+}
+vec3 sampledLights(Surface s,vec3 V,inout uint rng,bool last){
+  vec3 total=vec3(0),d,f;
+  if(lighting.counts.y>0){float select=random(rng);uint lo=0,hi=lighting.counts.y;
+    while(lo+1<hi){uint mid=(lo+hi)/2;if(areas[mid-1].p2Cdf.w<select)lo=mid;else hi=mid;}
+    uint index=lo;Area a=areas[index];
+    float u=sqrt(random(rng)),v=random(rng);vec3 bary=vec3(1-u,u*(1-v),u*v);
+    vec3 point=a.p0Area.xyz*bary.x+a.p1Probability.xyz*bary.y+a.p2Cdf.xyz*bary.z;
+    vec3 delta=point-s.position;float dist=length(delta);
+    if(dist>1e-8){vec3 L=delta/dist;float pdf=areaPdf(a,s.position,point);
+      brdf(s,V,L,false,d,f);
+      if(pdf>0 && any(greaterThan(d+f,vec3(0)))){
+        float mis=last?1:powerWeight(pdf,bsdfPdf(s,V,L));
+        total+=(d*lighting.strengths.x+f*lighting.strengths.y)*emitterColor(a.ids.x,a.ids.y,bary)*visibilityTo(s,point)*mis/pdf;
+      }
+    }
+  }
+  if(lighting.environment.x>0){float u=random(rng),v=random(rng);float z=1-2*u,phi=2*PI*v;
+    vec3 L=vec3(sqrt(max(0,1-z*z))*vec2(cos(phi),sin(phi)),z);
+    brdf(s,V,L,false,d,f);
+    if(any(greaterThan(d+f,vec3(0)))){float pdf=1/(4*PI),mis=last?1:powerWeight(pdf,bsdfPdf(s,V,L));
+      total+=(d*lighting.strengths.z+f*lighting.strengths.w)*environmentRadiance(L)*visibility(s,L,1e6)*mis/pdf;
+    }
+  }
+  return total;
+}
+vec3 path(vec3 origin,vec3 direction,float farDistance,inout uint rng){
+  vec3 radiance=vec3(0),beta=vec3(1),previousDiffuse=vec3(0),previousSpecular=vec3(0),previousOrigin=origin;
+  float previousPdf=0,etaRR=1;bool previousDelta=false;
+  uint medium=0xffffffffu;vec3 sigma=vec3(0),physicalOrigin=origin;
+  for(uint bounce=0;bounce<lighting.counts.w;++bounce){
+    result.found=0;
+    traceRayEXT(scene,gl_RayFlagsNoneEXT,bounce==0?1:2,0,0,0,origin,0,direction,bounce==0?farDistance:1e6,0);
+    if(result.found==0){float mis=bounce==0 || previousDelta?1:powerWeight(previousPdf,1/(4*PI));
+      radiance+=(bounce==0?beta:previousDiffuse*lighting.strengths.z+previousSpecular*lighting.strengths.w)*environmentRadiance(direction)*mis;break;
+    }
+    Surface s=result;vec3 V=-direction;
+    bool glass=isDielectric(s),solid=glass && s.optical.z>.5,enter=s.unused!=0;
+    if(medium==0xffffffffu && solid && !enter){medium=s.ids.x;sigma=s.absorptionThickness.rgb;}
+    if(medium!=0xffffffffu){vec3 beer=dielectricAttenuation(sigma,length(s.position-physicalOrigin));
+      beta*=beer;previousDiffuse*=beer;previousSpecular*=beer;}
+    shadowMedium=medium;shadowSigma=sigma;
+    float emitterMis=1;
+    InstanceData obj=objects[s.ids.x];
+    if(bounce>0 && !previousDelta && obj.maps.z!=0xffffffffu && s.ids.y<obj.maps.w){
+      emitterMis=powerWeight(previousPdf,areaPdf(areas[obj.maps.z+s.ids.y],previousOrigin,s.position));
+    }
+    radiance+=(bounce==0?beta:previousDiffuse*lighting.strengths.x+previousSpecular*lighting.strengths.y)*s.emission*emitterMis;
+    if(s.proxy!=0)break;
+    bool last=bounce+1>=lighting.counts.w;
+    if(glass) {
+      radiance+=beta*(deltaLights(s,V)+sampledLights(s,V,rng,last));
+      if(last)break;
+      if(solid && medium!=0xffffffffu && medium!=s.ids.x)break; // Nested media outside this profile.
+      float etaI=solid && !enter?s.optical.x:1,etaT=solid && !enter?1:s.optical.x;
+      float cosine=max(dot(s.geometricNormal,V),0);
+      float f=solid?dielectricFresnel(cosine,etaI,etaT):thinDielectricReflection(cosine,s.optical.x);
+      vec3 next;
+      previousDelta=true;previousDiffuse=vec3(0);previousPdf=0;
+      if(random(rng)<f){next=reflect(direction,s.geometricNormal);previousSpecular=beta;}
+      else if(random(rng)<s.optical.y){
+        next=solid?refract(direction,s.geometricNormal,etaI/etaT):direction;
+        if(dot(next,next)<1e-12)break;
+        if(enter || !solid)beta*=s.albedo;
+        if(solid){float ratio=etaI/etaT;beta*=ratio*ratio;etaRR/=ratio*ratio;
+          if(enter){medium=s.ids.x;sigma=s.absorptionThickness.rgb;}else{medium=0xffffffffu;sigma=vec3(0);}}
+        else beta*=dielectricAttenuation(s.absorptionThickness.rgb,s.absorptionThickness.w/max(cosine,1e-4));
+        previousSpecular=beta;
+      } else {
+        float u=random(rng),v=random(rng);next=toWorld(s.normal,vec3(sqrt(v)*vec2(cos(2*PI*u),sin(2*PI*u)),sqrt(1-v)));
+        beta*=s.albedo;previousDiffuse=beta;previousSpecular=vec3(0);previousDelta=false;
+        previousPdf=(1-f)*(1-s.optical.y)*max(dot(s.normal,next),0)/PI;
+      }
+      if(bounce>=2){float survive=clamp(max(max(beta.r,beta.g),beta.b)*etaRR,.05,.95);if(random(rng)>=survive)break;
+        beta/=survive;previousDiffuse/=survive;previousSpecular/=survive;}
+      previousOrigin=s.position;physicalOrigin=s.position;origin=offsetOrigin(s,next);direction=next;continue;
+    }
+    radiance+=beta*(deltaLights(s,V)+sampledLights(s,V,rng,last));
+    if(last)break;
+    vec3 next=sampleBsdf(s,V,rng);float pdf=bsdfPdf(s,V,next);vec3 d,f;brdf(s,V,next,false,d,f);
+    if(pdf<=0 || !any(greaterThan(d+f,vec3(0))))break;
+    previousDiffuse=beta*d/pdf;previousSpecular=beta*f/pdf;beta=previousDiffuse+previousSpecular;
+    if(bounce>=2){float survive=clamp(max(max(beta.r,beta.g),beta.b)*etaRR,.05,.95);
+      if(random(rng)>=survive)break;
+      beta/=survive;previousDiffuse/=survive;previousSpecular/=survive;
+    }
+    previousDelta=false;previousPdf=pdf;previousOrigin=s.position;physicalOrigin=s.position;
+    origin=offsetOrigin(s,next);direction=next;
+  }
+  return radiance;
+}
+void main(){
+  uint rng=hash(gl_LaunchIDEXT.x+gl_LaunchIDEXT.y*gl_LaunchSizeEXT.x+hash(lighting.sampling.y));
+  uint spp=frame.options.x==3?lighting.sampling.x:1;
+  vec3 sum=vec3(0);
+  for(uint pathSample=0;pathSample<spp;++pathSample){
+    vec2 pixel=frame.options.x==3 && (lighting.sampling.w&1u)==0 ? vec2(random(rng),random(rng)) : vec2(.5);
+    vec2 uv=(vec2(gl_LaunchIDEXT.xy)+pixel)/vec2(gl_LaunchSizeEXT.xy);
+    vec4 nearPoint=frame.inverseViewProjection*vec4(uv*2-1,0,1),farPoint=frame.inverseViewProjection*vec4(uv*2-1,1,1);
+    vec3 origin=nearPoint.xyz/nearPoint.w,delta=farPoint.xyz/farPoint.w-origin;
+    if(frame.options.x==3)sum+=path(origin,safeUnit(delta,vec3(0,0,-1)),length(delta),rng);
+    else {
+      result.found=0;
+      traceRayEXT(scene,gl_RayFlagsNoneEXT,1,0,0,0,origin,0,safeUnit(delta,vec3(0,0,-1)),length(delta),0);
+      sum+=result.found==0?vec3(.05,.07,.1):frame.options.x==1?result.normal*.5+.5:frame.options.x==2?vec3(result.distance):result.albedo;
+    }
+  }
+  vec3 color=sum/float(spp);
+  if(frame.options.x==3 && lighting.counts.z>0){vec3 previous=imageLoad(target,ivec2(gl_LaunchIDEXT.xy)).rgb;
+    color=previous+(color-previous)*float(spp)/float(lighting.counts.z+spp);
+  }
+  imageStore(target,ivec2(gl_LaunchIDEXT.xy),vec4(color,1));
+}

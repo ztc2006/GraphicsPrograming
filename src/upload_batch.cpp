@@ -54,13 +54,18 @@ void UploadBatch::copyBuffer(std::span<std::byte const> data,
   if (!read)
     throw std::runtime_error(
         "Upload batch only supports vertex/index buffers.");
+  vk::PipelineStageFlags2 stages = vk::PipelineStageFlagBits2::eVertexInput;
+  if (usage & vk::BufferUsageFlagBits::eAccelerationStructureBuildInputReadOnlyKHR) {
+    stages |= vk::PipelineStageFlagBits2::eAccelerationStructureBuildKHR | vk::PipelineStageFlagBits2::eRayTracingShaderKHR;
+    read |= vk::AccessFlagBits2::eShaderRead;
+  }
   auto &command = commands_.front();
   command.copyBuffer(stage(data), destination,
                      {vk::BufferCopy{.size = data.size_bytes()}});
   vk::BufferMemoryBarrier2 barrier{
       .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
       .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
-      .dstStageMask = vk::PipelineStageFlagBits2::eVertexInput,
+      .dstStageMask = stages,
       .dstAccessMask = read,
       .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
       .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
@@ -77,7 +82,8 @@ void UploadBatch::copyImage(std::span<std::byte const> data,
                             std::span<TextureMipLevel const> levels,
                             std::size_t texelBytes, std::uint32_t arrayLayers) {
   if (levels.empty() || (texelBytes != 4 && texelBytes != 16) ||
-      (arrayLayers != 1 && arrayLayers != 6 && arrayLayers != 12) ||
+      (arrayLayers != 1 && arrayLayers != 6 && arrayLayers != 12 &&
+       arrayLayers != 18) ||
       (arrayLayers >= 6 && levels[0].width != levels[0].height))
     throw std::runtime_error("Image upload requires RGBA8 or RGBA32F levels.");
   auto expected = textureMipLayout(levels[0].width, levels[0].height,
@@ -118,6 +124,8 @@ void UploadBatch::copyImage(std::span<std::byte const> data,
   barrier.srcStageMask = vk::PipelineStageFlagBits2::eTransfer;
   barrier.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
   barrier.dstStageMask = vk::PipelineStageFlagBits2::eFragmentShader;
+  if (device_.rayTracingSupported())
+    barrier.dstStageMask |= vk::PipelineStageFlagBits2::eRayTracingShaderKHR;
   barrier.dstAccessMask = vk::AccessFlagBits2::eShaderSampledRead;
   barrier.oldLayout = vk::ImageLayout::eTransferDstOptimal;
   barrier.newLayout = vk::ImageLayout::eShaderReadOnlyOptimal;
@@ -126,6 +134,10 @@ void UploadBatch::copyImage(std::span<std::byte const> data,
   ++statistics_.imageCopies;
 }
 
+vk::CommandBuffer UploadBatch::recordingCommand() const {
+  if (submitted_ || finished_) throw std::runtime_error("Upload batch is not recording");
+  return *commands_.front();
+}
 void UploadBatch::submit() {
   if (finished_ || submitted_)
     return;

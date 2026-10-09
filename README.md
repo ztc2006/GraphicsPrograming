@@ -4,8 +4,9 @@ The confirmed development route targets Linux, native 1080p / 60 FPS and
 high-quality static glTF/GLB scenes. See the [roadmap](Engine_Roadmap.md),
 [design review](Renderer_Design_Review.md) and [execution checklist](Renderer_Refactor_Checklist.md).
 M0 measurement tools and material fixtures are implemented. Software-device
-smoke tests and RenderDoc capture pass. Hardware acceptance is deferred until the
-user reconnects the RTX 4060 Ti host and requests testing. Development continues:
+smoke tests and RenderDoc capture pass. The RTX 4060 Ti host was restored on
+2026-10-07 and native hardware tests now run; final long-run performance and
+motion-quality acceptance remain open. Development continues:
 M1 keeps the Renderer persistent, prepares loads in the background, retires old
 scene/preview resources after frame completion, shares images/samplers and batches each
 scene upload into one submission. Hardware
@@ -521,3 +522,109 @@ to .00148403. RTX quality fixtures and software resolve pass. Full native X11
 regression has 30/32 passes: legacy/EXT generic presentation tests timed out twice;
 they remain open, along with final broad motion-quality/performance acceptance.
 See [implementation](docs/M6_C_TAA_Implementation.md).
+
+## Geometry visibility and stable profiling
+
+Camera-frustum and shadow-caster culling are now enabled by default, with independent
+`--camera-culling on|off` and `--shadow-culling on|off` comparisons. Complete objects
+remain available for shadows, probes and motion history. Unused sun cascades are
+skipped conservatively, including blend intervals; shadow debug/probe capture stay complete.
+
+Keep the viewer visible during timing runs. On this Niri/XWayland/NVIDIA session,
+hidden windows can spend about one second in swapchain acquire and change GPU clocks.
+Reports retain these frames and expose `cpu_acquire_ms`/`slow_acquire_frame_count`;
+such runs must not be compared as fixed shader costs. The native visible-window suite
+passes 34/34; long-duration quality/performance acceptance remains separate.
+See [implementation and measured results](docs/Visibility_Performance_Implementation.md).
+
+## After AO: hierarchical visibility and distance fields
+
+M8 adds object BVH/Hi-Z and measured indirect/LOD work after GTAO. M9 adds mesh
+SDF generation/cache/debug and a bounded distance-field shadow prototype.
+Existing probe/SSR expansion moves from M8 to M10. Current AABB tests are flat
+scans; BVH nodes may still use AABB bounds. This documentation does not implement
+these capabilities. See [scope, budgets and validation](docs/Post_AO_Renderer_Plan.md).
+
+
+## M7-A GTAO (2026-10-08)
+
+Native-resolution GTAO, depth-based geometric normals, a 5x5 spatial filter and
+linear HDR composition are implemented. AO modulates the separate indirect
+diffuse output; direct lighting, emissive and specular remain outside its
+composition. The viewer enables GTAO by default. Render Debug exposes its switch,
+world radius, strength, raw/filtered views and three independent GPU timings.
+CLI controls: `--ao on|off --ao-radius .5 --ao-strength 1 --ao-debug none|raw|filtered`.
+Changes reset TAA colour history; unchanged settings retain it. AO precedes TAA.
+The shader uses 3 slices / 6 steps per side, finite world radius and a 128-pixel
+sample cap. Transparency contributes no occluder depth; off-screen geometry is
+absent. Four new targets add 20 bytes/pixel (41,472,000 payload bytes at 1080p),
+including a diffuse MRT that remains allocated/written when AO passes are off.
+36/36 native CTests pass (19 CPU / 17 GPU), including blocked two-slot AO pushes,
+query delivery, target recreation, prior probe and scene retirement contracts.
+Kitchen off/on, zero strength, debug and probe isolation pairs plus 48 fixed
+slow/fast camera frames pass. Those checks are bounded evidence, not final
+quality or 60FPS certification. See [decision](docs/M7_A_GTAO_Decision.md) and
+[implementation](docs/M7_A_GTAO_Implementation.md). M7-A2 now supplies bounded reference-quality checks; the next implementation is
+M8-A object BVH, with broader motion-quality checks retained separately.
+
+
+M7-A2 corrects open-plane energy (maximum error 7.13% to .049%) and one-pixel
+foreground contamination (filtered visibility .809 to 1). It adds deterministic
+ray references, tilt/scale/edge tests and a 16-frame jitter/translation gate.
+Untrusted depth normals conservatively keep visibility white; off-screen
+occluders and thin/edge information remain incomplete. All 36 native tests pass;
+1080p Kitchen AO short-test median is 1.207 ms. No new GPU targets or samples.
+See [M7-A2 decision](docs/M7_A2_AO_Quality_Decision.md) and
+[implementation](docs/M7_A2_AO_Quality_Implementation.md). Continue M8-A object BVH.
+
+
+## Kitchen preview repairs (2026-10-09)
+
+The normal viewer load path now hides explicitly tagged imported area-light
+cards from primary visibility and shadows while retaining their probe emission.
+The kitchen window opens to the environment without changing normals/culling.
+A small specular probe captured inside the microwave prevents the room Floor
+from leaking into its interior; external surfaces keep the room probe. Refresh
+both through Lighting after editing geometry/lights/probe regions. The original
+asset files are preserved; viewer preparation removes 219 zero-area and six
+equivalent duplicate triangles with stable IDs/vertex data. Ordinary emissive,
+textured/single-sided/transparent overlaps are retained. This remains an on-demand
+static reflection approximation; glass is still core alpha, not refraction.
+39/39 native tests pass including kitchen one/two-slot controls. See
+[repair decision](docs/Kitchen_Repair_Decision.md) and
+[implementation](docs/Kitchen_Repair_Implementation.md).
+
+
+## Reprioritization: RT comparison first (2026-10-09)
+
+The confirmed scope is independent RT and raster rendering pipelines sharing
+scene/material/optical/light/camera/exposure controls. First RT scope includes
+shadows, reflections, multi-bounceGI and basic solid glass. Open glass meshes use
+explicit thin-sheet fallback; caustics-specific algorithms, nested media and
+volumetric scattering are deferred. Raster glass uses screen/probe approximations.
+A mature denoiser is selected (NRD preferred); transmission needs separate
+handling. Main output is denoised, static accumulation/reference allowed; no
+initial RT hardFPS gate, formal comparisons at1080p, kitchen+analytic fixtures.
+UI first only switches render modes: no split/wipe/paired-screenshot feature.
+The user judges appearance; assistant visual verdicts only when explicitly asked.
+
+[RT-A/B/C/D implementation plan](docs/RT_Comparison_Plan.md) is confirmed.
+RT-A provides separate Vulkan RT Pipeline/SBT, BLAS/TLAS, RGBA32F HDR and the
+rendering-method switch. RT-B adds shared-material lighting, ray visibility,
+area/environment MIS, reflection, multi-bounce GI and static accumulation.
+RT-C adds explicit optical materials, closed-volume validation, diagnosed thin
+sheets, Fresnel/refraction/TIR and Beer absorption. Raster uses the same optical
+parameters in a captured-probe approximation; it does not trace rays. See
+[RT-C implementation](docs/RT_C_Implementation.md) for verified scope and limits.
+
+Select `Render Debug → Rendering method → Ray tracing`, or pass
+`--render-method ray-tracing` through `run.sh`. The UI shows accumulated samples.
+Raster remains the default. Only the selected scene path runs; display/exposure
+are shared. RT does not add raster probe SH, AO or constant ambient.
+
+NRD and separate transmission denoising remain RT-D. Glass currently uses smooth
+interfaces, one active medium and approximate straight colored shadow rays.
+Factor-only glTF transmission/volume/IOR are supported; unsupported maps and
+combinations fail explicitly. Kitchen PBRT dielectric metadata is recognized;
+original kitchen assets remain unchanged. Custom CPU object BVH/Hi-Z/indirect/LOD
+and SDF remain deferred. No commit or push was requested.

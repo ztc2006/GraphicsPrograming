@@ -151,6 +151,7 @@ struct TransformComponent {
 struct RenderableComponent {
   MeshId meshId = 0;
   MaterialId materialId = 0;
+  bool primaryVisible = true, shadowCaster = true;
 };
 
 struct BoundsComponent {
@@ -205,6 +206,8 @@ private:
     renderables_.add(entity, RenderableComponent{
                                  .meshId = object.meshId,
                                  .materialId = object.materialId,
+                                 .primaryVisible = object.primaryVisible,
+                                 .shadowCaster = object.shadowCaster,
                              });
     bounds_.add(entity, BoundsComponent{.worldBounds = object.worldBounds});
   }

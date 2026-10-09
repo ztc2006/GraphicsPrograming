@@ -16,8 +16,9 @@ struct alignas(16) IndoorLightingGpu {
   glm::vec4 probeMin{}, probeMax{}, probePosition{};
   std::array<glm::vec4, 9> probeSh{};
   SunCascadeGpu sun;
+  glm::vec4 detailMin{}, detailMax{}, detailPosition{};
 };
-static_assert(sizeof(IndoorLightingGpu) == 1040);
+static_assert(sizeof(IndoorLightingGpu) == 1088);
 static_assert(offsetof(IndoorLightingGpu, counts) == 400 &&
               offsetof(IndoorLightingGpu, probeSh) == 464);
 static_assert(offsetof(IndoorLightingGpu, sun) == 608);

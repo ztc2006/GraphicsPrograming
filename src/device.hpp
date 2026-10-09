@@ -25,7 +25,8 @@ public:
          std::vector<char const *> requiredDeviceExtensions,
          std::string preferredGpu = {}, bool debugUtils = false,
          PresentationInstanceSupport presentationInstance = {},
-         PresentationPolicy presentationPolicy = PresentationPolicy::Automatic);
+         PresentationPolicy presentationPolicy = PresentationPolicy::Automatic,
+         bool allowRayTracing = true);
 
   using BufferResources = GpuBuffer;
   BufferResources
@@ -69,6 +70,7 @@ public:
   void endLabel(vk::CommandBuffer command) const;
   PresentationSupport const &presentationSupport() const { return presentationSupport_; }
   bool memoryBudgetSupported() const;
+  bool rayTracingSupported() const { return rayTracingSupported_; }
   bool timelineSemaphoreSupported() const { return timelineSemaphoreSupported_; }
   float maxSamplerAnisotropy() const { return maxSamplerAnisotropy_; }
   std::pair<std::uint64_t, std::uint64_t> memoryUsageBudget() const;
@@ -98,6 +100,8 @@ private:
   std::string preferredGpu_;
   bool debugUtils_ = false;
   bool timelineSemaphoreSupported_ = false;
+  bool rayTracingSupported_ = false;
+  bool allowRayTracing_ = true;
   float maxSamplerAnisotropy_ = 1.0f;
   PresentationInstanceSupport presentationInstance_;
   PresentationPolicy presentationPolicy_;

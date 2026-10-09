@@ -14,4 +14,7 @@ layout(std430, set=0, binding=9) readonly buffer IndoorLighting {
   vec4 sunSplits;
   vec4 sunForwardNear;
   vec4 sunParams;
+  vec4 detailMin;
+  vec4 detailMax;
+  vec4 detailPosition;
 } indoor;

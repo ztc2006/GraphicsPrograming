@@ -38,8 +38,19 @@ int main() {
                      {"--warmup", "nan"},
                      {"--duration", "-1"},
                      {"--gpu"},
+                     {"--ao"},
+                     {"--ao", "invalid"},
+                     {"--ao-radius", "0"},
+                     {"--ao-radius", "nan"},
+                     {"--ao-radius", "101"},
+                     {"--ao-strength", "-1"},
+                     {"--ao-debug", "invalid"},
                      {"--light-culling"},
                      {"--light-culling", "bad"},
+                     {"--camera-culling"},
+                     {"--camera-culling", "bad"},
+                     {"--shadow-culling"},
+                     {"--shadow-culling", "bad"},
                      {"--frames-in-flight"},
                      {"--frames-in-flight", "0"},
                      {"--frames-in-flight", "3"},
@@ -47,6 +58,8 @@ int main() {
                      {"--frames-in-flight", "nan"},
                      {"--camera-path", "bad"},
                      {"--present", "bad"},
+                     {"--render-method", "bad"},
+                     {"--render-method"},
                      {"--present-sync"},
                      {"--present-sync", "bad"},
                      {"--benchmark", "out"},
@@ -64,16 +77,32 @@ int main() {
     require(parseViewerOptions({}).lightingPreset=="auto" &&
       parseViewerOptions(std::vector<std::string_view>{"--lighting-preset","asset"}).lightingPreset=="asset",
       "Lighting setup CLI/default lost");
+    require(parseViewerOptions({}).renderMethod=="raster" &&
+      parseViewerOptions(std::vector<std::string_view>{"--render-method","ray-tracing"}).renderMethod=="ray-tracing", "RT mode CLI parsing incorrect");
     require(parseViewerOptions({}).framesInFlight == 1, "Default frame count changed");
+    require(parseViewerOptions({}).cameraCulling && parseViewerOptions({}).shadowCulling &&
+        !parseViewerOptions(std::vector<std::string_view>{"--camera-culling","off"}).cameraCulling &&
+        !parseViewerOptions(std::vector<std::string_view>{"--shadow-culling","off"}).shadowCulling,
+        "Geometry culling default/control lost");
     require(parseViewerOptions({}).lightCulling == "clustered" &&
                 parseViewerOptions(std::vector<std::string_view>{"--light-culling", "full"}).lightCulling == "full",
             "Full-light comparison switch/default lost");
+    require(
+        parseViewerOptions({}).ao &&
+            !parseViewerOptions(std::vector<std::string_view>{"--ao", "off"})
+                 .ao &&
+            parseViewerOptions(std::vector<std::string_view>{
+                                   "--ao-radius", ".25", "--ao-debug", "raw"})
+                    .aoRadius == .25f,
+        "AO CLI controls lost");
     auto dir =
         std::filesystem::temp_directory_path() /
         ("vulkan-measurement-test-" +
          std::to_string(
              std::chrono::steady_clock::now().time_since_epoch().count()));
     BenchmarkMetadata metadata{.gpu = "software\nGPU", .software = true};
+    metadata.aoEnabled = true;
+    metadata.aoRadius = .75f;
     metadata.lightCulling = "clustered";
     metadata.temporalJitterEnabled=true;metadata.temporalHistoryValid=true;
     metadata.sunCascadeCount=4;metadata.sunShadowDistance=40;
@@ -83,7 +112,7 @@ int main() {
         {.id = 4,
          .cpuFrameMs = 10,
          .gpu = {.frameId = 4, .valid = true, .clustered = true, .totalMs = 5, .cullingMs = .125}},
-        {.id = 5, .cpuFrameMs = 20}};
+        {.id = 5, .cpuFrameMs = 200, .acquireMs=150}};
     writeBenchmarkReport(dir, metadata, frames);
     std::ifstream input(dir / "summary.json");
     std::string report((std::istreambuf_iterator<char>(input)), {});
@@ -108,6 +137,13 @@ int main() {
                 report.find("legacy_wait_idle") != std::string::npos &&
                 report.find("\"pending_present_fences\": 0") != std::string::npos,
             "Report lost presentation fallback diagnostics");
+    require(report.find("\"ao_enabled\": true") != std::string::npos &&
+                report.find("\"ao_radius\": 0.75") != std::string::npos &&
+                report.find("\"gpu_ao_ms\":") != std::string::npos,
+            "AO settings/timing missing from report");
+    require(report.find("\"detail_reflection_probe_valid\": false") !=
+                std::string::npos,
+            "Missing detail reflection state in report");
     require(report.find("\"gpu_taa_ms\":")!=std::string::npos,"Missing TAA timing field");
     require(report.find("\"gpu_output_ms\":") != std::string::npos &&
                 report.find("\"exposure_ev\":") != std::string::npos &&
@@ -118,6 +154,11 @@ int main() {
             "Culling metadata or completed-frame timing lost");
     require(report.find("\"sun_cascade_count\": 4")!=std::string::npos &&
         report.find("\"sun_shadow_distance\": 40")!=std::string::npos,"Report lost actual CSM configuration");
+    require(report.find("\"camera_culling_enabled\": true")!=std::string::npos &&
+        report.find("\"shadow_caster_culling_enabled\": true")!=std::string::npos &&
+        report.find("\"slow_acquire_frame_count\": 1")!=std::string::npos &&
+        report.find("\"cpu_acquire_ms\":")!=std::string::npos,
+        "Report lost geometry controls or hid slow acquire frames");
     std::ifstream csvInput(dir / "frames.csv");
     std::string csv((std::istreambuf_iterator<char>(csvInput)), {});
     require(csv.find("gpu_culling_ms,clustered_active,shadow_draws,main_draws") != std::string::npos &&

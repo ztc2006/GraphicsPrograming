@@ -1,8 +1,10 @@
 #include "hdr_output_regression.hpp"
-#include "hdr_output.hpp"
-#include "renderer.hpp"
+#include "frustum.hpp"
 #include "gltf_loader.hpp"
+#include "hdr_output.hpp"
 #include "lighting_presets.hpp"
+#include "renderer.hpp"
+#include "viewer_scene_prepare.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -64,6 +66,13 @@ struct RendererHdrTestAccess {
     return r.environmentBrdfLut_;
   }
   static HdrOutput &output(Renderer &renderer) { return *renderer.hdrOutput_; }
+  static vk::Image aoImage(Renderer const &r) {
+    return r.gtao_->image(Gtao::Composite);
+  }
+  static vk::Image temporalImage(Renderer const &r) {
+    return r.taa_->colorImage(1 - r.taa_->writeIndex());
+  }
+
   static RenderGraph::State const &hdrState(Renderer const &r) {
     return r.hdrState();
   }
@@ -72,6 +81,17 @@ struct RendererHdrTestAccess {
   }
   static RenderGraph::State const &shadowState(Renderer const &r) {
     return r.imageStates_.shadow;
+  }
+  static float probeEnergy(Renderer const &r) {
+    float sum = 0;
+    for (auto const &v : r.probeSh_)
+      sum += glm::length(v);
+    return sum;
+  }
+  static IndoorLightingGpu indoor(Renderer const &r, unsigned slot) {
+    IndoorLightingGpu g;
+    r.frames_[slot].indoorBuffer.read(std::as_writable_bytes(std::span{&g, 1}));
+    return g;
   }
   static vk::Image depth(Renderer const &r) {
     return *r.depthResources_.storage.image;
@@ -738,31 +758,38 @@ std::vector<std::byte> materialTga(unsigned width, unsigned height,
       bytes.push_back(std::byte(rgba[i * 4 + c]));
   return bytes;
 }
-std::vector<float> hdrImage(Device const &device, HdrOutput const &output) {
-  auto extent = output.extent();
+std::vector<float> hdrImageSource(Device const &device, vk::Image source,
+                                  vk::Extent2D extent) {
   std::vector<std::uint16_t> packed(std::size_t(extent.width) * extent.height * 4);
   auto readback = device.createBuffer(packed.size() * 2, vk::BufferUsageFlagBits::eTransferDst,
                                       vk::MemoryPropertyFlagBits::eHostVisible);
   record(device, [&](vk::CommandBuffer command) {
-    barrier(command, output.sceneImage(), vk::ImageLayout::eShaderReadOnlyOptimal,
-            vk::ImageLayout::eTransferSrcOptimal, vk::PipelineStageFlagBits2::eCopy,
+    barrier(command, source, vk::ImageLayout::eShaderReadOnlyOptimal,
+            vk::ImageLayout::eTransferSrcOptimal,
+            vk::PipelineStageFlagBits2::eCopy,
             vk::AccessFlagBits2::eTransferRead);
-    command.copyImageToBuffer(output.sceneImage(), vk::ImageLayout::eTransferSrcOptimal,
-        *readback.buffer, {vk::BufferImageCopy{.imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+    command.copyImageToBuffer(
+        source, vk::ImageLayout::eTransferSrcOptimal, *readback.buffer,
+        {vk::BufferImageCopy{
+            .imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
             .imageExtent = {extent.width, extent.height, 1}}});
     vk::BufferMemoryBarrier2 b{.srcStageMask = vk::PipelineStageFlagBits2::eCopy,
         .srcAccessMask = vk::AccessFlagBits2::eTransferWrite, .dstStageMask = vk::PipelineStageFlagBits2::eHost,
         .dstAccessMask = vk::AccessFlagBits2::eHostRead, .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
         .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .buffer = *readback.buffer, .size = VK_WHOLE_SIZE};
     command.pipelineBarrier2(vk::DependencyInfo{.bufferMemoryBarrierCount = 1, .pBufferMemoryBarriers = &b});
-    barrier(command, output.sceneImage(), vk::ImageLayout::eTransferSrcOptimal,
-            vk::ImageLayout::eShaderReadOnlyOptimal, vk::PipelineStageFlagBits2::eFragmentShader,
+    barrier(command, source, vk::ImageLayout::eTransferSrcOptimal,
+            vk::ImageLayout::eShaderReadOnlyOptimal,
+            vk::PipelineStageFlagBits2::eFragmentShader,
             vk::AccessFlagBits2::eShaderSampledRead);
   });
   readback.read(std::as_writable_bytes(std::span{packed}));
   std::vector<float> pixels(packed.size());
   std::transform(packed.begin(), packed.end(), pixels.begin(), [](auto v) { return glm::unpackHalf1x16(v); });
   return pixels;
+}
+std::vector<float> hdrImage(Device const &device, HdrOutput const &output) {
+  return hdrImageSource(device, output.sceneImage(), output.extent());
 }
 std::vector<std::uint32_t> clusterWords(Device const &device, Renderer const &r) {
   auto [source, grid] = RendererHdrTestAccess::clusterBuffer(r);
@@ -2270,18 +2297,26 @@ void exerciseIndoorLighting(Device const &device, SwapChain const &swapchain,
 }
 
 void exerciseKitchenScene(Device const &device, SwapChain const &swapchain,
-    unsigned slots, std::filesystem::path const &path, std::filesystem::path const &directory, bool colourDiagnostic) {
+                          unsigned slots, std::filesystem::path const &path,
+                          std::filesystem::path const &directory,
+                          bool colourDiagnostic, bool visibilityDiagnostic,
+                          bool aoDiagnostic) {
   auto imported=loadStaticGltfScene(path,{});
   require(imported.lights.empty(),"Kitchen control unexpectedly acquired asset lights");
   Renderer r(device,slots);r.recreateForSwapChain(swapchain);
+  if(visibilityDiagnostic)r.setShadowCasterCullingEnabled(false);
   AssetLibrary assets{.meshes=std::move(imported.meshes),.materials=std::move(imported.materials)};
   auto prepared=r.prepareScene(assets);r.waitSceneUpload(prepared);
   require(r.commitScene(prepared),"Kitchen scene did not commit");
   Aabb bounds;
   std::vector<Renderer::DrawItem> opaque,mask,transparent;
   for (auto const &obj:imported.objects) {
-    Renderer::DrawItem item{.meshId=obj.meshId,.materialId=obj.materialId,
-      .modelMatrix=obj.transform.matrix(),.worldBounds=obj.worldBounds};
+    Renderer::DrawItem item{.objectIndex = opaque.size() + mask.size() +
+                                           transparent.size(),
+                            .meshId = obj.meshId,
+                            .materialId = obj.materialId,
+                            .modelMatrix = obj.transform.matrix(),
+                            .worldBounds = obj.worldBounds};
     auto mode=assets.materials[obj.materialId].alphaMode;
     (mode==AlphaMode::Opaque?opaque:mode==AlphaMode::Mask?mask:transparent).push_back(item);
     if (obj.worldBounds.valid) {
@@ -2307,16 +2342,27 @@ void exerciseKitchenScene(Device const &device, SwapChain const &swapchain,
     require(r.renderFrame(scene,camera.viewProj(float(swapchain.extent().width)/swapchain.extent().height),camera.position,lighting,shadows)
         ==Renderer::FrameResult::eSuccess,"Kitchen frame failed");
     device.logicalDevice().waitIdle();r.collectCompletedWork();
-    auto pixels=hdrImage(device,RendererHdrTestAccess::output(r));
+    auto pixels =
+        aoDiagnostic && r.taaActive()
+            ? hdrImageSource(device, RendererHdrTestAccess::temporalImage(r),
+                             swapchain.extent())
+        : aoDiagnostic && r.aoActive()
+            ? hdrImageSource(device, RendererHdrTestAccess::aoImage(r),
+                             swapchain.extent())
+            : hdrImage(device, RendererHdrTestAccess::output(r));
     std::ofstream out(directory/(std::string(name)+".ppm"),std::ios::binary);
     auto size=swapchain.extent();out<<"P6\n"<<size.width<<' '<<size.height<<"\n255\n";
     for (std::size_t i=0;i<pixels.size();i+=4) for(unsigned c=0;c<3;++c) {
       require(std::isfinite(pixels[i+c]),"Kitchen contains invalid HDR pixels");
-      float v=filmic(pixels[i+c]);v=v<=.0031308f?v*12.92f:1.055f*std::pow(v,1/2.4f)-.055f;
+      float v=aoDiagnostic && r.aoSettings().debug!=AoDebug::None?std::clamp(pixels[i+c],0.f,1.f):filmic(pixels[i+c]);v=v<=.0031308f?v*12.92f:1.055f*std::pow(v,1/2.4f)-.055f;
       out.put(char(std::lround(std::clamp(v,0.f,1.f)*255)));
     }
-    std::ofstream raw(directory/(std::string(name)+".rgba32f"),std::ios::binary);
-    raw.write(reinterpret_cast<char const *>(pixels.data()),pixels.size()*4);
+    if (!std::string_view(name).starts_with("motion_")) {
+      std::ofstream raw(directory / (std::string(name) + ".rgba32f"),
+                        std::ios::binary);
+      raw.write(reinterpret_cast<char const *>(pixels.data()),
+                pixels.size() * 4);
+    }
     return pixels;
   };
   auto testLights=lighting.punctualLights;
@@ -2335,6 +2381,127 @@ void exerciseKitchenScene(Device const &device, SwapChain const &swapchain,
   double difference=0;for(std::size_t i=0;i<localReflection.size();i+=4)
     for(unsigned c=0;c<3;++c) difference+=std::abs(localReflection[i+c]-globalReflection[i+c]);
   require(difference>10,"Kitchen reflection probe had no observable effect");
+  if (aoDiagnostic) {
+    lighting.pbrDebugMode = 0;
+    lighting.localProbe.enabled = true;
+    r.setAoSettings({.enabled = false});
+    auto before = image("ao_off");
+    r.setAoSettings({.enabled = true});
+    auto after = image("ao_on");
+    double reduced = 0;
+    std::size_t changed = 0;
+    for (std::size_t i = 0; i < after.size(); i += 4)
+      for (unsigned c = 0; c < 3; ++c) {
+        require(after[i + c] <= before[i + c] + .004,
+                "AO brightened linear lighting");
+        reduced += before[i + c] - after[i + c];
+        changed += before[i + c] - after[i + c] > .002;
+      }
+    require(reduced > 1 && changed > 100, "Kitchen AO did not affect contacts");
+    r.setAoSettings({.enabled = true, .radius = .5, .strength = 0});
+    auto zero = image("ao_strength_zero");
+    for (std::size_t i = 0; i < before.size(); ++i)
+      require(std::abs(before[i] - zero[i]) < .004,
+              "AO zero strength altered scene");
+    r.setAoSettings({.enabled = true, .debug = AoDebug::Raw});
+    image("ao_raw");
+    r.setAoSettings({.enabled = true, .debug = AoDebug::Filtered});
+    image("ao_filtered");
+    r.setAoSettings({.enabled = true});
+    auto probeBefore = image("ao_probe_before");
+    r.captureLocalProbe(scene, lighting);
+    auto probeAfter = image("ao_probe_recaptured");
+    for (std::size_t i = 0; i < probeBefore.size(); ++i)
+      require(std::abs(probeBefore[i] - probeAfter[i]) < .004,
+              "AO contaminated static probe");
+    r.setTaaEnabled(true);
+    auto origin = camera.position;
+    for (unsigned path = 0; path < 2; ++path) {
+      r.invalidateTemporalHistory();
+      for (unsigned frame = 0; frame < 24; ++frame) {
+        float t = float(frame) / 23;
+        camera.position =
+            origin +
+            glm::vec3((path ? .8f : .08f) * std::sin(t * glm::pi<float>() * 2),
+                      0, 0);
+        std::sort(
+            transparent.begin(), transparent.end(),
+            [&](auto const &a, auto const &b) {
+              return glm::length((a.worldBounds.min + a.worldBounds.max) * .5f -
+                                 camera.position) >
+                     glm::length((b.worldBounds.min + b.worldBounds.max) * .5f -
+                                 camera.position);
+            });
+        auto name = std::string(path ? "motion_fast_" : "motion_slow_") +
+                    std::to_string(frame);
+        image(name.c_str());
+        require(r.gpuTimings().valid && r.gpuTimings().aoMs > 0 &&
+                    r.gpuTimings().taaMs > 0,
+                "AO/TAA completion timing missing");
+      }
+    }
+    std::cout << "PASS kitchen AO HDR off/on/debug, zero strength/probe "
+                 "isolation, 48 deterministic TAA motion frames; reduced="
+              << reduced << ", changed channels=" << changed << "\n";
+    return;
+  }
+  if(visibilityDiagnostic) {
+    lighting.pbrDebugMode=0;
+    auto fullScene=scene;
+    std::array<Camera,3> views{camera,camera,camera};
+    views[1].position={-1.8f,1.5f,0};views[1].target={1.3f,.9f,1.8f};
+    views[2].position={7,5,8};views[2].target={.5f,1.5f,1.5f};
+    auto difference=[](auto const &a,auto const &b) {
+      double maximum=0;for(std::size_t p=0;p<a.size();p+=4)for(unsigned c=0;c<3;++c)
+        maximum=std::max(maximum,double(std::abs(a[p+c]-b[p+c])));
+      return maximum;
+    };
+    bool savedCamera=false,savedShadow=false;
+    std::ofstream metrics(directory/"visibility-pairs.csv");
+    metrics<<"view,mode,main_draws,shadow_draws,max_linear_hdr_difference\n";
+    for(unsigned view=0;view<views.size();++view) {
+      camera=views[view];
+      std::sort(transparent.begin(),transparent.end(),[&](auto const &a,auto const &b) {
+        return glm::length((a.worldBounds.min+a.worldBounds.max)*.5f-camera.position)>
+          glm::length((b.worldBounds.min+b.worldBounds.max)*.5f-camera.position);
+      });
+      scene=fullScene;scene.allTransparent=transparent;
+      r.setShadowCasterCullingEnabled(false);
+      auto prefix=std::string("visibility_")+std::to_string(view);
+      auto reference=image((prefix+"_full").c_str());auto full=r.drawStatistics();
+      metrics<<view<<",full,"<<full.main<<','<<full.shadow<<",0\n";
+      std::array<std::vector<Renderer::DrawItem>,3> visible;
+      auto extent=swapchain.extent();
+      auto frustum=extractFrustum(camera.viewProj(float(extent.width)/extent.height),
+          {1.f/extent.width,1.f/extent.height});
+      std::array lists{fullScene.opaque,fullScene.mask,fullScene.transparent};
+      for(unsigned list=0;list<lists.size();++list)
+        for(auto const &item:lists[list])if(intersectsFrustum(frustum,item.worldBounds))visible[list].push_back(item);
+      for(unsigned mode=1;mode<=3;++mode) {
+        scene=fullScene;scene.allTransparent=transparent;
+        if(mode!=2){scene.opaque=visible[0];scene.mask=visible[1];scene.transparent=visible[2];}
+        r.setShadowCasterCullingEnabled(mode!=1);
+        auto result=image((prefix+"_"+std::to_string(mode)).c_str());auto draws=r.drawStatistics();
+        auto error=difference(reference,result);
+        metrics<<view<<','<<mode<<','<<draws.main<<','<<draws.shadow<<','<<error<<'\n';
+        require(error<.001,"Kitchen culling changed visible HDR");
+        savedCamera|=draws.main<full.main;savedShadow|=draws.shadow<full.shadow;
+      }
+    }
+    camera=views[0];
+    std::sort(transparent.begin(),transparent.end(),[&](auto const &a,auto const &b) {
+      return glm::length((a.worldBounds.min+a.worldBounds.max)*.5f-camera.position)>
+        glm::length((b.worldBounds.min+b.worldBounds.max)*.5f-camera.position);
+    });
+    scene=fullScene;scene.allTransparent=transparent;
+    r.setShadowCasterCullingEnabled(false);
+    auto probeReference=image("visibility_probe_before");
+    r.setShadowCasterCullingEnabled(true);r.captureLocalProbe(scene,lighting);
+    auto probeCulled=image("visibility_probe_after");
+    require(difference(probeReference,probeCulled)<.001,"Culling changed recaptured room-probe HDR");
+    require(savedCamera && savedShadow,"Kitchen culling saved no camera/shadow work");
+    std::cout<<"PASS three kitchen views: camera/shadow/combined culling HDR pairs and draw savings\n";
+  }
   if(colourDiagnostic) {
     lighting.localProbe.enabled=true;lighting.pbrDebugMode=1;image("base_colour");
     lighting.pbrDebugMode=14;image("direct_warm");
@@ -2357,6 +2524,94 @@ void exerciseKitchenScene(Device const &device, SwapChain const &swapchain,
   }
   std::cout<<"PASS full kitchen: "<<opaque.size()<<" opaque, "<<mask.size()<<" mask, "<<transparent.size()
     <<" blend, 2 spot shadows, local reflection HDR difference="<<difference<<"; images="<<directory<<std::endl;
+}
+
+void exerciseVisibilityCulling(Device const &device, SwapChain const &swapchain,
+                               unsigned slots) {
+  Renderer r(device,slots);r.recreateForSwapChain(swapchain);
+  AssetLibrary assets;
+  Mesh mesh;
+  for(auto position : {glm::vec3{-1,-1,0},glm::vec3{1,-1,0},
+                       glm::vec3{1,1,0},glm::vec3{-1,1,0}})
+    mesh.vertices.push_back(Vertex{.position=position,.color={1,1,1},.normal={0,0,1}});
+  mesh.indices={0,1,2,0,2,3};assets.meshes.push_back(mesh);
+  Material material;material.doubleSided=true;material.specularFactor=0;
+  assets.materials.push_back(material);
+  auto masked=material;masked.alphaMode=AlphaMode::Mask;assets.materials.push_back(masked);
+  auto blended=material;blended.alphaMode=AlphaMode::Blend;blended.tint.a=.5f;assets.materials.push_back(blended);
+  auto prepared=r.prepareScene(assets);r.waitSceneUpload(prepared);
+  require(r.commitScene(prepared),"Visibility scene failed to commit");
+  auto object=[&](glm::vec3 position,glm::vec3 scale,std::size_t identity) {
+    Renderer::DrawItem item{.objectIndex=identity,.meshId=0,.materialId=0,
+      .modelMatrix=glm::translate(glm::mat4{1},position)*glm::scale(glm::mat4{1},scale)};
+    for(auto const &vertex:mesh.vertices) {
+      auto p=glm::vec3(item.modelMatrix*glm::vec4(vertex.position,1));
+      if(!item.worldBounds.valid)item.worldBounds={p,p,true};
+      else {item.worldBounds.min=glm::min(item.worldBounds.min,p);item.worldBounds.max=glm::max(item.worldBounds.max,p);}
+    }
+    return item;
+  };
+  std::array all{object({0,0,-1},{1,1,1},0),
+                 object({.5f,0,-.3f},{.08f,.08f,1},1),
+                 object({50,0,-1},{-1,2,1},2)};
+  Camera camera;camera.position={0,0,0};camera.target={0,0,-1};camera.nearPlane=.1f;camera.farPlane=5;
+  LightingSettings lighting;lighting.environmentIntensity=0;lighting.color={1,1,1};
+  lighting.direction=glm::normalize(glm::vec3{1,0,1});lighting.shadowPcfRadius=0;
+  lighting.sunCascades.count=2;lighting.sunCascades.distance=4;lighting.sunCascades.casterDistance=6;
+  auto vp=camera.viewProj(float(swapchain.extent().width)/swapchain.extent().height);
+  auto draw=[&](std::span<Renderer::DrawItem const> visible,std::span<Renderer::DrawItem const> casters,bool cull) {
+    r.setShadowCasterCullingEnabled(cull);
+    require(r.renderFrame({.opaque=visible,.allOpaque=casters,.sky=false},vp,camera.position,lighting,true)
+        ==Renderer::FrameResult::eSuccess,"Visibility frame failed");
+    device.logicalDevice().waitIdle();r.collectCompletedWork();
+    return hdrImage(device,RendererHdrTestAccess::output(r));
+  };
+  auto delta=[](auto const &a,auto const &b) {
+    double sum=0;for(std::size_t i=0;i<a.size();i+=4)for(unsigned c=0;c<3;++c)sum+=std::abs(a[i+c]-b[i+c]);
+    return sum;
+  };
+  auto reference=draw(all,all,false);auto fullDraws=r.drawStatistics().shadow;
+  std::array withoutBlocker{all[0],all[2]};
+  auto missingShadow=draw(withoutBlocker,withoutBlocker,false);
+  require(delta(reference,missingShadow)>1,"Off-camera caster fixture did not affect the visible receiver");
+  auto shadowCulled=draw(all,all,true);auto culledDraws=r.drawStatistics().shadow;
+  require(delta(reference,shadowCulled)<.001,"Shadow caster culling changed visible HDR");
+  require(culledDraws<fullDraws,"Shadow culling retained all candidates");
+  std::vector<Renderer::DrawItem> visible;
+  auto frustum=extractFrustum(vp,{1.f/swapchain.extent().width,1.f/swapchain.extent().height});
+  for(auto const &item:all)if(intersectsFrustum(frustum,item.worldBounds))visible.push_back(item);
+  require(visible.size()==1,"Camera frustum failed to remove off-camera objects");
+  auto combined=draw(visible,all,true);
+  require(delta(reference,combined)<.001,"Camera culling lost an off-camera object's shadow");
+  auto known=r.drawStatistics().shadow;
+  lighting.shadowDebugMode=3;lighting.sunCascades.debugIndex=1;
+  auto debugReference=draw(all,all,false);auto debugCulled=draw(all,all,true);
+  require(delta(debugReference,debugCulled)<.001 && r.drawStatistics().shadow>known,
+      "Receiver culling removed a tile used by shadow debugging");
+  lighting.shadowDebugMode=1;
+  all[2].worldBounds.valid=false;auto unknown=draw(visible,all,true);
+  require(r.drawStatistics().shadow>known,"Missing caster bounds were not kept conservatively");
+  require(delta(reference,unknown)<.001,"Conservative unknown bounds changed HDR");
+  all[2]=object({50,0,-1},{-1,2,1},2);
+  std::array casters{all[1],all[2]};
+  for(unsigned mode : {1u,2u}) {
+    auto receiver=all[0];receiver.materialId=mode;
+    std::array receivers{receiver};
+    auto mixed=[&](bool cull) {
+      r.setShadowCasterCullingEnabled(cull);
+      Renderer::SceneDrawList list{.allOpaque=casters,.sky=false};
+      if(mode==1){list.mask=receivers;list.allMask=receivers;}
+      else {list.transparent=receivers;list.allTransparent=receivers;}
+      require(r.renderFrame(list,vp,camera.position,lighting,true)==Renderer::FrameResult::eSuccess,
+          "Mask/blend receiver frame failed");
+      device.logicalDevice().waitIdle();r.collectCompletedWork();
+      return hdrImage(device,RendererHdrTestAccess::output(r));
+    };
+    auto mixedReference=mixed(false);auto mixedCulled=mixed(true);
+    require(delta(mixedReference,mixedCulled)<.001,"Mask/blend receiver culling changed HDR");
+  }
+  std::cout<<"PASS visibility: shadow draws "<<fullDraws<<" -> "<<culledDraws
+      <<", visible objects 3 -> 1, off-camera shadow/unknown bounds preserved\n";
 }
 
 void exerciseSunCascades(Device const &device, SwapChain const &swapchain,
@@ -2475,4 +2730,370 @@ void exerciseSunCascades(Device const &device, SwapChain const &swapchain,
     std::cout<<"PASS CSM GPU: four levels, overlap, far fade, upstream/moving caster, legacy/spot/disabled, invalid retry, fade="<<fade[0]<<std::endl;
   }
   require(device.resourceLedger().snapshot().current==before,"CSM leaked GPU resources");
+}
+void exerciseKitchenGeometry(Device const &device, SwapChain const &swapchain,
+                             unsigned slots, std::filesystem::path const &path,
+                             std::filesystem::path const &directory,
+                             bool repaired) {
+  auto imported = loadStaticGltfScene(path, {});
+  require(imported.meshes.size() == 299 && imported.materials.size() == 90,
+          "Unexpected pinned kitchen layout");
+  if (repaired) {
+    auto repair = prepareImportedSceneForViewer(imported);
+    std::cout << "Viewer kitchen repair: zero=" << repair.zeroArea
+              << " duplicates=" << repair.duplicates
+              << " light cards=" << repair.lightCards << std::endl;
+    require(repair.zeroArea == 219 && repair.duplicates == 6 &&
+                repair.lightCards == 4,
+            "Pinned kitchen cleanup/role counts differ");
+  }
+  AssetLibrary assets{.meshes = imported.meshes,
+                      .materials = imported.materials};
+  Renderer r(device, slots);
+  r.recreateForSwapChain(swapchain);
+  r.setTaaEnabled(false);
+  r.setAoSettings({.enabled = false});
+  std::filesystem::create_directories(directory);
+  auto prepare = [&](AssetLibrary const &a) {
+    auto candidate = r.prepareScene(a);
+    r.waitSceneUpload(candidate);
+    require(r.commitScene(candidate), "Geometry diagnostic commit failed");
+  };
+  std::ofstream metrics(directory / "gpu-controls.csv");
+  metrics << "name,center_r,center_g,center_b\n";
+  auto image = [&](std::string const &name,
+                   Renderer::SceneDrawList const &scene, Camera const &camera,
+                   LightingSettings const &lighting) {
+    require(r.renderFrame(scene,
+                          camera.viewProj(float(swapchain.extent().width) /
+                                          swapchain.extent().height),
+                          camera.position, lighting,
+                          false) == Renderer::FrameResult::eSuccess,
+            "Geometry diagnostic frame failed");
+    device.logicalDevice().waitIdle();
+    r.collectCompletedWork();
+    auto pixels = hdrImage(device, RendererHdrTestAccess::output(r));
+    auto size = swapchain.extent();
+    std::ofstream out(directory / (name + ".ppm"), std::ios::binary);
+    out << "P6\n" << size.width << ' ' << size.height << "\n255\n";
+    for (std::size_t i = 0; i < pixels.size(); i += 4)
+      for (unsigned c = 0; c < 3; ++c) {
+        float v = lighting.pbrDebugMode == 4
+                      ? std::clamp(pixels[i + c], 0.f, 1.f)
+                      : filmic(pixels[i + c]);
+        v = v <= .0031308f ? 12.92f * v
+                           : 1.055f * std::pow(v, 1 / 2.4f) - .055f;
+        out.put(char(std::lround(std::clamp(v, 0.f, 1.f) * 255)));
+      }
+    std::ofstream raw(directory / (name + ".rgba32f"), std::ios::binary);
+    raw.write(reinterpret_cast<char const *>(pixels.data()), pixels.size() * 4);
+    auto center =
+        4 * (std::size_t(size.height / 2) * size.width + size.width / 2);
+    metrics << name << ',' << pixels[center] << ',' << pixels[center + 1] << ','
+            << pixels[center + 2] << '\n';
+    return pixels;
+  };
+  auto center = [&](auto const &p) {
+    auto s = swapchain.extent();
+    auto k = 4 * (std::size_t(s.height / 2) * s.width + s.width / 2);
+    return glm::vec3{p[k], p[k + 1], p[k + 2]};
+  };
+  LightingSettings dark;
+  dark.sunEnabled = false;
+  dark.environmentIntensity = 0;
+  Camera inside;
+  inside.position = {.06f, 1.9f, -1.5f};
+  inside.target = {.06f, 1.9f, -3.1173f};
+  inside.nearPlane = .02f;
+  inside.farPlane = 40;
+  Camera outside = inside;
+  outside.position = {.06f, 1.9f, -4.7f};
+  AssetLibrary emitter;
+  emitter.meshes.push_back(assets.meshes[295]);
+  emitter.materials.push_back(assets.materials[86]);
+  require(!emitter.materials[0].doubleSided &&
+              emitter.materials[0].alphaMode == AlphaMode::Opaque,
+          "Window emitter material changed");
+  prepare(emitter);
+  std::array one{Renderer::DrawItem{.objectIndex = 0}};
+  Renderer::SceneDrawList emitterScene{
+      .opaque = one, .allOpaque = one, .sky = false};
+  auto front = image("window_emitter_inside", emitterScene, inside, dark);
+  auto back = image("window_emitter_outside", emitterScene, outside, dark);
+  require(glm::length(center(front) - glm::vec3(1)) < .002f,
+          "Emitter front did not cover window center");
+  require(glm::length(center(back) - glm::vec3(.05, .07, .1)) < .002f,
+          "Emitter back was not culled");
+  emitter.materials[0].doubleSided = true;
+  prepare(emitter);
+  auto twoSided =
+      image("window_emitter_two_sided_control", emitterScene, outside, dark);
+  require(glm::length(center(twoSided) - glm::vec3(1)) < .002f,
+          "Emitter control did not render both sides");
+  if (repaired) {
+    one[0].primaryVisible = false;
+    one[0].shadowCaster = false;
+    auto hidden = image("window_hidden_light_card", emitterScene, inside, dark);
+    require(glm::length(center(hidden) - glm::vec3(.05, .07, .1)) < .002,
+            "Light-card primary visibility flag ignored");
+    auto capture = dark;
+    capture.localProbe = {true, {-4, -4, -4}, {4, 4, 4}, {0, 0, 0}};
+    r.captureLocalProbe(emitterScene, capture);
+    require(RendererHdrTestAccess::probeEnergy(r) > .01f,
+            "Hidden light card lost probe illumination");
+    auto shadowControl = capture;
+    shadowControl.sunEnabled = true;
+    r.setShadowCasterCullingEnabled(false);
+    require(r.renderFrame(emitterScene, inside.viewProj(1), inside.position,
+                          shadowControl,
+                          true) == Renderer::FrameResult::eSuccess,
+            "Light-card shadow control failed");
+    device.logicalDevice().waitIdle();
+    r.collectCompletedWork();
+    require(r.drawStatistics().main == 0 && r.drawStatistics().shadow == 0,
+            "Light card remained primary/shadow geometry");
+    r.setShadowCasterCullingEnabled(true);
+    one[0].primaryVisible = true;
+    one[0].shadowCaster = true;
+  }
+  prepare(assets);
+  std::vector<Renderer::DrawItem> opaque, blend, noEmitter;
+  for (unsigned i = 0; i < imported.objects.size(); ++i) {
+    auto const &o = imported.objects[i];
+    Renderer::DrawItem item{.objectIndex = i,
+                            .meshId = o.meshId,
+                            .materialId = o.materialId,
+                            .modelMatrix = o.transform.matrix(),
+                            .worldBounds = o.worldBounds};
+    item.primaryVisible = o.primaryVisible;
+    item.shadowCaster = o.shadowCaster;
+    (assets.materials[o.materialId].alphaMode == AlphaMode::Blend ? blend
+                                                                  : opaque)
+        .push_back(item);
+    if (assets.materials[o.materialId].alphaMode != AlphaMode::Blend &&
+        o.meshId != 295)
+      noEmitter.push_back(item);
+  }
+  auto sort = [&](Camera const &c) {
+    std::sort(blend.begin(), blend.end(), [&](auto const &a, auto const &b) {
+      return glm::length((a.worldBounds.min + a.worldBounds.max) * .5f -
+                         c.position) >
+             glm::length((b.worldBounds.min + b.worldBounds.max) * .5f -
+                         c.position);
+    });
+  };
+  Renderer::SceneDrawList scene{.opaque = opaque,
+                                .transparent = blend,
+                                .allOpaque = opaque,
+                                .allTransparent = blend,
+                                .sky = true};
+  LightingSettings lighting;
+  Camera preset;
+  applyKitchenLightingPreset(lighting, preset);
+  sort(inside);
+  auto full = image("window_full_inside", scene, inside, lighting);
+  if (!repaired)
+    require(glm::all(glm::greaterThanEqual(center(full), glm::vec3(.99f))),
+            "Full kitchen window center did not see emitter radiance");
+  auto windowDepth = [&] {
+    auto size = swapchain.extent();
+    auto bytes = pixel(device, RendererHdrTestAccess::depth(r),
+                       RendererHdrTestAccess::depthState(r).layout,
+                       {int(size.width / 2), int(size.height / 2), 0},
+                       sizeof(float), vk::ImageAspectFlagBits::eDepth);
+    float d;
+    std::memcpy(&d, bytes.data(), sizeof(d));
+    return d;
+  };
+  float emitterDepth = windowDepth();
+  auto without = scene;
+  without.opaque = noEmitter;
+  without.allOpaque = noEmitter;
+  auto removed =
+      image("window_without_emitter_control", without, inside, lighting);
+  require((repaired ? emitterDepth > .999f : emitterDepth < .999f) &&
+              windowDepth() > .999f,
+          "Window primary depth still blocked by light card");
+  sort(outside);
+  image("window_full_outside", scene, outside, lighting);
+  Camera micro = preset;
+  micro.position = {-.75f, 1.85f, -1.95f};
+  micro.target = {-2.2f, 1.14f, -1.95f};
+  micro.fovRadians = glm::radians(35.f);
+  micro.nearPlane = .02f;
+  micro.farPlane = 40;
+  sort(micro);
+  r.captureLocalProbe(scene, lighting);
+  lighting.localProbe.enabled = true;
+  if (repaired) {
+    require(r.detailReflectionProbeValid(),
+            "Microwave detail probe did not publish");
+    auto opaqueOnly = scene;
+    opaqueOnly.transparent = {};
+    lighting.pbrDebugMode = 8;
+    lighting.detailReflectionProbe.enabled = false;
+    auto leaking = image("microwave_room_only_failure_control", opaqueOnly,
+                         micro, lighting);
+    lighting.detailReflectionProbe.enabled = true;
+    auto protectedSpec =
+        image("microwave_detail_specular", opaqueOnly, micro, lighting);
+    if (slots == 2) {
+      auto latest = unsigned((r.submittedFrameId() - 1) % 2);
+      auto a = RendererHdrTestAccess::indoor(r, latest),
+           b = RendererHdrTestAccess::indoor(r, 1 - latest);
+      require((a.counts.w & 4u) != 0 && (b.counts.w & 4u) == 0 &&
+                  a.detailMin ==
+                      glm::vec4(lighting.detailReflectionProbe.minimum, 0),
+              "Detail probe SSBO flags/bounds aliased between slots");
+    }
+
+    std::cout << "Microwave isolated specular: room="
+              << glm::length(center(leaking))
+              << " detail=" << glm::length(center(protectedSpec)) << std::endl;
+    require(glm::length(center(protectedSpec)) <
+                glm::length(center(leaking)) * .5f,
+            "Microwave still samples room Floor instead of cavity");
+    lighting.pbrDebugMode = 14;
+    lighting.detailReflectionProbe.enabled = false;
+    auto directA = image("microwave_direct_room", scene, micro, lighting);
+    lighting.detailReflectionProbe.enabled = true;
+    auto directB = image("microwave_direct_detail", scene, micro, lighting);
+    for (std::size_t i = 0; i < directA.size(); ++i)
+      require(directA[i] == directB[i],
+              "Detail reflection changed direct lighting");
+    auto oldId = r.submittedFrameId();
+    auto invalid = lighting;
+    invalid.detailReflectionProbe.position =
+        invalid.detailReflectionProbe.minimum;
+    bool rejected = false;
+    try {
+      r.captureLocalProbe(scene, invalid);
+    } catch (std::runtime_error const &) {
+      rejected = true;
+    }
+    require(rejected && r.detailReflectionProbeValid() &&
+                r.submittedFrameId() == oldId,
+            "Failed detail capture invalidated live probe/history");
+    lighting.pbrDebugMode = 0;
+  }
+  auto local = image("microwave_local_all", scene, micro, lighting);
+  lighting.pbrDebugMode = 4;
+  image("microwave_normals", scene, micro, lighting);
+  lighting.pbrDebugMode = 8;
+  auto spec = image("microwave_local_specular", scene, micro, lighting);
+  lighting.localProbe.enabled = false;
+  auto global =
+      image("microwave_global_specular_control", scene, micro, lighting);
+  lighting.localProbe.enabled = true;
+  lighting.pbrDebugMode = 0;
+  lighting.environmentSpecularStrength = 0;
+  auto noSpec = image("microwave_no_specular_control", scene, micro, lighting);
+  double difference = 0, sourceDifference = 0;
+  for (std::size_t i = 0; i < local.size(); i += 4)
+    for (unsigned c = 0; c < 3; ++c) {
+      difference += std::abs(local[i + c] - noSpec[i + c]);
+      sourceDifference += std::abs(spec[i + c] - global[i + c]);
+    }
+  require(difference > 10 && sourceDifference > 10,
+          "Microwave specular/probe source controls had no observable effect");
+  std::cout
+      << "PASS window actual GPU: opaque single-sided emitter front="
+      << center(front).x << ", back=" << center(back).x
+      << ", two-sided control=" << center(twoSided).x
+      << "; full scene/removal matches. Microwave specular-off difference="
+      << difference << ", local/global source difference=" << sourceDifference
+      << std::endl;
+}
+
+
+void exerciseDielectricRaster(Device const &device, SwapChain const &swapchain,
+                              unsigned slots) {
+  auto before=device.resourceLedger().snapshot().current;
+  {
+    Renderer r(device,slots);
+    r.recreateForSwapChain(swapchain);
+    r.setTaaEnabled(false);
+    r.setAoSettings({.enabled=false});
+    HdrImage constant{.width=8,.height=4,.rgba=std::vector<float>(8*4*4,1)};
+    auto bake=bakeEnvironment(constant,{.faceSize=8,.prefilterSamples=32,
+                                        .lutSize=8,.lutSamples=64});
+    std::array colors{glm::vec3(1,0,0),glm::vec3(0,1,0),glm::vec3(0,0,1),
+                      glm::vec3(1,1,0),glm::vec3(2,3,4),glm::vec3(8,5,2)};
+    for(auto level:bake.levels)
+      for(unsigned f=0;f<6;++f)
+        for(unsigned i=0;i<level.size*level.size;++i)
+          for(unsigned c=0;c<3;++c)
+            bake.cubeRgba[level.offset+(f*level.size*level.size+i)*4+c]=colors[f][c];
+    RendererHdrTestAccess::environment(r,bake);
+    Mesh plane;
+    for(auto pos:{glm::vec3(-1,-1,.5),glm::vec3(3,-1,.5),glm::vec3(-1,3,.5)})
+      plane.vertices.push_back(Vertex{.position=pos,.color={1,1,1},.normal={0,0,1}});
+    plane.indices={0,1,2};
+    Mesh box;
+    for(auto pos:{glm::vec3(-2,-2,.4),glm::vec3(2,-2,.4),glm::vec3(2,2,.4),glm::vec3(-2,2,.4),
+                  glm::vec3(-2,-2,.5),glm::vec3(2,-2,.5),glm::vec3(2,2,.5),glm::vec3(-2,2,.5)})
+      box.vertices.push_back(Vertex{.position=pos,.color={1,1,1},.normal={0,0,1}});
+    // Opposite triangle orders must select the same nearest optical surface.
+    box.indices={0,2,1,0,3,2,0,1,5,0,5,4,1,2,6,1,6,5,2,3,7,2,7,6,3,0,4,3,4,7,4,5,6,4,6,7};
+    require(classifyDielectricMesh(box).solid,"Raster optical box is not closed");
+    AssetLibrary assets;
+    assets.meshes={plane,box};
+    auto reordered=box;
+    std::rotate(reordered.indices.begin(),reordered.indices.end()-6,reordered.indices.end());
+    assets.meshes.push_back(reordered);
+    Material m;
+    m.doubleSided=true;m.alphaMode=AlphaMode::Blend;m.metallicFactor=0;
+    m.roughnessFactor=.04f;m.tint.a=.35f;
+    m.optical.enabled=true;m.optical.coverage=0;
+    assets.materials.push_back(m);
+    m.optical.ior=1;m.optical.thickness=.1;m.optical.absorption={1,2,3};
+    assets.materials.push_back(m);
+    m.optical.ior=1.5;m.optical.solid=true;m.optical.absorption={0,0,0};
+    assets.materials.push_back(m);
+    auto candidate=r.prepareScene(assets);r.waitSceneUpload(candidate);
+    require(r.commitScene(candidate),"Raster glass commit failed");
+    LightingSettings l;l.sunEnabled=false;l.intensity=0;l.environmentIntensity=1;
+    l.environmentSpecularStrength=1;l.environmentDiffuseStrength=0;
+    // Depth decreases toward the +Z camera, matching the optical view vector.
+    glm::mat4 vp(1);vp[1][1]=-1;vp[2][2]=-1;vp[3][2]=1;
+    auto center=vk::Offset3D{int(swapchain.extent().width/2),int(swapchain.extent().height/2),0};
+    auto draw=[&](unsigned mesh,unsigned material,glm::vec3 v){
+      require(r.beginFrame(vp,glm::vec3(0,0,.5)+1000.f*v,l,false)==Renderer::FrameResult::eSuccess,
+              "Raster glass begin failed");
+      r.drawObject(mesh,material,glm::mat4(1));r.endFrame();
+      device.logicalDevice().waitIdle();r.collectCompletedWork();
+      auto p=hdrPixel(device,RendererHdrTestAccess::output(r),center);
+      return glm::vec3(p[0],p[1],p[2]);
+    };
+    auto close=[&](glm::vec3 actual,glm::vec3 expected){
+      if(glm::length(actual-expected)>.025)
+        std::cerr<<"Raster glass actual "<<actual.x<<' '<<actual.y<<' '<<actual.z
+                 <<" expected "<<expected.x<<' '<<expected.y<<' '<<expected.z<<'\n';
+      require(glm::length(actual-expected)<.025,"Raster shared IOR/Beer/cube direction differs");
+    };
+    double f=.08/1.04;
+    close(draw(0,0,{0,0,1}),float(f)*colors[4]+float(1-f)*colors[5]);
+    close(draw(0,1,{0,0,1}),colors[5]*glm::vec3(std::exp(-.1),std::exp(-.2),std::exp(-.3)));
+    glm::vec3 oblique{std::sqrt(.75f),0,.5};
+    float Fs=dielectricFresnel(.5,1,1.5);
+    float Ft=2*Fs/(1+Fs);
+    close(draw(0,0,oblique),Ft*colors[1]+(1-Ft)*colors[1]);
+    close(draw(1,2,oblique),Fs*colors[1]+(1-Fs)*colors[5]);
+    close(draw(2,2,oblique),Fs*colors[1]+(1-Fs)*colors[5]);
+    // A requested solid on the open plane must use the thin direction.
+    close(draw(0,2,oblique),colors[1]);
+    std::array one{Renderer::DrawItem{.objectIndex=0,.meshId=0,.materialId=0}};
+    Renderer::SceneDrawList scene{.transparent=one,.allTransparent=one,.sky=false};
+    l.localProbe={true,{-2,-2,-2},{2,2,2},{0,0,0}};
+    r.captureLocalProbe(scene,l);
+    float capture=RendererHdrTestAccess::probeEnergy(r);
+    for(unsigned i=0;i<bake.cubeRgba.size();++i)if(i%4!=3)bake.cubeRgba[i]*=10;
+    RendererHdrTestAccess::environment(r,bake);
+    r.captureLocalProbe(scene,l);
+    require(std::abs(RendererHdrTestAccess::probeEnergy(r)-capture)<1e-5,
+            "Glass probe capture recursively sampled environment/probe lighting");
+    std::cout<<"PASS raster glass: shared Fresnel/IOR/Beer, thin vs solid probe direction, "
+                 "open fallback, legacy optical alpha and nonrecursive capture\n";
+  }
+  require(device.resourceLedger().snapshot().current==before,"Raster glass resources leaked");
 }

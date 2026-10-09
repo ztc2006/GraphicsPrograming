@@ -13,6 +13,7 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <bit>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -182,9 +183,34 @@ void Renderer::recreateForSwapChain(SwapChain const &swapChain) {
   auto newHdrOutput = std::make_unique<HdrOutput>(device_, swapChain.extent(),
                                                   swapChain.imageFormat());
 
-  auto newTaa=std::make_unique<TaaResolve>(device_,swapChain.extent(),newHdrOutput->sceneView(),*newDepthResource.imageView,*newMotionResource.imageView);
-  newHdrOutput->configureTemporalViews({newTaa->colorView(0),newTaa->colorView(1)});
+  auto newAo = std::make_unique<Gtao>(device_, swapChain.extent(),
+                                      newHdrOutput->sceneView(),
+                                      *newDepthResource.imageView);
+  auto newTaa = std::make_unique<TaaResolve>(
+      device_, swapChain.extent(), newHdrOutput->sceneView(),
+      *newDepthResource.imageView, *newMotionResource.imageView,
+      newAo->view(Gtao::Composite));
+  std::unique_ptr<RayTracingRenderer> newRt;
+  std::string rtReason = "RT Pipeline/BDA/indexing features not enabled or available";
+  if (device_.rayTracingSupported()) {
+    try {
+      newRt = std::make_unique<RayTracingRenderer>(device_, swapChain.extent(), framesInFlight_);
+      newHdrOutput->configureRayTracingView(newRt->view());
+      rtReason.clear();
+    } catch (std::exception const &error) {
+      rtReason = error.what();
+      std::cerr << "RT unavailable; retaining raster: " << rtReason << '\n';
+    }
+  }
+  newHdrOutput->configureTemporalViews({newTaa->colorView(0),
+                                        newTaa->colorView(1),
+                                        newAo->view(Gtao::Composite)});
   using std::swap;
+  swap(rayTracing_, newRt);
+  rtUnavailableReason_ = std::move(rtReason);
+  if (!rayTracing_) renderMethod_ = RenderMethod::Raster;
+  swap(gtao_, newAo);
+  lastAoActive_ = false;
   swap(taa_,newTaa);
   lastTaaActive_=false;
   swap(pipelineLayout_, newPipelineLayout);
@@ -214,7 +240,7 @@ void Renderer::recreateForSwapChain(SwapChain const &swapChain) {
   currentFrame_ = 0;
   activeFrame_.reset();
   activePass_ = ActivePass::eNone;
-  resourceStatistics_.pipelineBuilds += 13;
+  resourceStatistics_.pipelineBuilds += 16;
 }
 
 void Renderer::createPersistentResources() {
@@ -289,6 +315,10 @@ void Renderer::createFrameResources() {
   for (std::uint32_t index = 0; index < framesInFlight_; ++index) {
     FrameContext frame{};
     if (timestampBits_) {
+      frame.aoTimestamps = vk::raii::QueryPool(
+          device_.logicalDevice(),
+          vk::QueryPoolCreateInfo{.queryType = vk::QueryType::eTimestamp,
+                                  .queryCount = 6});
       frame.taaTimestamps=vk::raii::QueryPool(device_.logicalDevice(),vk::QueryPoolCreateInfo{.queryType=vk::QueryType::eTimestamp,.queryCount=2});
       frame.timestamps = vk::raii::QueryPool(
           device_.logicalDevice(),
@@ -332,6 +362,8 @@ Renderer::createGeometryResources(Mesh const &mesh, UploadBatch &uploads,
   auto upload = [this, &uploads, &scope]<typename T>(
                     std::vector<T> const &data, vk::BufferUsageFlags usage) {
     auto bytes = std::as_bytes(std::span(data));
+    if (device_.rayTracingSupported())
+      usage |= vk::BufferUsageFlagBits::eShaderDeviceAddress | vk::BufferUsageFlagBits::eAccelerationStructureBuildInputReadOnlyKHR;
     auto resources = device_.createBuffer(
         bytes.size_bytes(), vk::BufferUsageFlagBits::eTransferDst | usage,
         vk::MemoryPropertyFlagBits::eDeviceLocal, scope);
@@ -343,6 +375,7 @@ Renderer::createGeometryResources(Mesh const &mesh, UploadBatch &uploads,
       upload(mesh.vertices, vk::BufferUsageFlagBits::eVertexBuffer);
   resources.index = upload(mesh.indices, vk::BufferUsageFlagBits::eIndexBuffer);
   resources.indexCount = static_cast<std::uint32_t>(mesh.indices.size());
+  resources.vertexCount = static_cast<std::uint32_t>(mesh.vertices.size());
   resources.unitVertexAlpha = std::ranges::all_of(
       mesh.vertices, [](Vertex const &v) { return v.alpha == 1.0f; });
   return resources;
@@ -487,6 +520,8 @@ Renderer::PreparedScene Renderer::prepareScene(AssetLibrary const &assets) {
   for (auto const &mesh : assets.meshes) {
     if (mesh.vertices.empty() || mesh.indices.empty())
       throw std::runtime_error("Mesh has no vertices or indices.");
+    if (mesh.vertices.size() > std::numeric_limits<std::uint32_t>::max())
+      throw std::runtime_error("Mesh vertex count exceeds the RT address limit.");
     if (mesh.indices.size() > std::numeric_limits<std::uint32_t>::max())
       throw std::runtime_error("Mesh index count exceeds the draw limit.");
     for (auto index : mesh.indices)
@@ -501,12 +536,25 @@ Renderer::PreparedScene Renderer::prepareScene(AssetLibrary const &assets) {
   candidate->resourceScope_ =
       device_.resourceLedger().scope(ResourceLedger::Domain::PreparedScene);
   candidate->meshes_.reserve(assets.meshes.size());
-  for (auto const &mesh : assets.meshes)
-    candidate->meshes_.push_back(
-        createGeometryResources(mesh, uploads, candidate->resourceScope_));
+  bool opticalScene=std::ranges::any_of(assets.materials,[](auto const &m){return m.optical.enabled && m.optical.solid;});
+  for (auto const &mesh : assets.meshes) {
+    candidate->meshes_.push_back(createGeometryResources(mesh,uploads,candidate->resourceScope_));
+    if(opticalScene)candidate->meshes_.back().dielectric=classifyDielectricMesh(mesh);
+  }
   candidate->materials_ = std::make_unique<MaterialGpuStore>(
       device_, *materialDescriptorSetLayout_, assets.materials, textureCache_,
       uploads, candidate->resourceScope_);
+  candidate->materialCount_ = assets.materials.size();
+  candidate->rtTextureCount_ = rtTextures(nullptr,nullptr,nullptr,candidate->materials_.get(),candidate->materialCount_).size();
+  if (device_.rayTracingSupported()) {
+    std::vector<RtMeshInput> meshes;
+    for (std::size_t i=0;i<candidate->meshes_.size();++i) {
+      auto const &mesh=candidate->meshes_[i];
+      meshes.push_back({*mesh.vertex.buffer,*mesh.index.buffer,mesh.vertexCount,mesh.indexCount,
+          assets.meshes[i].vertices,assets.meshes[i].indices});
+    }
+    candidate->rtGeometry_ = std::make_unique<RayTracingGeometry>(device_, meshes, uploads, candidate->resourceScope_);
+  }
   return candidate;
 }
 
@@ -558,6 +606,7 @@ bool Renderer::commitScene(PreparedScene &candidate,
   }
   if (candidate->uploads_ && !candidate->uploads_->ready())
     return false;
+  if (candidate->rtGeometry_) candidate->rtGeometry_->uploadsCompleted();
   // Allocate the retirement entry before changing live state. The callback owns
   // a snapshot of old preview descriptors, not references to new UI containers.
   if (sceneAssets_ || retireSceneUi)
@@ -568,7 +617,10 @@ bool Renderer::commitScene(PreparedScene &candidate,
         ResourceLedger::Domain::RetiredScene);
   candidate->resourceScope_.setDomain(ResourceLedger::Domain::LiveScene);
   sceneAssets_.swap(candidate);
+  if (renderMethod_ == RenderMethod::RayTracing && !rayTracingAvailable())
+    renderMethod_ = RenderMethod::Raster;
   probeValid_ = false;
+  detailProbeValid_ = false;
   invalidateTemporalHistory();
   candidate.reset();
   ++resourceStatistics_.sceneCommits;
@@ -881,13 +933,33 @@ Renderer::FrameResult Renderer::beginFrameImpl(glm::mat4 const &viewProjMatrix,
   // resetting a fence. The retry therefore retains a usable frame slot.
   auto eye=viewProjMatrix*glm::vec4(cameraPosition,1);
   bool perspective=std::abs(eye.w)<1e-4f && glm::length(glm::vec3(viewProjMatrix[0][3],viewProjMatrix[1][3],viewProjMatrix[2][3]))>.5f;
-  bool activeTaa=taaEnabled_ && perspective && lighting.pbrDebugMode==0 && lighting.shadowDebugMode<2;
+  bool activeAo = renderMethod_ == RenderMethod::Raster && aoSettings_.enabled && perspective &&
+                  lighting.pbrDebugMode == 0 && lighting.shadowDebugMode < 2;
+  bool activeTaa =
+      renderMethod_ == RenderMethod::Raster && taaEnabled_ && (!activeAo || aoSettings_.debug == AoDebug::None) &&
+      perspective && lighting.pbrDebugMode == 0 && lighting.shadowDebugMode < 2;
   if(activeTaa!=lastTaaActive_){temporalHistory_.reset();taa_->reset();}
   lastTaaActive_=activeTaa;
+  if (activeAo != lastAoActive_)
+    taa_->reset();
+  lastAoActive_ = activeAo;
+  if (activeAo && aoSettings_.debug != AoDebug::None) {
+    display.exposureEv = 0;
+    display.toneMap = false;
+  }
   auto temporal = temporalHistory_.prepare(viewProjMatrix, cameraPosition,
-      swapChain_->extent().width, swapChain_->extent().height, activeTaa || (temporalJitterEnabled_ && !taaEnabled_), objects);
+      swapChain_->extent().width, swapChain_->extent().height, activeTaa || (renderMethod_ == RenderMethod::Raster && temporalJitterEnabled_ && !taaEnabled_), objects);
   if (temporal.gpu.size() > device_.physicalDevice().getProperties().limits.maxStorageBufferRange / sizeof(MotionObjectGpu))
     throw std::runtime_error("Motion snapshot exceeds storage buffer range");
+  if (renderMethod_ == RenderMethod::RayTracing) {
+    rtLighting_ = lighting;
+    rtShadows_ = shadowPassEnabled;
+    shadowPassEnabled = false;
+    rtPush_.inverseViewProjection = glm::inverse(viewProjMatrix);
+    rtPush_.camera = glm::vec4(cameraPosition, 1);
+    rtPush_.options.y = unsigned(rasterizerDebugSettings_.cullMode);
+    rtPush_.options.z = rasterizerDebugSettings_.frontFace == vk::FrontFace::eClockwise;
+  }
   auto lights = packPunctualLights(
       lighting.punctualLights,
       device_.physicalDevice().getProperties().limits.maxStorageBufferRange);
@@ -899,7 +971,7 @@ Renderer::FrameResult Renderer::beginFrameImpl(glm::mat4 const &viewProjMatrix,
   auto const &limits = device_.physicalDevice().getProperties().limits;
   auto grid = makeClusterGrid(viewProjMatrix, cameraPosition, swapChain_->extent().width,
       swapChain_->extent().height, limits.maxStorageBufferRange, limits.maxComputeWorkGroupCount[0],
-      lighting.clusteredLights && clusterSupported_ && !lights.lights.empty());
+      renderMethod_ == RenderMethod::Raster && lighting.clusteredLights && clusterSupported_ && !lights.lights.empty());
   if (grid.screen.z) grid.inverseViewProj = glm::inverse(temporal.camera.rasterViewProj);
   displaySettings_ = display;
   std::uint32_t const frameIndex = currentFrame_;
@@ -914,7 +986,17 @@ Renderer::FrameResult Renderer::beginFrameImpl(glm::mat4 const &viewProjMatrix,
                               .count();
   collectFrameTimings(frame);
   collectCompletedWork();
+  frame.rayTracing = renderMethod_ == RenderMethod::RayTracing;
   frame.taaEnabled=activeTaa;
+  frame.aoEnabled = activeAo;
+  aoPush_ = {.inverseRaster = glm::inverse(temporal.camera.rasterViewProj),
+             .camera = glm::vec4(cameraPosition, 1),
+             .settings = {aoSettings_.radius, aoSettings_.strength,
+                          float(aoSettings_.debug), 128},
+             .screen = {float(swapChain_->extent().width),
+                        float(swapChain_->extent().height), 0, 0}};
+  frame.cameraPosition=cameraPosition;
+  frame.shadowReceiverCullingAllowed=lighting.shadowDebugMode<2;
   taaPush_={.inverseRaster=glm::inverse(temporal.camera.rasterViewProj),
     .depthRow={viewProjMatrix[0][3],viewProjMatrix[1][3],viewProjMatrix[2][3],viewProjMatrix[3][3]},
     .jitterWeight={temporal.camera.jitterUv.x,temporal.camera.jitterUv.y,.1f,float(taaHistoryFilter_)},
@@ -983,6 +1065,8 @@ Renderer::FrameResult Renderer::beginFrameImpl(glm::mat4 const &viewProjMatrix,
   frame.uiEnabled = activeGraph_->uiPass.has_value();
   if (*frame.timestamps)
     commandBuffer.resetQueryPool(*frame.timestamps, 0, 12);
+  if (activeAo && *frame.aoTimestamps)
+    commandBuffer.resetQueryPool(*frame.aoTimestamps, 0, 6);
   if(activeTaa && *frame.taaTimestamps) commandBuffer.resetQueryPool(*frame.taaTimestamps,0,2);
   activeFrame_ = ActiveFrameState{frameIndex, imageIndex, acquireResult};
   activePass_ = ActivePass::eNone;
@@ -1020,6 +1104,13 @@ void Renderer::recordObject(MeshId meshId, MaterialId materialId,
       .alphaParams = materialResource.alphaParams,
       .shadowPass = {activeShadowIndex_, int(motionIndex), 0, 0},
   };
+  if (materialResource.optical.enabled) {
+    bool solid=materialResource.optical.solid && meshResources.dielectric.solid;
+    float local=solid ? (materialResource.optical.thickness>0 ? materialResource.optical.thickness : meshResources.dielectric.boxThickness) : materialResource.optical.thickness;
+    float scale=std::max({glm::length(glm::vec3(modelMatrix[0])),glm::length(glm::vec3(modelMatrix[1])),glm::length(glm::vec3(modelMatrix[2]))});
+    pushConstants.shadowPass.z=std::bit_cast<std::int32_t>(local*scale);
+    pushConstants.shadowPass.w=int(solid);
+  }
   if (!normalMapsEnabled_) {
     pushConstants.surfaceParams.z = 0.0f;
   }
@@ -1062,8 +1153,14 @@ void Renderer::recordObject(MeshId meshId, MaterialId materialId,
     throw std::runtime_error("Renderer has no active draw pass.");
   }
 
+  // Probe refraction already includes the background. Full optical coverage
+  // needs the nearest surface, independent of triangle order. Capture still
+  // uses alpha blending for its direct-only opacity approximation.
+  bool opticalDepth = materialResource.optical.enabled &&
+                      materialResource.optical.coverage != 2 &&
+                      (frames_[frameState.frameIndex].indoor.counts.w & 2u) == 0;
   MaterialPipelineVariant const variant =
-      selectMaterialPipeline(materialResource.alphaMode,
+      selectMaterialPipeline(opticalDepth ? AlphaMode::Opaque : materialResource.alphaMode,
                              materialResource.doubleSided, RasterPass::Main);
   vk::raii::Pipeline const *pipeline = nullptr;
   switch (variant) {
@@ -1165,6 +1262,7 @@ Renderer::FrameResult Renderer::finishFrame(SceneDrawList const &scene) {
   auto &frame = frames_[frameState.frameIndex];
   auto &commandBuffer = commandBuffers_[frameState.frameIndex];
 
+  if (renderMethod_ == RenderMethod::RayTracing) prepareRayTracing(scene);
   recordGraph(scene);
 
   vk::Semaphore waitSemaphore = *frame.imageAvailableSemaphore;
@@ -1189,11 +1287,16 @@ Renderer::FrameResult Renderer::finishFrame(SceneDrawList const &scene) {
   device_.graphicsQueue().submit({submitInfo}, *frame.inFlightFence);
   auto const &graph = *activeGraph_;
   if (graph.clusterPass) frame.clusterState = graph.plan.finalBufferState(graph.clusterIndices);
+  if (graph.rayTracing) {
+    rayTracing_->submitted(graph.plan, graph.hdr);
+  } else {
   imageStates_.shadow = graph.plan.finalState(graph.shadow);
   imageStates_.depth = graph.plan.finalState(graph.depth);
   imageStates_.hdr = graph.plan.finalState(graph.hdr);
   imageStates_.motion = graph.plan.finalState(graph.motion);
+  gtao_->submitted(graph.plan, graph.diffuse, graph.ao ? &*graph.ao : nullptr);
   if(graph.taa)taa_->submitted(graph.plan,*graph.taa);
+  }
   imageStates_.output[frameState.imageIndex] =
       graph.plan.finalState(graph.output);
   onFrameSubmitted(frame);
@@ -1454,9 +1557,10 @@ vk::raii::Pipeline Renderer::createEnvironmentPipeline(
           vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
           vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA,
   };
-  std::array colorBlendAttachments{colorBlendAttachment, colorBlendAttachment};
+  std::array colorBlendAttachments{colorBlendAttachment, colorBlendAttachment,
+                                   colorBlendAttachment};
   vk::PipelineColorBlendStateCreateInfo colorBlending{
-      .attachmentCount = 2,
+      .attachmentCount = 3,
       .pAttachments = colorBlendAttachments.data(),
   };
   std::array dynamicStates = {vk::DynamicState::eViewport,
@@ -1465,9 +1569,10 @@ vk::raii::Pipeline Renderer::createEnvironmentPipeline(
       .dynamicStateCount = static_cast<std::uint32_t>(dynamicStates.size()),
       .pDynamicStates = dynamicStates.data(),
   };
-  std::array colorAttachmentFormats{HdrOutput::sceneFormat, kMotionFormat};
+  std::array colorAttachmentFormats{HdrOutput::sceneFormat, kMotionFormat,
+                                    HdrOutput::sceneFormat};
   vk::PipelineRenderingCreateInfo renderingInfo{
-      .colorAttachmentCount = 2,
+      .colorAttachmentCount = 3,
       .pColorAttachmentFormats = colorAttachmentFormats.data(),
       .depthAttachmentFormat = kDepthFormat,
   };
@@ -1568,10 +1673,11 @@ Renderer::createGraphicsPipeline(SwapChain const &swapChain,
           vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
           vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA,
   };
-  std::array colorBlendAttachments{colorBlendAttachment, colorBlendAttachment};
+  std::array colorBlendAttachments{colorBlendAttachment, colorBlendAttachment,
+                                   colorBlendAttachment};
   vk::PipelineColorBlendStateCreateInfo colorBlending{
       .logicOpEnable = false,
-      .attachmentCount = 2,
+      .attachmentCount = 3,
       .pAttachments = colorBlendAttachments.data(),
   };
 
@@ -1592,9 +1698,10 @@ Renderer::createGraphicsPipeline(SwapChain const &swapChain,
       .pDynamicStates = dynamicStates.data(),
   };
 
-  std::array colorAttachmentFormats{HdrOutput::sceneFormat, kMotionFormat};
+  std::array colorAttachmentFormats{HdrOutput::sceneFormat, kMotionFormat,
+                                    HdrOutput::sceneFormat};
   vk::PipelineRenderingCreateInfo pipelineRenderingCreateInfo{
-      .colorAttachmentCount = 2,
+      .colorAttachmentCount = 3,
       .pColorAttachmentFormats = colorAttachmentFormats.data(),
       .depthAttachmentFormat = kDepthFormat,
   };
@@ -1695,10 +1802,11 @@ vk::raii::Pipeline Renderer::createTransparentPipeline(
           vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
           vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA,
   };
-  std::array colorBlendAttachments{colorBlendAttachment, colorBlendAttachment};
+  std::array colorBlendAttachments{colorBlendAttachment, colorBlendAttachment,
+                                   colorBlendAttachment};
   vk::PipelineColorBlendStateCreateInfo colorBlending{
       .logicOpEnable = false,
-      .attachmentCount = 2,
+      .attachmentCount = 3,
       .pAttachments = colorBlendAttachments.data(),
   };
 
@@ -1719,9 +1827,10 @@ vk::raii::Pipeline Renderer::createTransparentPipeline(
       .pDynamicStates = dynamicStates.data(),
   };
 
-  std::array colorAttachmentFormats{HdrOutput::sceneFormat, kMotionFormat};
+  std::array colorAttachmentFormats{HdrOutput::sceneFormat, kMotionFormat,
+                                    HdrOutput::sceneFormat};
   vk::PipelineRenderingCreateInfo pipelineRenderingCreateInfo{
-      .colorAttachmentCount = 2,
+      .colorAttachmentCount = 3,
       .pColorAttachmentFormats = colorAttachmentFormats.data(),
       .depthAttachmentFormat = kDepthFormat,
   };
@@ -1822,10 +1931,11 @@ vk::raii::Pipeline Renderer::createDebugLinePipeline(
           vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
           vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA,
   };
-  std::array colorBlendAttachments{colorBlendAttachment, colorBlendAttachment};
+  std::array colorBlendAttachments{colorBlendAttachment, colorBlendAttachment,
+                                   colorBlendAttachment};
   vk::PipelineColorBlendStateCreateInfo colorBlending{
       .logicOpEnable = false,
-      .attachmentCount = 2,
+      .attachmentCount = 3,
       .pAttachments = colorBlendAttachments.data(),
   };
 
@@ -1846,9 +1956,10 @@ vk::raii::Pipeline Renderer::createDebugLinePipeline(
       .pDynamicStates = dynamicStates.data(),
   };
 
-  std::array colorAttachmentFormats{HdrOutput::sceneFormat, kMotionFormat};
+  std::array colorAttachmentFormats{HdrOutput::sceneFormat, kMotionFormat,
+                                    HdrOutput::sceneFormat};
   vk::PipelineRenderingCreateInfo pipelineRenderingCreateInfo{
-      .colorAttachmentCount = 2,
+      .colorAttachmentCount = 3,
       .pColorAttachmentFormats = colorAttachmentFormats.data(),
       .depthAttachmentFormat = kDepthFormat,
   };
@@ -2100,7 +2211,7 @@ void Renderer::onFrameSubmitted(FrameContext &frame) {
 void Renderer::collectFrameTimings(FrameContext &frame) {
   if (!frame.submitted)
     return;
-  GpuTimings result{.frameId = frame.frameId, .clustered = frame.clusterEnabled};
+  GpuTimings result{.frameId = frame.frameId, .clustered = frame.clusterEnabled, .rayTracing = frame.rayTracing};
   if (*frame.timestamps) {
     std::array<std::uint64_t, 24> values{};
     unsigned count = frame.clusterEnabled ? 12 : 10;
@@ -2128,6 +2239,27 @@ void Renderer::collectFrameTimings(FrameContext &frame) {
     result.cullingMs = frame.clusterEnabled ? elapsed(10, 11) : 0;
     result.outputMs = elapsed(5, 6);
     result.uiMs = frame.uiEnabled ? elapsed(7, 8) : 0;
+    if (frame.aoEnabled) {
+      std::array<std::uint64_t, 12> v{};
+      auto status = vkGetQueryPoolResults(
+          static_cast<VkDevice>(device_.deviceHandle()),
+          static_cast<VkQueryPool>(*frame.aoTimestamps), 0, 6, sizeof(v),
+          v.data(), 16,
+          VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+      if (status != VK_SUCCESS)
+        throw std::runtime_error("Completed AO query unavailable");
+      for (unsigned i = 0; i < 6; ++i)
+        if (!v[i * 2 + 1])
+          throw std::runtime_error("Completed AO query unavailable");
+      result.aoMs =
+          timestampMilliseconds(v[0], v[10], timestampBits_, timestampPeriod_);
+      result.aoHorizonMs =
+          timestampMilliseconds(v[0], v[2], timestampBits_, timestampPeriod_);
+      result.aoFilterMs =
+          timestampMilliseconds(v[4], v[6], timestampBits_, timestampPeriod_);
+      result.aoCompositeMs =
+          timestampMilliseconds(v[8], v[10], timestampBits_, timestampPeriod_);
+    }
     if(frame.taaEnabled){std::array<std::uint64_t,4> v{};
       auto status=vkGetQueryPoolResults(static_cast<VkDevice>(device_.deviceHandle()),static_cast<VkQueryPool>(*frame.taaTimestamps),0,2,sizeof(v),v.data(),16,VK_QUERY_RESULT_64_BIT|VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
       if(status!=VK_SUCCESS||!v[1]||!v[3])throw std::runtime_error("Completed TAA query unavailable");
@@ -2156,6 +2288,7 @@ void Renderer::collectCompletedWork() {
   }
   std::erase_if(pendingSceneUploads_, [](auto const &candidate) {
     if (!candidate->uploads_ || candidate->uploads_->ready()) {
+      if (candidate->rtGeometry_) candidate->rtGeometry_->uploadsCompleted();
       candidate->uploads_.reset();
       return true;
     }

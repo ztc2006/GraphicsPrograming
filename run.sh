@@ -23,9 +23,13 @@ Relative model paths are resolved from the caller's current directory.
   --debug        Run under gdb.
   --build        Explicitly request the default build behavior.
   --release      Configure an optimized Release build.
+  --render-method raster|ray-tracing
   --benchmark DIR --warmup S --duration S --size WIDTHxHEIGHT
   --frames-in-flight 1|2 --present-sync auto|fence|legacy
   --light-culling full|clustered --lighting-preset auto|asset|kitchen
+  --camera-culling on|off --shadow-culling on|off (default on)
+  --ao on|off --ao-radius R --ao-strength S --ao-debug none|raw|filtered
+  --no-taa --taa-history bilinear|catmull-rom
   --camera-path static|orbit --present auto|fifo|mailbox|immediate
   --gpu NAME --no-ui --validation are forwarded to the viewer.
 EOF
@@ -39,10 +43,10 @@ while (($#)); do
     --benchmark)
       (($# >= 2)) || fail "$1 requires an output directory"
       VIEWER_ARGS+=("$1" "$(realpath -m -- "$2")"); shift ;;
-    --warmup|--duration|--size|--camera-path|--light-culling|--lighting-preset|--present|--gpu|--frames-in-flight|--present-sync)
+    --warmup|--duration|--size|--camera-path|--light-culling|--lighting-preset|--present|--gpu|--frames-in-flight|--present-sync|--camera-culling|--shadow-culling|--taa-history|--render-method|--ao|--ao-radius|--ao-strength|--ao-debug)
       (($# >= 2)) || fail "$1 requires a value"
       VIEWER_ARGS+=("$1" "$2"); shift ;;
-    --no-ui|--validation) VIEWER_ARGS+=("$1") ;;
+    --no-ui|--validation|--no-taa) VIEWER_ARGS+=("$1") ;;
     --build-only|build) BUILD=true; BUILD_ONLY=true ;;
     -d|--debug|debug) DEBUG=true ;;
     run) ;;

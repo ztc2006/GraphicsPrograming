@@ -25,6 +25,7 @@ layout(set = 0, binding = 3) uniform sampler2D environmentTexture;
 layout(location = 0) in vec2 inUv;
 layout(location = 0) out vec4 outFragColor;
 layout(location=1) out vec4 outMotion;
+layout(location=2) out vec4 outIndirectDiffuse;
 
 const vec2 INV_ATAN = vec2(0.15915494309, 0.31830988618);
 
@@ -36,6 +37,7 @@ vec2 directionToEquirectangularUv(vec3 direction) {
 
 
 void main() {
+  outIndirectDiffuse=vec4(0);
   vec2 ndc = inUv * 2.0 - 1.0;
   vec4 nearPoint = ubo.inverseViewProj * vec4(ndc, 0.0, 1.0);
   nearPoint /= nearPoint.w;

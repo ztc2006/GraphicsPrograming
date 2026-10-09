@@ -7,7 +7,7 @@ void Renderer::validateDrawItem(DrawItem const &item, bool caster) const {
   if (!sceneAssets_ || item.meshId >= sceneAssets_->meshes_.size())
     throw std::runtime_error("Renderer mesh id is out of range");
   auto const &material = materials().material(item.materialId);
-  if (caster && material.alphaMode == AlphaMode::Blend)
+  if (caster && material.alphaMode == AlphaMode::Blend && !(renderMethod_==RenderMethod::RayTracing && material.optical.enabled))
     throw std::runtime_error("Transparent materials cannot be shadow casters");
   for (unsigned col = 0; col < 4; ++col)
     for (unsigned row = 0; row < 4; ++row)
@@ -46,6 +46,19 @@ Renderer::FrameResult Renderer::renderFrame(SceneDrawList const &scene,
           found->second->model != item.modelMatrix)
         throw std::runtime_error("Visible temporal instance differs from complete scene");
     }
+  if (renderMethod_ == RenderMethod::RayTracing) {
+    if (!sceneAssets_ || !sceneAssets_->rtGeometry_)
+      throw std::runtime_error("No committed RT geometry");
+    auto properties=device_.physicalDevice().getProperties2<vk::PhysicalDeviceProperties2,vk::PhysicalDeviceAccelerationStructurePropertiesKHR>();
+    auto limit=std::min<std::uint64_t>(0xffffff,properties.get<vk::PhysicalDeviceAccelerationStructurePropertiesKHR>().maxInstanceCount);
+    if (objects.size()>limit || objects.size()>device_.physicalDevice().getProperties().limits.maxStorageBufferRange/RayTracingRenderer::instanceBytes)
+      throw std::runtime_error("RT scene instance count exceeds device limits");
+    for (auto const &object : objects) {
+      auto const &m=object.model;
+      if (std::abs(glm::determinant(m))<1e-12f || m[0][3]!=0 || m[1][3]!=0 || m[2][3]!=0 || m[3][3]!=1)
+        throw std::runtime_error("RT requires invertible affine instance transforms");
+    }
+  }
   auto result = beginFrameImpl(viewProj, camera, lighting, shadows, objects);
   if (result != FrameResult::eSuccess) return result;
   return finishFrame(scene);
@@ -75,6 +88,7 @@ RenderGraph::State const &Renderer::hdrState() const {
   return activeGraph_ ? activeGraph_->plan.recordedState(activeGraph_->hdr) : imageStates_.hdr;
 }
 Renderer::FrameGraph Renderer::buildFrameGraph(std::uint32_t imageIndex, bool shadows) const {
+  if (renderMethod_ == RenderMethod::RayTracing) return buildRayTracingGraph(imageIndex);
   using G = RenderGraph;
   G graph;
   FrameGraph frame;
@@ -98,6 +112,7 @@ Renderer::FrameGraph Renderer::buildFrameGraph(std::uint32_t imageIndex, bool sh
       *swapChain_->imageViews()[imageIndex], swapChain_->imageFormat(), swapChain_->extent(),
       vk::ImageAspectFlagBits::eColor, vk::ImageUsageFlagBits::eColorAttachment,
       true, imageStates_.output[imageIndex]});
+  frame.diffuse = gtao_->importDiffuse(graph);
   auto const &slot = frames_[currentFrame_];
   G::BufferState host{vk::PipelineStageFlagBits2::eHost, vk::AccessFlagBits2::eHostWrite, true};
   auto lights = graph.importBuffer({"Punctual lights", *slot.punctualLights.buffer, 0,
@@ -126,16 +141,31 @@ Renderer::FrameGraph Renderer::buildFrameGraph(std::uint32_t imageIndex, bool sh
     frame.shadowPass = graph.addPass(shadows ? "Shadow" : "Shadow initialization", {
         {frame.shadow, G::Usage::DepthAttachment, vk::AttachmentLoadOp::eClear,
          vk::AttachmentStoreOp::eStore, false, farDepth}}, {{indoor, G::BufferUsage::VertexRead}});
-  frame.mainPass = graph.addPass("Main scene (sky + opaque + mask + blend + debug)", {
-      {frame.shadow, G::Usage::SampledDepth},
-      {frame.hdr, G::Usage::ColorAttachment, vk::AttachmentLoadOp::eClear,
-       vk::AttachmentStoreOp::eStore, false, background},
-      {frame.motion, G::Usage::ColorAttachment, vk::AttachmentLoadOp::eClear,
-       vk::AttachmentStoreOp::eStore, false, vk::ClearValue{.color=vk::ClearColorValue{std::array<float,4>{0,0,0,0}}}},
-      {frame.depth, G::Usage::DepthAttachment, vk::AttachmentLoadOp::eClear,
-       vk::AttachmentStoreOp::eStore, false, farDepth}}, std::move(mainBuffers));
+  frame.mainPass = graph.addPass(
+      "Main scene (sky + opaque + mask + blend + debug)",
+      {{frame.shadow, G::Usage::SampledDepth},
+       {frame.hdr, G::Usage::ColorAttachment, vk::AttachmentLoadOp::eClear,
+        vk::AttachmentStoreOp::eStore, false, background},
+       {frame.motion, G::Usage::ColorAttachment, vk::AttachmentLoadOp::eClear,
+        vk::AttachmentStoreOp::eStore, false,
+        vk::ClearValue{
+            .color = vk::ClearColorValue{std::array<float, 4>{0, 0, 0, 0}}}},
+       {frame.diffuse, G::Usage::ColorAttachment, vk::AttachmentLoadOp::eClear,
+        vk::AttachmentStoreOp::eStore, false,
+        vk::ClearValue{
+            .color = vk::ClearColorValue{std::array<float, 4>{0, 0, 0, 0}}}},
+       {frame.depth, G::Usage::DepthAttachment, vk::AttachmentLoadOp::eClear,
+        vk::AttachmentStoreOp::eStore, false, farDepth}},
+      std::move(mainBuffers));
   auto displayInput=frame.hdr;
-  if(slot.taaEnabled){frame.taa=taa_->addPass(graph,frame.hdr,frame.depth,frame.motion);displayInput=frame.taa->color[frame.taa->write];}
+  if (slot.aoEnabled) {
+    frame.ao = gtao_->addPasses(graph, frame.hdr, frame.depth, frame.diffuse);
+    displayInput = frame.ao->images[Gtao::Composite];
+  }
+  if (slot.taaEnabled) {
+    frame.taa = taa_->addPass(graph, displayInput, frame.depth, frame.motion);
+    displayInput = frame.taa->color[frame.taa->write];
+  }
   frame.outputPass = graph.addPass("Display output (exposure + filmic + sRGB)", {
       {displayInput, G::Usage::SampledColor},
       {frame.output, G::Usage::ColorAttachment, vk::AttachmentLoadOp::eDontCare,
@@ -158,27 +188,48 @@ void Renderer::recordGraph(SceneDrawList const &scene) {
   timestamp(command, 0);
   if (!graph.shadowPass) { timestamp(command, 1); timestamp(command, 2); }
   graph.plan.record(*command, [&](RenderGraph::Pass const &pass, RenderGraph::Event event) {
+    bool rtBuild = graph.rtBuildPass && pass.id == *graph.rtBuildPass;
     bool cluster = graph.clusterPass && pass.id == *graph.clusterPass;
     bool shadow = graph.shadowPass && pass.id == *graph.shadowPass;
     bool main = pass.id == graph.mainPass;
     bool output = pass.id == graph.outputPass;
+    int aoPass = !graph.ao                        ? -1
+                 : pass.id == graph.ao->horizon   ? 0
+                 : pass.id == graph.ao->filter    ? 1
+                 : pass.id == graph.ao->composite ? 2
+                                                  : -1;
     bool temporal=graph.taa && pass.id==graph.taa->resolve;
     unsigned firstQuery = cluster ? 10 : shadow ? 1 : main ? 3 : output ? 5 : 7;
     if (event == RenderGraph::Event::Begin) {
       device_.beginLabel(*command, pass.name.c_str());
-      if(temporal){if(*frames_[state.frameIndex].taaTimestamps)command.writeTimestamp2(vk::PipelineStageFlagBits2::eBottomOfPipe,*frames_[state.frameIndex].taaTimestamps,0);}
-      else if(cluster||shadow||main||output||(graph.uiPass&&pass.id==*graph.uiPass))timestamp(command, firstQuery);
+      if (aoPass >= 0) {
+        if (*frames_[state.frameIndex].aoTimestamps)
+          command.writeTimestamp2(vk::PipelineStageFlagBits2::eBottomOfPipe,
+                                  *frames_[state.frameIndex].aoTimestamps,
+                                  unsigned(aoPass) * 2);
+      } else if (temporal) {
+        if (*frames_[state.frameIndex].taaTimestamps)
+          command.writeTimestamp2(vk::PipelineStageFlagBits2::eBottomOfPipe,
+                                  *frames_[state.frameIndex].taaTimestamps, 0);
+      } else if (cluster || shadow || main || output ||
+                 (graph.uiPass && pass.id == *graph.uiPass))
+        if (!(main && graph.rayTracing)) timestamp(command, firstQuery);
+      if (rtBuild) timestamp(command, 3);
       activePass_ = shadow ? ActivePass::eShadow : main ? ActivePass::eMain : ActivePass::eNone;
       if (cluster) {
         command.bindPipeline(vk::PipelineBindPoint::eCompute, *clusterPipeline_);
         command.bindDescriptorSets(vk::PipelineBindPoint::eCompute, *clusterPipelineLayout_, 0,
                                    {frames_[state.frameIndex].descriptorSet}, {});
       }
-      if (shadow || main)
+      if (shadow || (main && !graph.rayTracing))
         command.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *pipelineLayout_, 0,
                                    {frames_[state.frameIndex].descriptorSet}, {});
     } else if (event == RenderGraph::Event::Draw) {
-      if (cluster) {
+      if (rtBuild) {
+        rayTracing_->build(*command, state.frameIndex);
+      } else if (main && graph.rayTracing) {
+        rayTracing_->trace(*command, state.frameIndex, rtPush_);
+      } else if (cluster) {
         command.dispatch((frames_[state.frameIndex].clusterGrid.grid.w + 63) / 64, 1, 1);
       } else if (shadow) {
         if (!requestedShadows_) return; // The graph still records the clear and store.
@@ -187,6 +238,8 @@ void Renderer::recordGraph(SceneDrawList const &scene) {
         if (scene.sky) recordEnvironment();
         for (auto list : {scene.opaque, scene.mask, scene.transparent})
           for (auto const &item : list) {
+            if (!item.primaryVisible)
+              continue;
             std::uint32_t index = 0;
             auto const &temporal = frames_[state.frameIndex].temporal;
             if (temporal) {
@@ -198,22 +251,39 @@ void Renderer::recordGraph(SceneDrawList const &scene) {
           }
         if (scene.bounds)
           for (auto list : {scene.opaque, scene.mask, scene.transparent})
-            for (auto const &item : list) if (item.worldBounds.valid) {
-              recordAabb(item.worldBounds, {.1f, .95f, .65f, .95f});
-              ++drawStatistics_.debug;
-            }
+            for (auto const &item : list)
+              if (item.primaryVisible && item.worldBounds.valid) {
+                recordAabb(item.worldBounds, {.1f, .95f, .65f, .95f});
+                ++drawStatistics_.debug;
+              }
         for (auto const &box : queuedBoxes_) {
           recordAabb(box.bounds, box.color);
           ++drawStatistics_.debug;
         }
-      } else if(temporal){taa_->draw(*command,taaPush_);
+      } else if (aoPass >= 0) {
+        gtao_->draw(*command, unsigned(aoPass), aoPush_);
+      } else if (temporal) {
+        taa_->draw(*command, taaPush_, graph.ao.has_value());
       } else if (output) {
-        hdrOutput_->drawDisplay(*command, displaySettings_,graph.taa?int(graph.taa->write):-1);
+        hdrOutput_->drawDisplay(*command, displaySettings_,
+                                graph.rayTracing ? 3 : graph.taa  ? int(graph.taa->write)
+                                : graph.ao ? 2
+                                           : -1);
       } else if (graph.uiPass && pass.id == *graph.uiPass && uiDrawCallback_)
         uiDrawCallback_(*command);
     } else {
-      if(temporal){if(*frames_[state.frameIndex].taaTimestamps)command.writeTimestamp2(vk::PipelineStageFlagBits2::eBottomOfPipe,*frames_[state.frameIndex].taaTimestamps,1);}
-      else if(cluster||shadow||main||output||(graph.uiPass&&pass.id==*graph.uiPass))timestamp(command, firstQuery + 1);
+      if (aoPass >= 0) {
+        if (*frames_[state.frameIndex].aoTimestamps)
+          command.writeTimestamp2(vk::PipelineStageFlagBits2::eBottomOfPipe,
+                                  *frames_[state.frameIndex].aoTimestamps,
+                                  unsigned(aoPass) * 2 + 1);
+      } else if (temporal) {
+        if (*frames_[state.frameIndex].taaTimestamps)
+          command.writeTimestamp2(vk::PipelineStageFlagBits2::eBottomOfPipe,
+                                  *frames_[state.frameIndex].taaTimestamps, 1);
+      } else if (cluster || shadow || main || output ||
+                 (graph.uiPass && pass.id == *graph.uiPass))
+        timestamp(command, firstQuery + 1);
       device_.endLabel(*command);
       activePass_ = ActivePass::eNone;
       if (output && !graph.uiPass) { timestamp(command, 7); timestamp(command, 8); }

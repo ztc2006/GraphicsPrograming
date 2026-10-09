@@ -156,7 +156,8 @@ TextureResources TextureLoader::createFromHdrPixels(std::span<float const> rgba,
 TextureResources TextureLoader::createFromHdrCube(std::span<float const> rgba,
                                                   std::uint32_t faceSize,
                                                   UploadBatch &batch, unsigned cubes) const {
-  if (cubes < 1 || cubes > 2) throw std::runtime_error("HDR cube array requires one or two cubes");
+  if (cubes < 1 || cubes > 3)
+    throw std::runtime_error("HDR cube array requires one to three cubes");
   auto levels = textureMipLayout(faceSize, faceSize, 16, true);
   for (auto &level : levels) {
     level.offset *= 6 * cubes;

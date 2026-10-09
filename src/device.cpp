@@ -14,10 +14,10 @@ Device::Device(vk::raii::Instance const &instance,
                vk::raii::SurfaceKHR const &surface,
                std::vector<char const *> requiredDeviceExtensions,
                std::string preferredGpu, bool debugUtils,
-               PresentationInstanceSupport presentationInstance, PresentationPolicy presentationPolicy)
+               PresentationInstanceSupport presentationInstance, PresentationPolicy presentationPolicy, bool allowRayTracing)
     : instance_(instance), surface_(surface),
       requiredDeviceExtensions_(std::move(requiredDeviceExtensions)),
-      preferredGpu_(std::move(preferredGpu)), debugUtils_(debugUtils),
+      preferredGpu_(std::move(preferredGpu)), debugUtils_(debugUtils), allowRayTracing_(allowRayTracing),
       presentationInstance_(presentationInstance), presentationPolicy_(presentationPolicy), gpuAllocator_(*this) {
   pickPhysicalDevice();
   createLogicalDevice();
@@ -202,6 +202,26 @@ void Device::createLogicalDevice() {
   auto has = [&](char const *name) {
     return std::ranges::any_of(extensions, [&](auto const &e) { return std::strcmp(e.extensionName, name) == 0; });
   };
+  if (allowRayTracing_ && has(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME) &&
+      has(VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME) &&
+      has(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME)) {
+    auto rt = physicalDevice_.getFeatures2<vk::PhysicalDeviceFeatures2,
+        vk::PhysicalDeviceVulkan12Features,
+        vk::PhysicalDeviceAccelerationStructureFeaturesKHR,
+        vk::PhysicalDeviceRayTracingPipelineFeaturesKHR>();
+    auto const &v12 = rt.get<vk::PhysicalDeviceVulkan12Features>();
+    rayTracingSupported_ = rt.get<vk::PhysicalDeviceAccelerationStructureFeaturesKHR>().accelerationStructure &&
+        rt.get<vk::PhysicalDeviceRayTracingPipelineFeaturesKHR>().rayTracingPipeline &&
+        v12.bufferDeviceAddress && v12.scalarBlockLayout && v12.runtimeDescriptorArray &&
+        v12.shaderSampledImageArrayNonUniformIndexing &&
+        rt.get<vk::PhysicalDeviceFeatures2>().features.shaderInt64;
+    if (rayTracingSupported_)
+      for (auto name : {VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME,
+                        VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME,
+                        VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME})
+        if (std::ranges::none_of(requiredDeviceExtensions_, [&](auto p) { return std::strcmp(p, name) == 0; }))
+          requiredDeviceExtensions_.push_back(name);
+  }
   PresentationDeviceSupport present{has(vk::KHRSwapchainMaintenance1ExtensionName),
                                     has(vk::EXTSwapchainMaintenance1ExtensionName), false};
   if (presentationPolicy_ != PresentationPolicy::Legacy &&
@@ -220,10 +240,12 @@ void Device::createLogicalDevice() {
   vk::StructureChain<vk::PhysicalDeviceFeatures2,
                      vk::PhysicalDeviceVulkan12Features,
                      vk::PhysicalDeviceVulkan13Features,
-                     vk::PhysicalDeviceSwapchainMaintenance1FeaturesKHR> featureChain = {
+                     vk::PhysicalDeviceSwapchainMaintenance1FeaturesKHR,
+                     vk::PhysicalDeviceAccelerationStructureFeaturesKHR,
+                     vk::PhysicalDeviceRayTracingPipelineFeaturesKHR> featureChain = {
       {}, {.timelineSemaphore = timelineSemaphoreSupported_},
       {.synchronization2 = true, .dynamicRendering = true},
-      {.swapchainMaintenance1 = presentationSupport_.fencesEnabled()}};
+      {.swapchainMaintenance1 = presentationSupport_.fencesEnabled()}, {}, {}};
   if (!presentationSupport_.fencesEnabled())
     featureChain.unlink<vk::PhysicalDeviceSwapchainMaintenance1FeaturesKHR>();
   featureChain.get<vk::PhysicalDeviceFeatures2>().features.samplerAnisotropy =
@@ -231,6 +253,19 @@ void Device::createLogicalDevice() {
 
   featureChain.get<vk::PhysicalDeviceFeatures2>().features.imageCubeArray = true;
 
+  if (rayTracingSupported_) {
+    auto &v12 = featureChain.get<vk::PhysicalDeviceVulkan12Features>();
+    v12.bufferDeviceAddress = true;
+    v12.scalarBlockLayout = true;
+    v12.runtimeDescriptorArray = true;
+    v12.shaderSampledImageArrayNonUniformIndexing = true;
+    featureChain.get<vk::PhysicalDeviceFeatures2>().features.shaderInt64 = true;
+    featureChain.get<vk::PhysicalDeviceAccelerationStructureFeaturesKHR>().accelerationStructure = true;
+    featureChain.get<vk::PhysicalDeviceRayTracingPipelineFeaturesKHR>().rayTracingPipeline = true;
+  } else {
+    featureChain.unlink<vk::PhysicalDeviceAccelerationStructureFeaturesKHR>();
+    featureChain.unlink<vk::PhysicalDeviceRayTracingPipelineFeaturesKHR>();
+  }
   float queuePriority = 1.0f;
   std::set<std::uint32_t> uniqueQueueFamilies = {
       queueFamilyIndices_.graphics,

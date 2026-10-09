@@ -10,4 +10,5 @@ struct SceneObject {
   MeshId meshId = 0;
   MaterialId materialId = 0;
   Aabb worldBounds{};
+  bool primaryVisible = true, shadowCaster = true;
 };
